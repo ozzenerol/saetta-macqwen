@@ -395,6 +395,162 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
 template [[host_name("qmm_dq_5bit")]] kernel decltype(qmm_dq<5>) qmm_dq<5>;
 template [[host_name("qmm_dq_8bit")]] kernel decltype(qmm_dq<8>) qmm_dq<8>;
 
+// The experts' gate and up projections of one moe_group tile together, and
+// silu(gate) * up: tiles of up to 32 rows, 64 columns of each matrix per
+// threadgroup. Simdgroups 0 and 1 compute the gate columns, 2 and 3 the up
+// ones, all from the same half x tile. y gets the result in f32 and y_half
+// in half, the inputs of qmm_few and of qmm2 for down_proj. Tiles of
+// PREFILL_FEW rows or fewer are left to qmm_few and silu_mul_tiles.
+constant uint PREFILL_GU_BM = 32;
+constant uint PREFILL_GU_BN = 64;
+constant uint PREFILL_GU_BK = 32;
+constant uint PREFILL_GU_LD = PREFILL_GU_BK + 8;
+
+template <uint BITS>
+kernel void qmm_gate_up(device const uint *g_words [[buffer(0)]],
+                        device const ushort *g_scales [[buffer(1)]],
+                        device const ushort *g_biases [[buffer(2)]],
+                        device const uint *u_words [[buffer(3)]],
+                        device const ushort *u_scales [[buffer(4)]],
+                        device const ushort *u_biases [[buffer(5)]],
+                        device const half *x [[buffer(6)]],
+                        device float *y [[buffer(7)]],
+                        device half *y_half [[buffer(8)]],
+                        constant MmShape &s [[buffer(9)]],
+                        device const uint4 *tiles [[buffer(10)]],
+                        device const uint *rows [[buffer(11)]],
+                        device const uint *tile_count [[buffer(12)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint simd [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    // The x and w tiles while the loop runs, then the two result tiles.
+    threadgroup float smem[2 * PREFILL_GU_BM * PREFILL_GU_BN];
+    threadgroup half *xt = (threadgroup half *)smem;
+    threadgroup half *wt = xt + PREFILL_GU_BM * PREFILL_GU_LD;  // [2][BN][LD]
+
+    if (tg.y >= tile_count[0]) {
+        return;
+    }
+    uint4 tile = tiles[tg.y];
+    if (tile.z <= PREFILL_FEW) {
+        return;
+    }
+    uint expert = tile.x, first = tile.y, count = tile.z;
+    uint n0 = tg.x * PREFILL_GU_BN;
+
+    // Threads 0-63 dequantize a gate row, 64-127 an up row; every thread
+    // also loads 8 values of one x row.
+    uint mat = tid / 64;
+    uint lr = tid % 64;
+    ulong wrow = ulong(expert) * s.n + n0 + lr;
+    device const uint *wp = (mat == 0 ? g_words : u_words) + wrow * (s.k * BITS / 32);
+    device const ushort *sp = (mat == 0 ? g_scales : u_scales) + wrow * (s.k / 64);
+    device const ushort *bp = (mat == 0 ? g_biases : u_biases) + wrow * (s.k / 64);
+    threadgroup half4 *wdst = (threadgroup half4 *)(wt + (mat * PREFILL_GU_BN + lr) * PREFILL_GU_LD);
+    uint xr = tid / 4;
+    uint xc = (tid % 4) * 8;
+    bool x_ok = xr < count;
+    device const half *xrow = x + (x_ok ? ulong(rows[first + xr]) * s.k : 0) + xc;
+    threadgroup half4 *xdst = (threadgroup half4 *)(xt + xr * PREFILL_GU_LD + xc);
+
+    uint sn = (simd % 2) * 32;
+    threadgroup half *wm = wt + (simd / 2) * PREFILL_GU_BN * PREFILL_GU_LD;
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+
+    for (uint k0 = 0; k0 < s.k; k0 += PREFILL_GU_BK) {
+        uint packed[BITS];
+        device const uint *wk = wp + k0 / 32 * BITS;
+        for (uint j = 0; j < BITS; j++) {
+            packed[j] = wk[j];
+        }
+        float scale = bf16_to_float(sp[k0 / 64]);
+        float bias = bf16_to_float(bp[k0 / 64]);
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            float4 q = float4(unpack<BITS>(packed, 4 * i), unpack<BITS>(packed, 4 * i + 1),
+                              unpack<BITS>(packed, 4 * i + 2), unpack<BITS>(packed, 4 * i + 3));
+            wdst[i] = half4(q * scale + bias);
+        }
+        if (x_ok) {
+            device const half4 *p = (device const half4 *)(xrow + k0);
+            xdst[0] = p[0];
+            xdst[1] = p[1];
+        } else {
+            xdst[0] = half4(0);
+            xdst[1] = half4(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < PREFILL_GU_BK; kk += 8) {
+            simdgroup_half8x8 a[4];
+            simdgroup_half8x8 b[4];
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(a[i], xt + (8 * i) * PREFILL_GU_LD + kk, PREFILL_GU_LD);
+                simdgroup_load(b[i], wm + (sn + 8 * i) * PREFILL_GU_LD + kk, PREFILL_GU_LD, ulong2(0, 0), true);
+            }
+            for (uint i = 0; i < 4; i++) {
+                for (uint j = 0; j < 4; j++) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // smem as [2][BM][BN]: gate, then up.
+    threadgroup float *res = smem + (simd / 2) * PREFILL_GU_BM * PREFILL_GU_BN;
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_store(acc[i][j], res + (8 * i) * PREFILL_GU_BN + sn + 8 * j, PREFILL_GU_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r = tid / 4;
+    uint c0 = (tid % 4) * 16;
+    if (r < count) {
+        ulong o = ulong(first + r) * s.n + n0 + c0;
+        for (uint c = 0; c < 16; c++) {
+            float g = smem[r * PREFILL_GU_BN + c0 + c];
+            float u = smem[PREFILL_GU_BM * PREFILL_GU_BN + r * PREFILL_GU_BN + c0 + c];
+            float v = silu(g) * u;
+            y[o + c] = v;
+            y_half[o + c] = half(v);
+        }
+    }
+}
+
+template [[host_name("qmm_gate_up_5bit")]] kernel decltype(qmm_gate_up<5>) qmm_gate_up<5>;
+template [[host_name("qmm_gate_up_8bit")]] kernel decltype(qmm_gate_up<8>) qmm_gate_up<8>;
+
+// g = silu(g) * u and g_half = half(g) on the rows of the moe_group tiles
+// of PREFILL_FEW rows or fewer, which qmm_gate_up leaves to qmm_few.
+kernel void silu_mul_tiles(device float *g [[buffer(0)]],
+                           device const float *u [[buffer(1)]],
+                           device half *g_half [[buffer(2)]],
+                           constant uint &n [[buffer(3)]],
+                           device const uint4 *tiles [[buffer(4)]],
+                           device const uint *tile_count [[buffer(5)]],
+                           uint t [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint threads [[threads_per_threadgroup]]) {
+    if (t >= tile_count[0] || tiles[t].z > PREFILL_FEW) {
+        return;
+    }
+    ulong start = ulong(tiles[t].y) * n;
+    uint size = tiles[t].z * n;
+    for (uint i = tid; i < size; i += threads) {
+        float v = silu(g[start + i]) * u[start + i];
+        g[start + i] = v;
+        g_half[start + i] = half(v);
+    }
+}
+
 // The same product for few rows: up to PREFILL_FEW rows of x per
 // threadgroup, in f32 as qmv.metal does, so weights are read once for all
 // of them instead of computing a 64-row tile. A simdgroup computes 4 rows
