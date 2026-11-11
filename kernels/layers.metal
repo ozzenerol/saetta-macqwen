@@ -530,6 +530,133 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
     }
 }
 
+// deltanet_rows in two ops. deltanet_conv_rows: one thread per conv
+// channel runs the m rows and writes mixed [m, channels] (silu applied).
+kernel void deltanet_conv_rows(device const float *qkv [[buffer(0)]],
+                               device const float *conv_w [[buffer(1)]],
+                               device float *conv [[buffer(2)]],
+                               device float *mixed [[buffer(3)]],
+                               constant RowsStepParams &p [[buffer(4)]],
+                               device float *conv_snaps [[buffer(5)]],
+                               uint c [[thread_position_in_grid]]) {
+    constexpr uint D = 128;
+    uint channels = 2 * p.k_heads * D + p.v_heads * D;
+    if (c >= channels) {
+        return;
+    }
+    uint past = p.kernel_size - 1;
+    uint conv_size = past * channels;
+    device const float *wc = conv_w + c * p.kernel_size;
+    for (uint row = 0; row < p.rows; row++) {
+        float x = qkv[row * channels + c];
+        float acc = wc[past] * x;
+        for (uint t = 0; t < past; t++) {
+            acc += wc[t] * conv[t * channels + c];
+        }
+        for (uint t = 0; t + 1 < past; t++) {
+            conv[t * channels + c] = conv[(t + 1) * channels + c];
+        }
+        conv[(past - 1) * channels + c] = x;
+        if (p.snapshots) {
+            for (uint t = 0; t < past; t++) {
+                conv_snaps[row * conv_size + t * channels + c] = conv[t * channels + c];
+            }
+        }
+        mixed[row * channels + c] = silu(acc);
+    }
+}
+
+// deltanet_step_rows: one threadgroup of SIMDS simdgroups per value head,
+// D / SIMDS state rows per simdgroup in registers, the m rows one after the
+// other. Same math and snapshots as deltanet_rows.
+template <uint SIMDS>
+kernel void deltanet_step_rows(device const float *mixed [[buffer(0)]],
+                               device const float *a [[buffer(1)]],
+                               device const float *b [[buffer(2)]],
+                               device const float *a_log [[buffer(3)]],
+                               device const float *dt_bias [[buffer(4)]],
+                               device float *state [[buffer(5)]],
+                               device const float *z [[buffer(6)]],
+                               device const float *norm_w [[buffer(7)]],
+                               device float *y [[buffer(8)]],
+                               constant RowsStepParams &p [[buffer(9)]],
+                               device float *state_snaps [[buffer(10)]],
+                               uint h [[threadgroup_position_in_grid]],
+                               uint tid [[thread_position_in_threadgroup]],
+                               uint simd [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint D = 128;
+    constexpr uint MINE = D / SIMDS;
+    threadgroup float tmp[32];
+    threadgroup float out[D];
+    uint key_size = p.k_heads * D;
+    uint channels = 2 * key_size + p.v_heads * D;
+    uint values = p.v_heads * D;
+    uint state_size = values * D;
+    uint kh = h / (p.v_heads / p.k_heads);
+    float decay = exp(a_log[h]);
+
+    float4 s[MINE];
+#pragma clang loop unroll(full)
+    for (uint j = 0; j < MINE; j++) {
+        uint i = simd + SIMDS * j;
+        s[j] = ((device float4 *)(state + (h * D + i) * D))[lane];
+    }
+
+    for (uint row = 0; row < p.rows; row++) {
+        device const float *mr = mixed + row * channels;
+        float4 qv = ((device const float4 *)(mr + kh * D))[lane];
+        float4 kv = ((device const float4 *)(mr + key_size + kh * D))[lane];
+        device const float *vv = mr + 2 * key_size + h * D;
+        float eps = p.eps / D;
+        qv *= (1.0f / D) / sqrt(simd_sum(dot(qv, qv)) / D + eps);
+        kv *= rsqrt(float(D)) / sqrt(simd_sum(dot(kv, kv)) / D + eps);
+        float x = a[row * p.v_heads + h] + dt_bias[h];
+        float softplus = max(x, 0.0f) + log(1.0f + exp(-abs(x)));
+        float g = exp(-decay * softplus);
+        float beta = sigmoid(b[row * p.v_heads + h]);
+
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < MINE; j++) {
+            uint i = simd + SIMDS * j;
+            float4 sj = s[j] * g;
+            float delta = (vv[i] - simd_sum(dot(sj, kv))) * beta;
+            sj += kv * delta;
+            s[j] = sj;
+            if (p.snapshots) {
+                device float4 *snap =
+                    (device float4 *)(state_snaps + row * state_size + (h * D + i) * D);
+                snap[lane] = sj;
+            }
+            float o = simd_sum(dot(sj, qv));
+            if (lane == 0) {
+                out[i] = o;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float o = tid < D ? out[tid] : 0.0f;
+        float inv = norm_scale(o * o, D, p.eps, tmp, simd, lane, SIMDS);
+        if (tid < D) {
+            uint n = row * values + h * D + tid;
+            y[n] = o * inv * norm_w[tid] * silu(z[n]);
+        }
+    }
+
+#pragma clang loop unroll(full)
+    for (uint j = 0; j < MINE; j++) {
+        uint i = simd + SIMDS * j;
+        ((device float4 *)(state + (h * D + i) * D))[lane] = s[j];
+    }
+}
+
+template [[host_name("deltanet_step_rows_8")]] kernel decltype(deltanet_step_rows<8>)
+    deltanet_step_rows<8>;
+template [[host_name("deltanet_step_rows_16")]] kernel decltype(deltanet_step_rows<16>)
+    deltanet_step_rows<16>;
+template [[host_name("deltanet_step_rows_32")]] kernel decltype(deltanet_step_rows<32>)
+    deltanet_step_rows<32>;
+
 struct PrepParams {
     uint heads;
     uint kv_heads;

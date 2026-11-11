@@ -571,7 +571,14 @@ mod mac {
         ) {
             assert!(snaps.is_none_or(|s| m <= s.rows));
             let c = &self.cfg;
-            let DeltaNetRowsScratch { qkv, z, a, b, y } = scratch;
+            let DeltaNetRowsScratch {
+                qkv,
+                z,
+                a,
+                b,
+                y,
+                mixed,
+            } = scratch;
             rows::record_proj(plan, &self.in_proj_qkv, m, x, qkv, false);
             rows::record_proj(plan, &self.in_proj_z, m, x, z, true);
             rows::record_proj(plan, &self.in_proj_b, m, x, b, true);
@@ -592,27 +599,56 @@ mod mac {
                 Some(s) => (whole(&s.conv), whole(&s.recurrent)),
                 None => (conv.clone(), recurrent.clone()),
             };
-            plan.op(
-                "deltanet_rows",
-                &[
-                    qkv,
-                    &self.conv1d,
-                    &conv,
-                    a,
-                    b,
-                    &self.a_log,
-                    &self.dt_bias,
-                    &recurrent,
-                    z,
-                    &self.norm,
-                    y,
-                    &p,
-                    &conv_snaps,
-                    &state_snaps,
-                ],
-                size(c.k_heads, 1),
-                size(1024, 1),
-            );
+            let simds = DN_SIMDS.load(std::sync::atomic::Ordering::Relaxed);
+            if simds == 0 {
+                plan.op(
+                    "deltanet_rows",
+                    &[
+                        qkv,
+                        &self.conv1d,
+                        &conv,
+                        a,
+                        b,
+                        &self.a_log,
+                        &self.dt_bias,
+                        &recurrent,
+                        z,
+                        &self.norm,
+                        y,
+                        &p,
+                        &conv_snaps,
+                        &state_snaps,
+                    ],
+                    size(c.k_heads, 1),
+                    size(1024, 1),
+                );
+            } else {
+                let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
+                plan.op(
+                    "deltanet_conv_rows",
+                    &[qkv, &self.conv1d, &conv, mixed, &p, &conv_snaps],
+                    size(channels.div_ceil(256), 1),
+                    size(256, 1),
+                );
+                plan.op(
+                    &format!("deltanet_step_rows_{simds}"),
+                    &[
+                        mixed,
+                        a,
+                        b,
+                        &self.a_log,
+                        &self.dt_bias,
+                        &recurrent,
+                        z,
+                        &self.norm,
+                        y,
+                        &p,
+                        &state_snaps,
+                    ],
+                    size(c.v_heads, 1),
+                    size(32 * simds, 1),
+                );
+            }
 
             rows::record_proj(plan, &self.out_proj, m, y, out, false);
         }
@@ -626,7 +662,12 @@ mod mac {
         a: View,
         b: View,
         y: View,
+        mixed: View,
     }
+
+    /// Simdgroups per value head of deltanet_step_rows (8, 16 or 32); 0
+    /// records the fused deltanet_rows instead.
+    pub static DN_SIMDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
 
     impl DeltaNetRowsScratch {
         pub fn new(gpu: &Gpu, cfg: &Config) -> DeltaNetRowsScratch {
@@ -640,6 +681,7 @@ mod mac {
                 a: v(c.v_heads),
                 b: v(c.v_heads),
                 y: v(values),
+                mixed: v(channels),
             }
         }
     }
@@ -883,44 +925,54 @@ mod mac {
                 ));
             }
 
-            let rows_state = GpuDeltaNetState::new(&gpu, &layer.cfg);
-            let scratch = DeltaNetRowsScratch::new(&gpu, &cfg);
-            let snaps = GpuDeltaNetSnaps::new(&gpu, &layer.cfg, TOKENS);
-            let xs = View::new(gpu.buffer_from(&inputs.concat()));
-            let outs = View::new(gpu.buffer(TOKENS * n * 4));
-            let mut plan = Plan::new(&gpu);
-            layer.record_rows(
-                &mut plan,
-                TOKENS,
-                &xs,
-                &outs,
-                &rows_state,
-                &scratch,
-                Some(&snaps),
-            );
-            plan.build().run(&gpu);
-            let close = |got: &[f32], want: &[f32], what: &str| {
-                let err = rel_rms(got, want);
-                assert!(err < BOUND, "{what}: rel rms {err}");
-            };
-            close(&read(&outs.buffer, TOKENS * n), &want, "outputs");
-            let conv_n = rows_state.conv.length() as usize / 4;
-            let rec_n = rows_state.recurrent.length() as usize / 4;
-            for (row, (conv, rec)) in states.iter().enumerate() {
+            for simds in [0, 8, 16, 32] {
+                DN_SIMDS.store(simds, std::sync::atomic::Ordering::Relaxed);
+                let rows_state = GpuDeltaNetState::new(&gpu, &layer.cfg);
+                let scratch = DeltaNetRowsScratch::new(&gpu, &cfg);
+                let snaps = GpuDeltaNetSnaps::new(&gpu, &layer.cfg, TOKENS);
+                let mut padded = inputs.concat();
+                padded.resize(rows::MAX_ROWS * n, 0.0);
+                let xs = View::new(gpu.buffer_from(&padded));
+                let outs = View::new(gpu.buffer(TOKENS * n * 4));
                 let mut plan = Plan::new(&gpu);
-                snaps.record_restore(&mut plan, row, &rows_state);
+                layer.record_rows(
+                    &mut plan,
+                    TOKENS,
+                    &xs,
+                    &outs,
+                    &rows_state,
+                    &scratch,
+                    Some(&snaps),
+                );
                 plan.build().run(&gpu);
+                let close = |got: &[f32], want: &[f32], what: &str| {
+                    let err = rel_rms(got, want);
+                    assert!(err < BOUND, "{what}: rel rms {err}");
+                };
                 close(
-                    &read(&rows_state.conv, conv_n),
-                    conv,
-                    &format!("row {row} conv"),
+                    &read(&outs.buffer, TOKENS * n),
+                    &want,
+                    &format!("simds {simds} outputs"),
                 );
-                close(
-                    &read(&rows_state.recurrent, rec_n),
-                    rec,
-                    &format!("row {row} recurrent"),
-                );
+                let conv_n = rows_state.conv.length() as usize / 4;
+                let rec_n = rows_state.recurrent.length() as usize / 4;
+                for (row, (conv, rec)) in states.iter().enumerate() {
+                    let mut plan = Plan::new(&gpu);
+                    snaps.record_restore(&mut plan, row, &rows_state);
+                    plan.build().run(&gpu);
+                    close(
+                        &read(&rows_state.conv, conv_n),
+                        conv,
+                        &format!("simds {simds} row {row} conv"),
+                    );
+                    close(
+                        &read(&rows_state.recurrent, rec_n),
+                        rec,
+                        &format!("simds {simds} row {row} recurrent"),
+                    );
+                }
             }
+            DN_SIMDS.store(16, std::sync::atomic::Ordering::Relaxed);
             println!("deltanet rows: {TOKENS} rows and their restores match {TOKENS} tokens");
         }
 
