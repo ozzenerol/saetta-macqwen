@@ -156,6 +156,65 @@ mod mac {
         rows.div_ceil(ROWS_PER_SIMD * SIMDS) as u64
     }
 
+    /// The router and shared-expert gate of one layer, both 8-bit.
+    pub struct Router<'a> {
+        pub gate: GpuQuant<'a>,
+        pub shared_gate: GpuQuant<'a>,
+    }
+
+    impl<'a> Router<'a> {
+        /// `layer` is a module prefix such as `language_model.model.layers.0`.
+        pub fn new(
+            gpu: &Gpu,
+            weights: &'a Weights,
+            quant: &Quantization,
+            layer: &str,
+        ) -> Result<Router<'a>, String> {
+            let load = |name: &str| -> Result<GpuQuant<'a>, String> {
+                let q = weights.quantized(&format!("{layer}.mlp.{name}"), quant)?;
+                Ok(GpuQuant::new(gpu, &q))
+            };
+            let r = Router {
+                gate: load("gate")?,
+                shared_gate: load("shared_expert_gate")?,
+            };
+            assert_eq!(
+                (r.gate.bits, r.shared_gate.bits),
+                (8, 8),
+                "router kernel is 8-bit"
+            );
+            assert_eq!(r.shared_gate.rows, 1);
+            assert_eq!(r.gate.cols, r.shared_gate.cols);
+            Ok(r)
+        }
+
+        /// Number of floats `record` writes: one logit per expert, then the
+        /// shared expert's gate logit.
+        pub fn outputs(&self) -> usize {
+            self.gate.rows + 1
+        }
+
+        /// Records out[..experts] = gate x and out[experts] = shared_gate x,
+        /// as one op.
+        pub fn record(&self, plan: &mut Plan, x: &View, out: &View, parallel: bool) {
+            let (g, s) = (&self.gate, &self.shared_gate);
+            let shape = plan.constant(&[g.rows as u32, g.cols as u32]);
+            let buffers = [
+                &g.words, &g.scales, &g.biases, &s.words, &s.scales, &s.biases, x, out, &shape,
+            ];
+            let grid = MTLSize::new(self.outputs().div_ceil(ROUTER_SIMDS) as u64, 1, 1);
+            let threads = MTLSize::new(32 * ROUTER_SIMDS as u64, 1, 1);
+            if parallel {
+                plan.op_parallel("router_8bit", &buffers, grid, threads);
+            } else {
+                plan.op("router_8bit", &buffers, grid, threads);
+            }
+        }
+    }
+
+    /// Must match ROUTER_SIMDS in kernels/router.metal.
+    const ROUTER_SIMDS: usize = 8;
+
     /// Expert ids for layer `l` of the benchmark: 8 distinct, spread out.
     pub fn bench_ids(l: usize) -> [u32; 8] {
         std::array::from_fn(|i| ((l * 37 + i * 29 + 11) % 256) as u32)
@@ -227,6 +286,42 @@ mod mac {
                 bytes * n / times[0] / 1e9,
                 times[runs / 2] / n * 1e6,
                 bytes * n / times[runs / 2] / 1e9,
+            );
+        }
+
+        // The router: one router_8bit op per layer against two qmv ops.
+        let routers: Vec<Router> = (0..config.num_layers())
+            .map(|l| {
+                Router::new(
+                    &gpu,
+                    &weights,
+                    &config.quantization,
+                    &format!("language_model.model.layers.{l}"),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let logits = View::new(gpu.buffer(routers[0].outputs() * 4));
+        let shared = View::new(gpu.buffer(4));
+        for (label, fused) in [("router_8bit", true), ("2 x qmv_8bit", false)] {
+            let mut plan = Plan::new(&gpu);
+            for r in &routers {
+                if fused {
+                    r.record(&mut plan, &x, &logits, false);
+                } else {
+                    r.gate.record(&mut plan, &x, &logits, false);
+                    r.shared_gate.record(&mut plan, &x, &shared, true);
+                }
+            }
+            let built = plan.build();
+            let mut times: Vec<f64> = (0..=runs)
+                .map(|_| built.run(&gpu).as_secs_f64())
+                .skip(1)
+                .collect();
+            times.sort_by(f64::total_cmp);
+            println!(
+                "  router, {label}: best {:.1} us per layer, median {:.1} us",
+                times[0] / n * 1e6,
+                times[runs / 2] / n * 1e6,
             );
         }
         Ok(())

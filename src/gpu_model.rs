@@ -15,7 +15,7 @@ mod mac {
     use crate::config::{Config, LayerType};
     use crate::gpu::{Gpu, contents};
     use crate::gpu_layers::{GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm};
-    use crate::moe::Experts;
+    use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
@@ -82,6 +82,8 @@ mod mac {
     /// The scratch buffers of the MoE block, shared by all layers.
     struct MoeScratch {
         normed: View,
+        /// The router's output: `num_experts` logits, then the shared
+        /// expert gate logit, which `shared_logit` points at.
         router: View,
         ids: View,
         weights: View,
@@ -96,8 +98,8 @@ mod mac {
 
     struct GpuMoe<'a> {
         post_norm: View,
-        router: GpuQuant<'a>,
-        shared_expert_gate: GpuQuant<'a>,
+        /// Router logits then the shared expert gate, 257 values.
+        router: Router<'a>,
         shared_gate: GpuQuant<'a>,
         shared_up: GpuQuant<'a>,
         shared_down: GpuQuant<'a>,
@@ -118,8 +120,7 @@ mod mac {
                     weights,
                     &format!("{prefix}.post_attention_layernorm.weight"),
                 )?,
-                router: m("gate")?,
-                shared_expert_gate: m("shared_expert_gate")?,
+                router: Router::new(gpu, weights, &cfg.quantization, prefix)?,
                 shared_gate: m("shared_expert.gate_proj")?,
                 shared_up: m("shared_expert.up_proj")?,
                 shared_down: m("shared_expert.down_proj")?,
@@ -133,8 +134,6 @@ mod mac {
             Norm::rows(1, hidden, cfg.rms_norm_eps, &self.post_norm)
                 .record(plan, x, &s.normed, false);
             self.router.record(plan, &s.normed, &s.router, false);
-            self.shared_expert_gate
-                .record(plan, &s.normed, &s.shared_logit, true);
             self.shared_gate
                 .record(plan, &s.normed, &s.shared_gate, true);
             self.shared_up.record(plan, &s.normed, &s.shared_up, true);
@@ -244,12 +243,16 @@ mod mac {
             let experts = &loaded.first().map(|l| &l.moe.experts);
             let expert_size = experts.map_or(cfg.moe_intermediate_size, |e| e.size());
             let shared_size = cfg.shared_expert_intermediate_size;
+            let router = view(gpu, cfg.num_experts + 1);
             let s = MoeScratch {
                 normed: view(gpu, hidden),
-                router: view(gpu, cfg.num_experts),
+                router: router.clone(),
                 ids: view(gpu, cfg.num_experts_per_tok),
                 weights: view(gpu, cfg.num_experts_per_tok),
-                shared_logit: view(gpu, 1),
+                shared_logit: View {
+                    buffer: router.buffer,
+                    offset: (cfg.num_experts * 4) as u64,
+                },
                 shared_gate: view(gpu, shared_size),
                 shared_up: view(gpu, shared_size),
                 shared_h: view(gpu, shared_size),
