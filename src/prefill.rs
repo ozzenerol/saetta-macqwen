@@ -807,16 +807,15 @@ mod mac {
                         .collect();
                     let tp = gpu.buffer_from(&rows);
                     for i in 0..n {
-                        let at = |b: &View, size: usize| View {
-                            buffer: b.buffer.clone(),
-                            offset: b.offset + (i * size) as u64,
+                        let row = View {
+                            buffer: logits.buffer.clone(),
+                            offset: logits.offset + (i * vocab * 4) as u64,
                         };
-                        s.encode(
-                            gpu,
-                            enc,
-                            &at(&logits, vocab * 4),
-                            &at(&View::new(tp.clone()), 16),
-                        );
+                        let params = View {
+                            buffer: tp.clone(),
+                            offset: (i * size_of::<TokenParams>()) as u64,
+                        };
+                        s.encode(gpu, enc, &row, &params);
                     }
                 }
             });
