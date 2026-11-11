@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta profile-prefill <model dir> <tokens> | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -48,6 +48,14 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(target_os = "macos")]
+        ["bench-serve-prefill", dir, tokens, every] => match (tokens.parse(), every.parse()) {
+            (Ok(t), Ok(e)) => report(bench_serve_prefill(dir, t, e)),
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
+        #[cfg(target_os = "macos")]
         ["bench-qmv", dir] => report(saetta::qmv::bench(Path::new(dir), 5, 20)),
         #[cfg(target_os = "macos")]
         ["bench-moe", dir] => report(saetta::moe::bench(Path::new(dir), 5)),
@@ -56,18 +64,21 @@ fn main() -> ExitCode {
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
         #[cfg(target_os = "macos")]
-        ["profile-prefill", dir, tokens] => match tokens.parse() {
-            Ok(t) => report(saetta::prefill::bench_profile(
-                Path::new(dir),
-                t,
-                PREFILL_CHUNK,
-                exact_prefill(),
-            )),
-            Err(_) => {
-                eprintln!("{USAGE}");
-                ExitCode::FAILURE
+        ["profile-prefill", dir, tokens, ref rest @ ..] if rest.len() <= 1 => {
+            match (tokens.parse(), rest.first().map(|l| l.parse()).transpose()) {
+                (Ok(t), Ok(last)) => report(saetta::prefill::bench_profile(
+                    Path::new(dir),
+                    t,
+                    PREFILL_CHUNK,
+                    exact_prefill(),
+                    last,
+                )),
+                _ => {
+                    eprintln!("{USAGE}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         #[cfg(target_os = "macos")]
         ["bench-qmm2", dir] => report(saetta::qmm::bench(Path::new(dir), &[512, 2048], 10)),
         #[cfg(target_os = "macos")]
@@ -864,6 +875,33 @@ fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
+/// Runs a prompt of `tokens` tokens through the model as `serve --gpu`
+/// builds it (no drafting), with prompt cache snapshots every `every`
+/// tokens. The model prints the time of each piece; this prints the total.
+#[cfg(target_os = "macos")]
+fn bench_serve_prefill(dir: &str, tokens: usize, every: usize) -> Result<(), Box<dyn Error>> {
+    use saetta::server::Model as _;
+    let dir = Path::new(dir);
+    let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
+    let weights: &'static Weights = Box::leak(Box::new(Weights::open(dir)?));
+    let memory = Memory {
+        context: (tokens + 64).next_multiple_of(1024),
+        ..Memory::default()
+    };
+    let served = load_gpu(config, weights, 0, memory)?;
+    let snapshots = served.snapshots;
+    let mut model = Cached::new(served, snapshots, every);
+    let prompt = saetta::prefill::test_tokens(tokens);
+    let start = Instant::now();
+    model.prefill(&prompt);
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "prompt of {tokens} tokens, snapshots every {every}: {secs:.1} s to the logits ({:.0} tokens/s)",
+        tokens as f64 / secs
+    );
+    Ok(())
+}
+
 fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
     match (tokens.parse(), chunk.parse()) {
         (Ok(t), Ok(c)) => report(saetta::prefill::bench(

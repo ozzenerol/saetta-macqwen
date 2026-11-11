@@ -924,7 +924,7 @@ mod mac {
             })
         }
 
-        /// Runs `tokens` from position 0 as `run` does, and returns the GPU
+        /// Runs `tokens` from position `pos` as `run` does, and returns the GPU
         /// time of each of `STAGES`, summed over the layers, then the time
         /// of whole layers and of the logits. Each layer runs once for real,
         /// then once for every stage k with only stages 0 ..= k, from the
@@ -934,6 +934,7 @@ mod mac {
             &self,
             gpu: &Gpu,
             tokens: &[u32],
+            pos: usize,
             states: &[State],
         ) -> Vec<(&'static str, f64)> {
             let n = tokens.len();
@@ -948,7 +949,7 @@ mod mac {
                 unsafe { std::ptr::copy_nonoverlapping(ptr, input.as_mut_ptr(), bytes) };
                 let run = || {
                     gpu.run_timed(serial, |enc| {
-                        self.encode_layer(gpu, enc, l, &x, n, 0, state)
+                        self.encode_layer(gpu, enc, l, &x, n, pos, state)
                     })
                     .1
                 };
@@ -1673,11 +1674,15 @@ mod mac {
 
     /// Prints the GPU time per stage of a `tokens`-token prefill (see
     /// `Prefill::profile`), after one warm-up run.
+    /// Profiles the prefill of `tokens` tokens, or with `last`, only of the
+    /// last `last` of them after a plain prefill of the others, to see what
+    /// a chunk costs deep in a long prompt.
     pub fn bench_profile(
         dir: &std::path::Path,
         tokens: usize,
         chunk: usize,
         exact: bool,
+        last: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Config::load(dir)?;
         let weights = Weights::open(dir)?;
@@ -1688,20 +1693,32 @@ mod mac {
         let prompt = test_tokens(tokens);
         let owned = OwnedState::new_all(&gpu, &cfg, capacity);
         let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
-        prefill.run(&gpu, &prompt, 0, &states);
-        for s in &owned {
-            if let OwnedState::Linear(d) = s {
-                zero(&d.conv);
-                zero(&d.recurrent);
+        let first = tokens - last.unwrap_or(tokens).min(tokens);
+        if first == 0 {
+            // A warm-up, then the DeltaNet state of an empty prompt again.
+            prefill.run(&gpu, &prompt, 0, &states);
+            for s in &owned {
+                if let OwnedState::Linear(d) = s {
+                    zero(&d.conv);
+                    zero(&d.recurrent);
+                }
             }
+        } else {
+            // The keys and values of the first tokens for real; the DeltaNet
+            // state the profiled runs then start from does not change the time.
+            let start = std::time::Instant::now();
+            prefill.run(&gpu, &prompt[..first], 0, &states);
+            let secs = start.elapsed().as_secs_f64();
+            println!("prefill of the first {first} tokens: {secs:.1} s");
         }
-        let times = prefill.profile(&gpu, &prompt, &states);
+        let times = prefill.profile(&gpu, &prompt[first..], first, &states);
         let total: f64 = times.iter().rev().take(2).map(|t| t.1).sum();
+        let n = tokens - first;
         println!(
-            "prefill {tokens} tokens, chunk {}, exact {exact}: GPU {:.3} s ({:.0} tokens/s)",
+            "prefill {n} tokens at position {first}, chunk {}, exact {exact}: GPU {:.3} s ({:.0} tokens/s)",
             prefill.chunk,
             total,
-            tokens as f64 / total
+            n as f64 / total
         );
         for (stage, t) in &times {
             println!("{stage:>22} {:8.1} ms {:5.1}%", t * 1e3, 100.0 * t / total);
