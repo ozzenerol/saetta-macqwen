@@ -30,4 +30,4 @@
 
 - B5 One command buffer per token for the whole model, fused small ops, GPU router
 - MTP weights and speculative decoding
-- state snapshots per turn
+- D1 state snapshots and the prompt cache, as in docs/CACHE.md
