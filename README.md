@@ -28,6 +28,8 @@ cargo build --release
 ./target/release/saetta gpu-check
 ```
 
+`saetta serve <model dir> [--port N]` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default). For now it runs the CPU model, at about 375 ms per token.
+
 ## License
 
 MIT
