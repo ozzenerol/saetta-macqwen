@@ -2,13 +2,22 @@
 //! a drop-in for prefill's qmm on the fast path: same buffers and gather
 //! modes, tiles of `tile_rows()` rows.
 
-/// A tile shape of qmm2 (kernel name prefix, rows of x, columns of y per
-/// threadgroup); must match the QMM2 instances in kernels/qmm.metal.
+/// A tile shape of qmm2 (kernel name prefix, rows of x per expert tile,
+/// columns of y per threadgroup, threadgroups per tile along the rows);
+/// must match the QMM2 instances in kernels/qmm.metal.
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
     pub name: &'static str,
     pub rows: usize,
     pub cols: usize,
+    pub sub: usize,
+}
+
+impl Variant {
+    /// Rows of x per threadgroup.
+    pub fn block_rows(&self) -> usize {
+        self.rows / self.sub
+    }
 }
 
 pub const VARIANTS: [Variant; 5] = [
@@ -16,28 +25,42 @@ pub const VARIANTS: [Variant; 5] = [
         name: "qmm2",
         rows: 64,
         cols: 64,
+        sub: 1,
     },
     Variant {
         name: "qmm2_db",
         rows: 64,
         cols: 64,
+        sub: 1,
     },
     Variant {
         name: "qmm2_32",
         rows: 32,
         cols: 128,
+        sub: 1,
     },
     Variant {
         name: "qmm2_32_db",
         rows: 32,
         cols: 128,
+        sub: 1,
     },
     Variant {
         name: "qmm2_16",
         rows: 16,
         cols: 128,
+        sub: 1,
     },
 ];
+
+/// qmm2_32 on expert tiles of 64 rows, one threadgroup per 32-row half,
+/// for the down of prefill_gate_up64's tiles.
+pub const HALVES: Variant = Variant {
+    name: "qmm2_32x2",
+    rows: 64,
+    cols: 128,
+    sub: 2,
+};
 
 /// The fastest in bench-qmm2: 32 x 128 tiles, single buffered.
 pub const DEFAULT: Variant = VARIANTS[2];
@@ -123,7 +146,11 @@ mod mac {
             enc.set_buffer(i, Some(&x.buffer), 0);
         }
         enc.dispatch_thread_groups(
-            MTLSize::new(w.rows.div_ceil(v.cols) as u64, m.div_ceil(v.rows) as u64, 1),
+            MTLSize::new(
+                w.rows.div_ceil(v.cols) as u64,
+                m.div_ceil(v.block_rows()) as u64,
+                1,
+            ),
             MTLSize::new(128, 1, 1),
         );
     }
@@ -156,7 +183,11 @@ mod mac {
             enc.set_buffer(6 + i as u64, Some(&b.buffer), b.offset);
         }
         enc.dispatch_thread_groups(
-            MTLSize::new(w.rows.div_ceil(v.cols) as u64, max_tiles as u64, 1),
+            MTLSize::new(
+                w.rows.div_ceil(v.cols) as u64,
+                (max_tiles * v.sub) as u64,
+                1,
+            ),
             MTLSize::new(128, 1, 1),
         );
     }

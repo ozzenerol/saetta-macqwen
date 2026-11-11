@@ -354,76 +354,6 @@ mod mac {
         groups(enc, (gate.rows.div_ceil(64), m.div_ceil(64)), threads);
     }
 
-    /// Largest number of k parts of `router_split`; the router scratch
-    /// holds this many partial logits.
-    const ROUTER_PARTS: usize = 4;
-
-    /// The router logits of `m` rows as qmm split (x as two halves, close to
-    /// f32) on 16 KB tiles, with k cut into parts so a chunk has about 256
-    /// threadgroups. y gets the partial logits one after the other, which
-    /// moe_route adds up; returns their number.
-    fn router_split(
-        gpu: &Gpu,
-        enc: &ComputeCommandEncoderRef,
-        w: &GpuQuant,
-        x: &View,
-        y: &View,
-        m: usize,
-    ) -> usize {
-        assert!(w.bits == 8 && w.experts == 1);
-        let tiles = w.rows.div_ceil(TILE) * m.div_ceil(TILE);
-        // 32 k steps of 32 per part at most 4 parts: k = 2048 has 64.
-        let parts = (256 / tiles).clamp(1, ROUTER_PARTS);
-        assert!(w.cols.is_multiple_of(32 * parts));
-        enc.set_compute_pipeline_state(&gpu.pipeline("qmm_8bit_split_k32"));
-        set_quant(enc, 0, w);
-        set_views(enc, 3, &[x, y, x, x, x]);
-        let shape = MmShape {
-            m: m as u32,
-            n: w.rows as u32,
-            k: w.cols as u32,
-            gather: 0,
-        };
-        params(enc, 5, &shape);
-        enc.dispatch_thread_groups(
-            MTLSize::new(
-                w.rows.div_ceil(TILE) as u64,
-                m.div_ceil(TILE) as u64,
-                parts as u64,
-            ),
-            MTLSize::new(128, 1, 1),
-        );
-        parts
-    }
-
-    /// y[i] = x[i] . W for a W of one row, in f32 (qdot_rows).
-    fn qdot_rows(
-        gpu: &Gpu,
-        enc: &ComputeCommandEncoderRef,
-        w: &GpuQuant,
-        x: &View,
-        y: &View,
-        m: usize,
-    ) {
-        assert!(w.rows == 1 && w.cols.is_multiple_of(64));
-        assert!(
-            matches!(w.bits, 5 | 8),
-            "no qdot_rows kernel for {} bits",
-            w.bits
-        );
-        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("qdot_rows_{}bit", w.bits)));
-        set_quant(enc, 0, w);
-        set_views(enc, 3, &[x, y]);
-        let shape = MmShape {
-            m: m as u32,
-            n: 1,
-            k: w.cols as u32,
-            gather: 0,
-        };
-        params(enc, 5, &shape);
-        groups(enc, (m.div_ceil(4), 1), 128);
-    }
-
     /// qmm_few on the tiles of FEW rows or fewer of a grouped product.
     fn few_grouped(
         gpu: &Gpu,
@@ -459,7 +389,13 @@ mod mac {
             .filter(|&i| i < 4)
             .map_or(
                 if gate_up64() {
-                    crate::qmm::VARIANTS[0]
+                    // SAETTA_DOWN64=1: down on qmm2 64 x 64 instead (slower
+                    // in batch 6: 201 against 174 ms per 2k chunk).
+                    if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
+                        crate::qmm::VARIANTS[0]
+                    } else {
+                        crate::qmm::HALVES
+                    }
                 } else {
                     crate::qmm::DEFAULT
                 },
@@ -501,23 +437,19 @@ mod mac {
         std::env::var("SAETTA_QMM2").is_ok_and(|v| v == "1")
     }
 
-    /// SAETTA_ROUTER_OLD=1 runs the fast path's router on qmm_8bit_split and
-    /// shared_expert_gate on qmm_dq, as before router_split and qdot_rows.
-    fn old_router() -> bool {
-        std::env::var("SAETTA_ROUTER_OLD").is_ok_and(|v| v == "1")
-    }
-
-    /// SAETTA_GATE_UP64=1: expert tiles of up to 64 rows, gate and up in
-    /// prefill_gate_up64, down on qmm2 64 x 64.
+    /// Expert tiles of up to 64 rows, gate and up in prefill_gate_up64,
+    /// down on qmm2 32 x 128 over each half of a tile (3-4% faster at 1k
+    /// to 15k tokens than 32-row tiles, batch 6), unless SAETTA_GATE_UP64=0
+    /// or SAETTA_EXPERT_VARIANT picks a variant.
     fn gate_up64() -> bool {
-        std::env::var("SAETTA_GATE_UP64").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
             && std::env::var("SAETTA_EXPERT_VARIANT").is_err()
     }
 
-    /// SAETTA_SHARED_GU=1: the shared expert's gate, up and silu in one
-    /// prefill_gate_up64 pass on normed in half.
+    /// The shared expert's gate, up and silu in one prefill_gate_up64 pass
+    /// on normed in half, unless SAETTA_SHARED_GU=0.
     fn shared_gate_up() -> bool {
-        std::env::var("SAETTA_SHARED_GU").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_SHARED_GU").map_or(true, |v| v != "0")
     }
 
     /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
@@ -656,7 +588,7 @@ mod mac {
                 b: f(chunk * d.v_heads),
                 mixer_out: f(chunk * h),
                 q_half: f(chunk * narrow / 2),
-                router: f(ROUTER_PARTS * chunk * cfg.num_experts),
+                router: f(chunk * cfg.num_experts),
                 shared_gate: f(chunk),
                 shared_g: f(chunk * cfg.shared_expert_intermediate_size),
                 shared_u: f(chunk * cfg.shared_expert_intermediate_size),
@@ -724,8 +656,6 @@ mod mac {
     struct RouteParams {
         experts: u32,
         top_k: u32,
-        parts: u32,
-        stride: u32,
     }
 
     #[repr(C)]
@@ -1709,22 +1639,15 @@ mod mac {
             ]
             .map(whole);
             let fast = !self.exact_now();
-            let mut router_parts = 1;
             if self.on("router") {
                 // Routing stays close to f32 so it picks the experts decode
                 // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
                 if fast && fast_router() {
                     self.mm(gpu, enc, &layer.router, normed, &router, t);
-                } else if fast && t > FEW_MAX && !old_router() {
-                    router_parts = router_split(gpu, enc, &layer.router, normed, &router, t);
                 } else {
                     qmm(gpu, enc, &layer.router, normed, &router, t, true);
                 }
-                if fast && !old_router() {
-                    qdot_rows(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
-                } else {
-                    self.mm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
-                }
+                self.mm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
             }
             let silu_mul = gpu.pipeline("silu_mul_rows");
             let normed_half = whole(&s.normed_half);
@@ -1773,8 +1696,6 @@ mod mac {
                 let p = RouteParams {
                     experts: cfg.num_experts as u32,
                     top_k: top_k as u32,
-                    parts: router_parts as u32,
-                    stride: (t * cfg.num_experts) as u32,
                 };
                 params(enc, 3, &p);
                 groups(enc, (t, 1), 32);
