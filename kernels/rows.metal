@@ -388,11 +388,13 @@ inline void w_tiles(device const uint *words,
                     thread simdgroup_float8x8 *wt) {
     device const uint *w = words + row * row_words + k * BITS / 32;
     uint packed[BITS];
+#pragma clang loop unroll(full)
     for (uint i = 0; i < BITS; i++) {
         packed[i] = w[i];
     }
     uint g = row * groups + k / 64;
     float s = bf16_to_float(scales[g]), b = bf16_to_float(biases[g]);
+#pragma clang loop unroll(full)
     for (uint i = 0; i < 4; i++) {
         wt[i].thread_elements()[0] = s * float(unpack<BITS>(packed, 8 * i + fn)) + b;
         wt[i].thread_elements()[1] = s * float(unpack<BITS>(packed, 8 * i + fn + 1)) + b;
@@ -440,10 +442,12 @@ kernel void qmv_mma(device const uint *words [[buffer(0)]],
     simdgroup_float8x8 acc = simdgroup_float8x8(0);
     for (uint k = simd * slice; k < (simd + 1) * slice; k += 32) {
         simdgroup_float8x8 xt[4], wt[4];
+#pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             simdgroup_load(xt[i], x + k + 8 * i, shape.cols, ulong2(0, 0), true);
         }
         w_tiles<BITS>(words, scales, biases, row, row_words, groups, k, f.y, wt);
+#pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             simdgroup_multiply_accumulate(acc, wt[i], xt[i], acc);
         }
@@ -493,11 +497,13 @@ kernel void moe_gate_up_mma(device const uint *gate_w [[buffer(0)]],
     simdgroup_float8x8 g = simdgroup_float8x8(0), up = simdgroup_float8x8(0);
     for (uint k = simd * slice; k < (simd + 1) * slice; k += 32) {
         simdgroup_float8x8 xt[4], wg[4], wu[4];
+#pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             simdgroup_load(xt[i], x + k + 8 * i, shape.cols, ulong2(0, 0), true);
         }
         w_tiles<BITS>(gate_w, gate_s, gate_b, row, row_words, groups, k, f.y, wg);
         w_tiles<BITS>(up_w, up_s, up_b, row, row_words, groups, k, f.y, wu);
+#pragma clang loop unroll(full)
         for (uint i = 0; i < 4; i++) {
             simdgroup_multiply_accumulate(g, wg[i], xt[i], g);
             simdgroup_multiply_accumulate(up, wu[i], xt[i], up);
@@ -546,6 +552,7 @@ kernel void moe_down_mma(device const uint *words [[buffer(0)]],
         // This lane's two columns j = f.y, f.y + 1 of X^T.
         float wt[2];
         device const float *hj[2];
+#pragma clang loop unroll(full)
         for (uint i = 0; i < 2; i++) {
             uint j = f.y + i;
             uint slot = j < m ? slots[u * m + j] : NO_SLOT;
@@ -554,6 +561,7 @@ kernel void moe_down_mma(device const uint *words [[buffer(0)]],
         }
         for (uint k = simd * slice; k < (simd + 1) * slice; k += 32) {
             simdgroup_float8x8 xt[4], wd[4];
+#pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
                 // Element (kk, j) of tile i is h[j, slot][k + 8 i + kk];
                 // this lane holds kk = f.x and j = f.y, f.y + 1.
@@ -561,6 +569,7 @@ kernel void moe_down_mma(device const uint *words [[buffer(0)]],
                 xt[i].thread_elements()[1] = wt[1] * hj[1][k + 8 * i + f.x];
             }
             w_tiles<BITS>(words, scales, biases, row, row_words, groups, k, f.y, wd);
+#pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
                 simdgroup_multiply_accumulate(acc, wd[i], xt[i], acc);
             }
@@ -614,7 +623,9 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
     uint row_words = shape.cols * BITS / 32;
     uint groups = shape.cols / 64;
     float acc[QR][M];
+#pragma clang loop unroll(full)
     for (uint r = 0; r < QR; r++) {
+#pragma clang loop unroll(full)
         for (uint j = 0; j < M; j++) {
             acc[r][j] = 0;
         }
@@ -623,9 +634,11 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
     for (uint k = lane * 16; k < shape.cols; k += 16 * 32) {
         float4 xv[M][4];
         float xsum[M];
+#pragma clang loop unroll(full)
         for (uint j = 0; j < M; j++) {
             device const float4 *x4 = (device const float4 *)(x + j * shape.cols + k);
             float sum = 0;
+#pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
                 xv[j][i] = x4[i];
                 sum += xv[j][i].x + xv[j][i].y + xv[j][i].z + xv[j][i].w;
@@ -633,6 +646,7 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
             xsum[j] = sum;
         }
         uint bit0 = k * BITS;
+#pragma clang loop unroll(full)
         for (uint r = 0; r < QR; r++) {
             uint row = row0 + r;
             if (row >= shape.rows) {
@@ -640,11 +654,13 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
             }
             device const uint *w = words + row * row_words + bit0 / 32;
             uint packed[NW];
+#pragma clang loop unroll(full)
             for (uint i = 0; i < NW; i++) {
                 packed[i] = w[i];
             }
             float4 q[4];
             uint off = bit0 % 32;
+#pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
                 q[i] = float4(unpack_at<BITS>(packed, off + (4 * i) * BITS),
                               unpack_at<BITS>(packed, off + (4 * i + 1) * BITS),
@@ -653,6 +669,7 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
             }
             uint g = row * groups + k / 64;
             float s = bf16_to_float(scales[g]), b = bf16_to_float(biases[g]);
+#pragma clang loop unroll(full)
             for (uint j = 0; j < M; j++) {
                 float qx = dot(q[0], xv[j][0]) + dot(q[1], xv[j][1]) + dot(q[2], xv[j][2]) +
                            dot(q[3], xv[j][3]);
@@ -661,8 +678,10 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
         }
     }
 
+#pragma clang loop unroll(full)
     for (uint r = 0; r < QR; r++) {
         uint row = row0 + r;
+#pragma clang loop unroll(full)
         for (uint j = 0; j < M; j++) {
             float sum = simd_sum(acc[r][j]);
             if (lane == 0 && row < shape.rows) {
@@ -688,10 +707,12 @@ inline void q16(device const uint *words, uint row, uint row_words, uint k, thre
     uint bit0 = k * BITS;
     device const uint *w = words + row * row_words + bit0 / 32;
     uint packed[NW];
+#pragma clang loop unroll(full)
     for (uint i = 0; i < NW; i++) {
         packed[i] = w[i];
     }
     uint off = bit0 % 32;
+#pragma clang loop unroll(full)
     for (uint i = 0; i < 4; i++) {
         q[i] = float4(unpack_at<BITS>(packed, off + (4 * i) * BITS),
                       unpack_at<BITS>(packed, off + (4 * i + 1) * BITS),
@@ -728,6 +749,7 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
     uint m = rows.x, r0 = rows.y;
     uint slot[M];
     bool any = false;
+#pragma clang loop unroll(full)
     for (uint j = 0; j < M; j++) {
         slot[j] = r0 + j < m ? slots[u * m + r0 + j] : NO_SLOT;
         any = any || slot[j] != NO_SLOT;
@@ -740,7 +762,9 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
     uint row_words = shape.cols * BITS / 32;
     uint groups = shape.cols / 64;
     float g[MOE_QR][M], up[MOE_QR][M];
+#pragma clang loop unroll(full)
     for (uint r = 0; r < MOE_QR; r++) {
+#pragma clang loop unroll(full)
         for (uint j = 0; j < M; j++) {
             g[r][j] = 0;
             up[r][j] = 0;
@@ -750,15 +774,18 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
     for (uint k = lane * 16; k < shape.cols; k += 16 * 32) {
         float4 xv[M][4];
         float xsum[M];
+#pragma clang loop unroll(full)
         for (uint j = 0; j < M; j++) {
             device const float4 *x4 = (device const float4 *)(x + (r0 + j) * shape.cols + k);
             float sum = 0;
+#pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
                 xv[j][i] = slot[j] != NO_SLOT ? x4[i] : float4(0);
                 sum += xv[j][i].x + xv[j][i].y + xv[j][i].z + xv[j][i].w;
             }
             xsum[j] = sum;
         }
+#pragma clang loop unroll(full)
         for (uint r = 0; r < MOE_QR; r++) {
             uint row = e * shape.rows + out0 + r;
             uint grp = row * groups + k / 64;
@@ -767,6 +794,7 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
             q16<BITS>(up_w, row, row_words, k, qu);
             float gs = bf16_to_float(gate_s[grp]), gb = bf16_to_float(gate_b[grp]);
             float us = bf16_to_float(up_s[grp]), ub = bf16_to_float(up_b[grp]);
+#pragma clang loop unroll(full)
             for (uint j = 0; j < M; j++) {
                 float dg = dot(qg[0], xv[j][0]) + dot(qg[1], xv[j][1]) + dot(qg[2], xv[j][2]) +
                            dot(qg[3], xv[j][3]);
@@ -778,7 +806,9 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
         }
     }
 
+#pragma clang loop unroll(full)
     for (uint r = 0; r < MOE_QR; r++) {
+#pragma clang loop unroll(full)
         for (uint j = 0; j < M; j++) {
             float gsum = simd_sum(g[r][j]);
             float usum = simd_sum(up[r][j]);
@@ -794,3 +824,83 @@ template [[host_name("moe_gate_up_reg_1")]] kernel decltype(moe_gate_up_reg<1>) 
 template [[host_name("moe_gate_up_reg_2")]] kernel decltype(moe_gate_up_reg<2>) moe_gate_up_reg<2>;
 template [[host_name("moe_gate_up_reg_3")]] kernel decltype(moe_gate_up_reg<3>) moe_gate_up_reg<3>;
 template [[host_name("moe_gate_up_reg_4")]] kernel decltype(moe_gate_up_reg<4>) moe_gate_up_reg<4>;
+
+// qmv for M rows with the packed weights in registers: the qmv lane layout
+// (32 values per lane, QMV_ROWS weight rows per simdgroup). The lane loads
+// the packed words of its 4 weight rows once, then for each row j of x
+// loads that row's 32 values once and unpacks the weights again for it.
+// Loads per weight chunk: about 7 + 2 M, ALU about M times decode's.
+template <uint BITS, uint M>
+kernel void qmv_pk(device const uint *words [[buffer(0)]],
+                   device const ushort *scales [[buffer(1)]],
+                   device const ushort *biases [[buffer(2)]],
+                   device const float *x [[buffer(3)]],
+                   device float *y [[buffer(4)]],
+                   constant QmvRegShape &shape [[buffer(5)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   uint simd [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (tg * QMV_SIMDS + simd) * QMV_ROWS;
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    float acc[QMV_ROWS][M];
+#pragma clang loop unroll(full)
+    for (uint r = 0; r < QMV_ROWS; r++) {
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < M; j++) {
+            acc[r][j] = 0;
+        }
+    }
+
+    for (uint k = lane * 32; k < shape.cols; k += 32 * 32) {
+        uint packed[QMV_ROWS][BITS];
+        float s[QMV_ROWS], b[QMV_ROWS];
+#pragma clang loop unroll(full)
+        for (uint r = 0; r < QMV_ROWS; r++) {
+            uint row = min(row0 + r, shape.rows - 1);
+            device const uint *w = words + row * row_words + k * BITS / 32;
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < BITS; i++) {
+                packed[r][i] = w[i];
+            }
+            uint g = row * groups + k / 64;
+            s[r] = bf16_to_float(scales[g]);
+            b[r] = bf16_to_float(biases[g]);
+        }
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < M; j++) {
+            float xv[32];
+            float xsum = load_x32(x + j * shape.cols + k, xv);
+#pragma clang loop unroll(full)
+            for (uint r = 0; r < QMV_ROWS; r++) {
+                float qx = 0;
+#pragma clang loop unroll(full)
+                for (uint i = 0; i < 32; i++) {
+                    qx += float(unpack<BITS>(packed[r], i)) * xv[i];
+                }
+                acc[r][j] += s[r] * qx + b[r] * xsum;
+            }
+        }
+    }
+
+#pragma clang loop unroll(full)
+    for (uint r = 0; r < QMV_ROWS; r++) {
+        uint row = row0 + r;
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < M; j++) {
+            float sum = simd_sum(acc[r][j]);
+            if (lane == 0 && row < shape.rows) {
+                y[j * shape.y_stride + row] = sum;
+            }
+        }
+    }
+}
+
+#define QMV_PK(BITS, M) \
+    template [[host_name("qmv_pk_" #BITS "bit_" #M)]] kernel decltype(qmv_pk<BITS, M>) \
+        qmv_pk<BITS, M>;
+#define QMV_PK_ALL(BITS) \
+    QMV_PK(BITS, 1) QMV_PK(BITS, 2) QMV_PK(BITS, 3) QMV_PK(BITS, 4) \
+    QMV_PK(BITS, 5) QMV_PK(BITS, 6) QMV_PK(BITS, 7) QMV_PK(BITS, 8)
+QMV_PK_ALL(5)
+QMV_PK_ALL(8)

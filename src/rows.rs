@@ -55,6 +55,33 @@ mod mac {
         record_qmv_reg(plan, w, m, x, y, parallel);
     }
 
+    /// `record_qmv` with the packed weights in registers (`qmv_pk`), rows of
+    /// y `y_stride` floats apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_qmv_pk(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        y_stride: usize,
+        parallel: bool,
+    ) {
+        assert_eq!(w.experts, 1, "stacked experts go through moe");
+        assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
+        assert!(
+            matches!(w.bits, 5 | 8),
+            "no qmv_pk kernel for {} bits",
+            w.bits
+        );
+        let kernel = format!("qmv_pk_{}bit_{m}", w.bits);
+        let shape = plan.constant(&[w.rows as u32, w.cols as u32, y_stride as u32]);
+        let buffers = [&w.words, &w.scales, &w.biases, x, y, &shape];
+        let grid = MTLSize::new(w.rows.div_ceil(ROWS_PER_SIMD * SIMDS) as u64, 1, 1);
+        let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
+        op(plan, &kernel, &buffers, grid, threads, parallel);
+    }
+
     /// Must match MOE_QR and QR_SIMDS in rows.metal.
     const QR: usize = 8;
     const QR_SIMDS: usize = 2;
@@ -516,8 +543,10 @@ mod mac {
                     let mut plan = Plan::new(&gpu);
                     if mma {
                         record_qmv_mma(&mut plan, &w, m, &x, &y, false);
-                    } else {
+                    } else if m % 2 == 0 {
                         record_qmv_reg(&mut plan, &w, m, &x, &y, false);
+                    } else {
+                        record_qmv_pk(&mut plan, &w, m, &x, &y, w.rows, false);
                     }
                     record_qmv(&mut plan, &w, m, &x, &want, true);
                     plan.build().run(&gpu);
@@ -664,7 +693,8 @@ mod mac {
                             0 => w.record(&mut plan, &x, &y, false),
                             1..=8 => record_qmv(&mut plan, &w, m, &x, &y, false),
                             9..=16 => record_qmv_reg(&mut plan, &w, m - 8, &x, &y, false),
-                            _ => record_qmv_mma(&mut plan, &w, m - 16, &x, &y, false),
+                            17..=24 => record_qmv_pk(&mut plan, &w, m - 16, &x, &y, w.rows, false),
+                            _ => record_qmv_mma(&mut plan, &w, m - 24, &x, &y, false),
                         }
                     }
                     let built = plan.build();
@@ -684,10 +714,18 @@ mod mac {
                 }
                 REG_QR.store(8, std::sync::atomic::Ordering::Relaxed);
                 let rows: Vec<String> = (1..=MAX_ROWS)
-                    .map(|m| format!("m{m} {:.1}/{:.1}/{:.1}", time(m), time(m + 8), time(m + 16)))
+                    .map(|m| {
+                        format!(
+                            "m{m} {:.1}/{:.1}/{:.1}/{:.1}",
+                            time(m),
+                            time(m + 8),
+                            time(m + 16),
+                            time(m + 24)
+                        )
+                    })
                     .collect();
                 println!(
-                    "{module} {}x{}: qmv {base:.1} us; rows/reg/mma {}",
+                    "{module} {}x{}: qmv {base:.1} us; rows/reg/pk/mma {}",
                     w.rows,
                     w.cols,
                     rows.join(", ")
