@@ -151,6 +151,10 @@ fn start_cached(script: Vec<u32>, every: usize) -> (String, Arc<Mutex<Log>>) {
 }
 
 fn serve(model: impl Model + 'static) -> String {
+    serve_with(model, false)
+}
+
+fn serve_with(model: impl Model + 'static, exact_history: bool) -> String {
     let settings = Settings {
         model_name: "fake".into(),
         sampling: Params {
@@ -160,6 +164,7 @@ fn serve(model: impl Model + 'static) -> String {
         },
         max_tokens: 1000,
         eos_token_ids: vec![IM_END, 306],
+        exact_history,
     };
     let server = Arc::new(Server::new(model, tokenizer(), settings).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -479,4 +484,114 @@ fn edit_goes_back_to_a_snapshot() {
     let (_, body) = post(&addr, ask("second question"));
     let (prompt, cached) = usage(&body);
     assert_eq!(cached, prompt - 1);
+}
+
+/// What a real model writes and the template does not give back: two
+/// newlines before </think> (the template writes one) and a number with a
+/// leading zero (the parser reads 20, the template writes "20").
+fn uneven_script() -> Vec<u32> {
+    let call = "\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n<parameter=limit>\n020\n</parameter>\n</function>\n";
+    script(&[
+        Ok("I will read it.\n\n"),
+        Err(THINK_END),
+        Ok("\n\nReading.\n\n"),
+        Err(TOOL),
+        Ok(call),
+        Err(TOOL_END),
+    ])
+}
+
+/// Runs `turns` qh-style tool steps and returns, per turn, the prompt
+/// length, the reused tokens and the tokens the state held before it.
+fn tool_turns(addr: &str, turns: usize) -> Vec<(u64, u64, u64)> {
+    let mut messages = vec![json!({"role": "user", "content": "Read main.go."})];
+    let mut held = 0;
+    let mut out = Vec::new();
+    for step in 0..turns {
+        let (_, body) = post(
+            addr,
+            json!({"messages": messages, "tools": read_tool(),
+                   "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true}}),
+        );
+        let (prompt, cached) = usage(&body);
+        out.push((prompt, cached, held));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let m = &v["choices"][0]["message"];
+        held = prompt + v["usage"]["completion_tokens"].as_u64().unwrap() - 1;
+        // As qh stores it: reasoning trimmed, arguments as sent.
+        messages.push(json!({"role": "assistant", "content": m["content"],
+            "reasoning_content": m["reasoning_content"].as_str().unwrap_or("").trim(),
+            "tool_calls": m["tool_calls"]}));
+        messages.push(json!({"role": "tool", "content": format!("file contents {step}")}));
+    }
+    out
+}
+
+/// The template's re-render differs from the generated tokens, so with
+/// exact history every turn goes back to the end of the last prompt.
+#[test]
+fn rerender_differs_from_generated_tokens() {
+    let (model, log) = fake(uneven_script());
+    let addr = serve_with(Cached::new(model, 16, 1024), true);
+    let turns = tool_turns(&addr, 4);
+    for &(prompt, cached, held) in &turns[1..] {
+        assert!(cached < held, "cached {cached}, held {held}");
+        assert!(
+            prompt - cached > 20,
+            "only {} tokens read again",
+            prompt - cached
+        );
+    }
+    assert!(!log.lock().unwrap().restores.is_empty());
+}
+
+/// With the splice, each turn reuses everything the state holds and reads
+/// only the tool result and the new turn's header.
+#[test]
+fn splice_reuses_the_generated_tokens() {
+    let (model, log) = fake(uneven_script());
+    let addr = serve(Cached::new(model, 16, 1024));
+    let turns = tool_turns(&addr, 6);
+    for (step, &(prompt, cached, held)) in turns.iter().enumerate().skip(1) {
+        assert_eq!(cached, held);
+        // Only the end of our answer, the tool result and the next header.
+        let new = format!(
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\nfile contents {}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+            step - 1
+        );
+        assert_eq!(prompt - cached, tokenizer().encode(&new).len() as u64);
+    }
+    let log = log.lock().unwrap();
+    assert!(log.restores.is_empty());
+    assert_eq!(log.resets, 0);
+}
+
+/// A client that changes our answer gets the normal render.
+#[test]
+fn edited_answer_is_rendered() {
+    let (model, _) = fake(script(&[Err(THINK_END), Ok("\n\nFour.")]));
+    let addr = serve(Cached::new(model, 16, 1024));
+    let kwargs = json!({"enable_thinking": true, "preserve_thinking": true});
+    let (_, body) = post(
+        &addr,
+        json!({"messages": [{"role": "user", "content": "2+2?"}],
+                                       "chat_template_kwargs": kwargs}),
+    );
+    let (prompt, _) = usage(&body);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let held = prompt + v["usage"]["completion_tokens"].as_u64().unwrap() - 1;
+    let ask = |answer: &str| {
+        json!({"messages": [{"role": "user", "content": "2+2?"},
+                            {"role": "assistant", "content": answer},
+                            {"role": "user", "content": "Sure?"}],
+               "chat_template_kwargs": kwargs})
+    };
+    let (_, body) = post(&addr, ask("Five."));
+    let (second, cached) = usage(&body);
+    assert!(cached < held);
+    // The rendered prompt: the same length a fresh server gives.
+    let (model, _) = fake(vec![]);
+    let fresh = serve(model);
+    let (_, body) = post(&fresh, ask("Five."));
+    assert_eq!(usage(&body).0, second);
 }
