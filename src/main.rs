@@ -516,7 +516,7 @@ impl server::Model for GpuServed {
             return Vec::new();
         }
         if let Some(d) = &mut self.drafting {
-            d.spec.report();
+            d.spec.report(m.position());
         }
         let start = Instant::now();
         let logits = if tokens.len() < SHORT_PREFILL {

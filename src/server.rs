@@ -450,6 +450,7 @@ impl<M: Model + 'static> Server<M> {
     /// differs.
     fn splice(&self, last: &Turn, held: &[u32], r: &ChatRequest) -> Option<Vec<u32>> {
         const END: &str = "<|im_end|>\n";
+        const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
         let n = last.messages.len();
         if r.messages.len() <= n
             || r.messages[..n] != last.messages[..]
@@ -462,12 +463,22 @@ impl<M: Model + 'static> Server<M> {
             ..r.options
         };
         let upto = chat::render(&r.messages[..=n], &r.tools, &options).ok()?;
-        if !upto.starts_with(&last.prompt_text)
-            || !upto.ends_with(END)
-            || !r.prompt_text.starts_with(&upto)
-        {
+        if !upto.starts_with(&last.prompt_text) || !upto.ends_with(END) {
             return None;
         }
+        // With thinking off, the answer starts with an empty think block that
+        // the template keeps for the last answer only, so the new render has
+        // the answer without it. The state keeps the tokens the model saw.
+        let upto = if r.prompt_text.starts_with(&upto) {
+            upto
+        } else {
+            let base = last.prompt_text.strip_suffix(EMPTY_THINK)?;
+            let upto = format!("{base}{}", &upto[last.prompt_text.len()..]);
+            if !r.prompt_text.starts_with(&upto) {
+                return None;
+            }
+            upto
+        };
         let rest = &r.prompt_text[upto.len() - END.len()..];
         let mut tokens = held.to_vec();
         tokens.extend(self.tokenizer.encode(rest));

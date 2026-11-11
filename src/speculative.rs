@@ -310,6 +310,122 @@ pub fn draft_lengths(
     Ok((tokens, lengths))
 }
 
+/// Chooses the number of drafts per round, 0 to `max`, for the most tokens
+/// per second: the expected tokens of a round with `k` drafts, from the
+/// recent acceptance, over the measured time of such a round at this
+/// context length. 0 is a plain decode step. A longer context makes every
+/// main pass dearer, which favours longer drafts.
+pub struct DraftLength {
+    max: usize,
+    /// Seconds per round, by context bucket and then `k`; 0 is unmeasured.
+    time: Vec<Vec<f64>>,
+    /// `accept[i]`: the chance draft `i` is kept when the drafts before it
+    /// were.
+    accept: Vec<f64>,
+    /// The round each length last ran in.
+    tried: Vec<usize>,
+    /// Rounds run per length. The first of each is a warm-up (pipelines,
+    /// buffers) and its time is thrown away by the second.
+    runs: Vec<usize>,
+    rounds: usize,
+}
+
+/// Rounds between tries of the length that ran least recently, so every
+/// time and the acceptance stay current.
+const EXPLORE: usize = 64;
+/// Weight of a new round in the running averages.
+const TIME_WEIGHT: f64 = 0.1;
+const ACCEPT_WEIGHT: f64 = 0.05;
+
+/// Context buckets by power of two: under 128, 128 to 255, and so on.
+fn bucket(context: usize) -> usize {
+    context.max(64).ilog2() as usize - 6
+}
+
+impl DraftLength {
+    pub fn new(max: usize) -> DraftLength {
+        DraftLength {
+            max,
+            time: Vec::new(),
+            accept: vec![0.8; max],
+            tried: vec![0; max + 1],
+            runs: vec![0; max + 1],
+            rounds: 0,
+        }
+    }
+
+    /// Tokens a round with `k` drafts yields on average.
+    pub fn expected(&self, k: usize) -> f64 {
+        let mut chance = 1.0;
+        let mut tokens = 1.0;
+        for a in &self.accept[..k] {
+            chance *= a;
+            tokens += chance;
+        }
+        tokens
+    }
+
+    fn times(&mut self, context: usize) -> &mut Vec<f64> {
+        let b = bucket(context);
+        while self.time.len() <= b {
+            // A new bucket starts from the one below it.
+            let below = self.time.last().cloned();
+            self.time
+                .push(below.unwrap_or_else(|| vec![0.0; self.max + 1]));
+        }
+        &mut self.time[b]
+    }
+
+    /// The draft length for the next round at `context` tokens.
+    pub fn next(&mut self, context: usize) -> usize {
+        self.rounds += 1;
+        let max = self.max;
+        let time = self.times(context).clone();
+        let unmeasured = |k: usize| time[k] == 0.0 || self.runs[k] < 2;
+        let k = if let Some(k) = (0..=max).rev().find(|&k| unmeasured(k)) {
+            k
+        } else if self.rounds.is_multiple_of(EXPLORE) {
+            (0..=max).min_by_key(|&k| self.tried[k]).unwrap()
+        } else {
+            let rate = |k: usize| self.expected(k) / time[k];
+            (0..=max)
+                .max_by(|&a, &b| rate(a).total_cmp(&rate(b)))
+                .unwrap()
+        };
+        self.tried[k] = self.rounds;
+        k
+    }
+
+    /// The round times in ms per length at `context`, for the log.
+    pub fn times_ms(&self, context: usize) -> Vec<f64> {
+        let b = bucket(context).min(self.time.len().saturating_sub(1));
+        self.time.get(b).map_or(Vec::new(), |t| {
+            t.iter().map(|s| (s * 1e4).round() / 10.0).collect()
+        })
+    }
+
+    /// A round with `k` drafts at `context` kept `accepted` of them and
+    /// took `seconds`.
+    pub fn record(&mut self, context: usize, k: usize, accepted: usize, seconds: f64) {
+        self.runs[k] += 1;
+        let first = self.runs[k] <= 2;
+        let t = &mut self.times(context)[k];
+        *t = if *t == 0.0 || first {
+            seconds
+        } else {
+            // Quick to come down, slow to go up as a longer context does,
+            // and a stalled round (the GPU sometimes waits 250 ms or more)
+            // counts as at most 3 times the estimate.
+            let w = if seconds < *t { 0.5 } else { TIME_WEIGHT };
+            *t + (seconds.min(3.0 * *t) - *t) * w
+        };
+        for i in 0..k.min(accepted + 1) {
+            let kept = if i < accepted { 1.0 } else { 0.0 };
+            self.accept[i] += (kept - self.accept[i]) * ACCEPT_WEIGHT;
+        }
+    }
+}
+
 /// The rounds `generate` makes over tokens whose draft lengths are `lengths`.
 pub fn simulate(lengths: &[usize], k: usize) -> Stats {
     let mut stats = Stats {
@@ -352,7 +468,7 @@ mod gpu {
     //! The same rounds as `generate`, on the GPU model with the GPU MTP
     //! layer.
 
-    use super::{Decider, Stats};
+    use super::{Decider, DraftLength, Stats};
     use crate::config::Config;
     use crate::gpu::{Gpu, contents};
     use crate::gpu_model::GpuModel;
@@ -361,6 +477,7 @@ mod gpu {
     use crate::qmv::View;
     use crate::sample::Sampler;
     use crate::sample_gpu::{NO_DRAFT, slot, supports};
+    use std::time::Instant;
 
     /// The drafter and what a round needs to go back. The main model is
     /// passed in, so the same model also serves without drafts.
@@ -374,18 +491,23 @@ mod gpu {
         last: View,
         /// For each MTP cache entry, the model position of its hidden state.
         mtp_positions: Vec<usize>,
+        length: DraftLength,
+        /// Rounds per draft length since the last report.
+        lengths: Vec<usize>,
         pub stats: Stats,
     }
 
     impl<'a> GpuSpec<'a> {
-        /// Drafts `k` tokens per round. `prefill` checks them and needs
-        /// `enable_verify` for `k + 1` rows.
+        /// Drafts up to `k` tokens per round, as many as pays. `prefill`
+        /// checks them and needs `enable_verify` for `k + 1` rows.
         pub fn new(model: &GpuModel<'a>, mtp: GpuMtp<'a>, cfg: &Config, k: usize) -> GpuSpec<'a> {
             let gpu = model.gpu();
             let hidden = cfg.hidden_size;
             GpuSpec {
                 last: View::new(gpu.buffer(hidden * 4)),
                 mtp_positions: Vec::new(),
+                length: DraftLength::new(k),
+                lengths: vec![0; k + 1],
                 stats: Stats {
                     accepted_at: vec![0; k],
                     ..Stats::default()
@@ -456,18 +578,25 @@ mod gpu {
         }
 
         /// Prints the drafting counts since the last call and clears them.
-        pub fn report(&mut self) {
+        pub fn report(&mut self, context: usize) {
             let s = &self.stats;
             if s.rounds > 0 {
                 eprintln!(
-                    "drafts: {} rounds, {} of {} accepted, {:.2} tokens per round, accepted at {:?}",
+                    "draft rounds: ms per length {:?}, accept {:?}",
+                    self.length.times_ms(context),
+                    self.length.accept
+                );
+                eprintln!(
+                    "drafts: {} rounds, {} of {} accepted, {:.2} tokens per round, accepted at {:?}, rounds per length {:?}",
                     s.rounds,
                     s.accepted,
                     s.drafted,
                     s.tokens_per_round(),
-                    s.accepted_at
+                    s.accepted_at,
+                    self.lengths
                 );
             }
+            self.lengths.fill(0);
             self.stats = Stats {
                 accepted_at: vec![0; self.k],
                 ..Stats::default()
@@ -507,6 +636,7 @@ mod gpu {
 
         /// One round: runs `pending` and the drafts, keeps the accepted
         /// drafts and returns them with the next token, which is not run.
+        /// The number of drafts is chosen per round.
         pub fn speculate(
             &mut self,
             model: &mut GpuModel<'a>,
@@ -514,7 +644,49 @@ mod gpu {
             pending: u32,
             decide: &mut dyn Decider,
         ) -> (Vec<u32>, u32) {
-            let k = self.k;
+            let context = model.position();
+            let k = self.length.next(context);
+            let start = Instant::now();
+            let (drafts, next) = if k == 0 {
+                self.plain(model, pending, decide)
+            } else {
+                self.round(model, prefill, pending, decide, k)
+            };
+            let seconds = start.elapsed().as_secs_f64();
+            eprintln!("ROUND k {k} ctx {context} accepted {} {:.1} ms", drafts.len(), seconds * 1e3);
+            self.length.record(context, k, drafts.len(), seconds);
+            self.lengths[k] += 1;
+            (drafts, next)
+        }
+
+        /// A round without drafts: a decode step that keeps the MTP cache.
+        fn plain(
+            &mut self,
+            model: &mut GpuModel<'a>,
+            pending: u32,
+            decide: &mut dyn Decider,
+        ) -> (Vec<u32>, u32) {
+            let last = self.last.clone();
+            self.mtp_record(&last, model.position() - 1, pending);
+            let next = match decide.sampling() {
+                Some((p, sampler)) if supports(&p) => model.run_sampled(pending, &p, sampler),
+                _ => {
+                    let logits = model.forward(pending);
+                    decide.pick(&logits)
+                }
+            };
+            copy(model.final_hidden(), &self.last, self.hidden);
+            (Vec::new(), next)
+        }
+
+        fn round(
+            &mut self,
+            model: &mut GpuModel<'a>,
+            prefill: &Prefill,
+            pending: u32,
+            decide: &mut dyn Decider,
+            k: usize,
+        ) -> (Vec<u32>, u32) {
             let vocab = self.vocab;
             let base = model.position();
             let mark = self.mtp.len();
@@ -889,6 +1061,61 @@ mod real {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fake rounds: a main pass costs `pass` seconds plus `per_row` per row,
+    /// and draft i is kept with chance `accept`.
+    fn settle(pass: f64, per_row: f64, accept: f64) -> usize {
+        let mut d = DraftLength::new(7);
+        let mut r = Sampler::new(5);
+        let mut counts = [0; 8];
+        for _ in 0..3000 {
+            let k = d.next(1000);
+            let accepted = (0..k).take_while(|_| r.next_f32() < accept as f32).count();
+            d.record(1000, k, accepted, pass + per_row * (k + 1) as f64);
+            counts[k] += 1;
+        }
+        (0..8).max_by_key(|&k| counts[k]).unwrap()
+    }
+
+    #[test]
+    fn draft_length_follows_cost_and_acceptance() {
+        // A first plain round far too slow is measured again later.
+        let mut d = DraftLength::new(3);
+        for k in [3, 3, 2, 2, 1, 1, 0] {
+            assert_eq!(d.next(100), k);
+            d.record(100, k, k, 0.04);
+        }
+        // The second plain round stalls, and so does one round in 50.
+        assert_eq!(d.next(100), 0);
+        d.record(100, 0, 0, 1.0);
+        for i in 0..2000 {
+            let k = d.next(100);
+            let t = if k == 0 { 0.01 } else { 0.04 };
+            d.record(100, k, k.min(1), if i % 50 == 0 { 0.5 } else { t });
+        }
+        assert_eq!(d.next(101), 0);
+
+        // Rows nearly free and drafts usually kept: draft the most.
+        assert_eq!(settle(0.010, 0.0005, 0.9), 7);
+        // Rows as dear as a pass: drafting never pays.
+        assert_eq!(settle(0.0, 0.010, 0.9), 0);
+        // In between, a short draft.
+        let k = settle(0.010, 0.003, 0.6);
+        assert!((1..=3).contains(&k), "{k}");
+    }
+
+    #[test]
+    fn new_context_bucket_starts_from_the_one_below() {
+        let mut d = DraftLength::new(2);
+        for k in [2, 2, 1, 1, 0, 0] {
+            assert_eq!(d.next(100), k);
+            d.record(100, k, k, 0.01);
+        }
+        // Measured below, so no unmeasured lengths at 5000 tokens.
+        let k = d.next(5000);
+        assert!(k <= 2);
+        assert_eq!(d.time.len(), bucket(5000) + 1);
+    }
 
     /// A one-hot drafter plus the rule must give tokens distributed as p,
     /// whichever token it drafts.

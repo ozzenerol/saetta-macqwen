@@ -791,3 +791,27 @@ fn client_leaving_in_the_prefill_keeps_whole_pieces() {
     assert!(cached > 0 && cached % 64 == 0, "cached {cached}");
     assert!((run as u64) < prompt + 64, "ran {run} of {prompt}");
 }
+
+#[test]
+fn splice_reuses_answers_without_thinking() {
+    let (model, log) = fake(script(&[Ok("It returns 14.")]));
+    let addr = serve(Cached::new(model, 16, 1024));
+    let mut messages = vec![json!({"role": "user", "content": "What is f(2)?"})];
+    let mut held = 0;
+    for turn in 0..4 {
+        let (_, body) = post(
+            &addr,
+            json!({"messages": messages, "chat_template_kwargs": {"enable_thinking": false}}),
+        );
+        let (prompt, cached) = usage(&body);
+        if turn > 0 {
+            assert_eq!(cached, held, "turn {turn}");
+        }
+        let v: Value = serde_json::from_str(&body).unwrap();
+        held = prompt + v["usage"]["completion_tokens"].as_u64().unwrap() - 1;
+        messages
+            .push(json!({"role": "assistant", "content": v["choices"][0]["message"]["content"]}));
+        messages.push(json!({"role": "user", "content": format!("And f({turn})?")}));
+    }
+    assert!(log.lock().unwrap().restores.is_empty());
+}
