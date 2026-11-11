@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 memmap2 = "0.9"
 half = "2.7"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 fancy-regex = "0.20.1"
 unicode-normalization = "0.1.26"
 

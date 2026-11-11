@@ -1,0 +1,886 @@
+{
+ "cases": [
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "kwargs": {},
+   "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": false,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>user\nHi<|im_end|>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.  \n"
+    },
+    {
+     "role": "user",
+     "content": "\n  What is 2+2?  \n\n"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "\n2+2 is 4.\n"
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n2+2 is 4.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "2+2 is 4."
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true
+   },
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdding.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Sure?"
+    },
+    {
+     "role": "assistant",
+     "content": "Yes.\n<think>odd</think>\nreally"
+    }
+   ],
+   "kwargs": {},
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nSure?<|im_end|>\n<|im_start|>assistant\n<think>\nodd\n</think>\n\nreally<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": false,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdding.\n</think>\n\n4"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nAdding.\n</think>\n\n4<|im_end|>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": ""
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "function": {
+      "description": "Read a text file. Lines come back numbered. Use offset and limit for big files.",
+      "name": "read",
+      "parameters": {
+       "properties": {
+        "limit": {
+         "description": "number of lines",
+         "type": "integer"
+        },
+        "offset": {
+         "description": "first line, 1-based",
+         "type": "integer"
+        },
+        "path": {
+         "description": "file path",
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "description": "List a directory. Directories end with /.",
+      "name": "ls",
+      "parameters": {
+       "properties": {
+        "path": {
+         "description": "directory, default .",
+         "type": "string"
+        }
+       },
+       "required": null,
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent.\n"
+    },
+    {
+     "role": "user",
+     "content": "Today is 2026-11-11.\n\nWhat is in main.go?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "I should read the file.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"main.go\", \"limit\": 20}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1\tpackage main\n2\n3\tfunc main() {}\n",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "assistant",
+     "content": "It has an empty main function.",
+     "reasoning_content": "Short file."
+    },
+    {
+     "role": "user",
+     "content": "List the dir and read go.mod."
+    },
+    {
+     "role": "assistant",
+     "content": "Reading both.",
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "ls",
+        "arguments": "{}"
+       }
+      },
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"go.mod\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "go.mod\nmain.go\n",
+     "tool_call_id": "call_2"
+    },
+    {
+     "role": "tool",
+     "content": "module x\n\ngo 1.24\n",
+     "tool_call_id": "call_3"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Read a text file. Lines come back numbered. Use offset and limit for big files.\", \"name\": \"read\", \"parameters\": {\"properties\": {\"limit\": {\"description\": \"number of lines\", \"type\": \"integer\"}, \"offset\": {\"description\": \"first line, 1-based\", \"type\": \"integer\"}, \"path\": {\"description\": \"file path\", \"type\": \"string\"}}, \"required\": [\"path\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"List a directory. Directories end with /.\", \"name\": \"ls\", \"parameters\": {\"properties\": {\"path\": {\"description\": \"directory, default .\", \"type\": \"string\"}}, \"required\": null, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nToday is 2026-11-11.\n\nWhat is in main.go?<|im_end|>\n<|im_start|>assistant\n<think>\nI should read the file.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n<parameter=limit>\n20\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n1\tpackage main\n2\n3\tfunc main() {}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nShort file.\n</think>\n\nIt has an empty main function.<|im_end|>\n<|im_start|>user\nList the dir and read go.mod.<|im_end|>\n<|im_start|>assistant\n<think>\nTwo calls.\n</think>\n\nReading both.\n\n<tool_call>\n<function=ls>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=path>\ngo.mod\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ngo.mod\nmain.go\n</tool_response>\n<tool_response>\nmodule x\n\ngo 1.24\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "function": {
+      "description": "Read a text file. Lines come back numbered. Use offset and limit for big files.",
+      "name": "read",
+      "parameters": {
+       "properties": {
+        "limit": {
+         "description": "number of lines",
+         "type": "integer"
+        },
+        "offset": {
+         "description": "first line, 1-based",
+         "type": "integer"
+        },
+        "path": {
+         "description": "file path",
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "description": "List a directory. Directories end with /.",
+      "name": "ls",
+      "parameters": {
+       "properties": {
+        "path": {
+         "description": "directory, default .",
+         "type": "string"
+        }
+       },
+       "required": null,
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent.\n"
+    },
+    {
+     "role": "user",
+     "content": "Today is 2026-11-11.\n\nWhat is in main.go?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "I should read the file.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"main.go\", \"limit\": 20}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1\tpackage main\n2\n3\tfunc main() {}\n",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "assistant",
+     "content": "It has an empty main function.",
+     "reasoning_content": "Short file."
+    },
+    {
+     "role": "user",
+     "content": "List the dir and read go.mod."
+    },
+    {
+     "role": "assistant",
+     "content": "Reading both.",
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "ls",
+        "arguments": "{}"
+       }
+      },
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"go.mod\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "go.mod\nmain.go\n",
+     "tool_call_id": "call_2"
+    },
+    {
+     "role": "tool",
+     "content": "module x\n\ngo 1.24\n",
+     "tool_call_id": "call_3"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true
+   },
+   "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Read a text file. Lines come back numbered. Use offset and limit for big files.\", \"name\": \"read\", \"parameters\": {\"properties\": {\"limit\": {\"description\": \"number of lines\", \"type\": \"integer\"}, \"offset\": {\"description\": \"first line, 1-based\", \"type\": \"integer\"}, \"path\": {\"description\": \"file path\", \"type\": \"string\"}}, \"required\": [\"path\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"List a directory. Directories end with /.\", \"name\": \"ls\", \"parameters\": {\"properties\": {\"path\": {\"description\": \"directory, default .\", \"type\": \"string\"}}, \"required\": null, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nToday is 2026-11-11.\n\nWhat is in main.go?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n<parameter=limit>\n20\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n1\tpackage main\n2\n3\tfunc main() {}\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt has an empty main function.<|im_end|>\n<|im_start|>user\nList the dir and read go.mod.<|im_end|>\n<|im_start|>assistant\n<think>\nTwo calls.\n</think>\n\nReading both.\n\n<tool_call>\n<function=ls>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=path>\ngo.mod\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ngo.mod\nmain.go\n</tool_response>\n<tool_response>\nmodule x\n\ngo 1.24\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "function": {
+      "description": "Read a text file. Lines come back numbered. Use offset and limit for big files.",
+      "name": "read",
+      "parameters": {
+       "properties": {
+        "limit": {
+         "description": "number of lines",
+         "type": "integer"
+        },
+        "offset": {
+         "description": "first line, 1-based",
+         "type": "integer"
+        },
+        "path": {
+         "description": "file path",
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    },
+    {
+     "function": {
+      "description": "List a directory. Directories end with /.",
+      "name": "ls",
+      "parameters": {
+       "properties": {
+        "path": {
+         "description": "directory, default .",
+         "type": "string"
+        }
+       },
+       "required": null,
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Today is 2026-11-11.\n\nWhat is in main.go?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "I should read the file.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"main.go\", \"limit\": 20}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1\tpackage main\n2\n3\tfunc main() {}\n",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "assistant",
+     "content": "It has an empty main function.",
+     "reasoning_content": "Short file."
+    },
+    {
+     "role": "user",
+     "content": "List the dir and read go.mod."
+    },
+    {
+     "role": "assistant",
+     "content": "Reading both.",
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "ls",
+        "arguments": "{}"
+       }
+      },
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"go.mod\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "go.mod\nmain.go\n",
+     "tool_call_id": "call_2"
+    },
+    {
+     "role": "tool",
+     "content": "module x\n\ngo 1.24\n",
+     "tool_call_id": "call_3"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Read a text file. Lines come back numbered. Use offset and limit for big files.\", \"name\": \"read\", \"parameters\": {\"properties\": {\"limit\": {\"description\": \"number of lines\", \"type\": \"integer\"}, \"offset\": {\"description\": \"first line, 1-based\", \"type\": \"integer\"}, \"path\": {\"description\": \"file path\", \"type\": \"string\"}}, \"required\": [\"path\"], \"type\": \"object\"}}, \"type\": \"function\"}\n{\"function\": {\"description\": \"List a directory. Directories end with /.\", \"name\": \"ls\", \"parameters\": {\"properties\": {\"path\": {\"description\": \"directory, default .\", \"type\": \"string\"}}, \"required\": null, \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nToday is 2026-11-11.\n\nWhat is in main.go?<|im_end|>\n<|im_start|>assistant\n<think>\nI should read the file.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n<parameter=limit>\n20\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n1\tpackage main\n2\n3\tfunc main() {}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nShort file.\n</think>\n\nIt has an empty main function.<|im_end|>\n<|im_start|>user\nList the dir and read go.mod.<|im_end|>\n<|im_start|>assistant\n<think>\nTwo calls.\n</think>\n\nReading both.\n\n<tool_call>\n<function=ls>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=path>\ngo.mod\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ngo.mod\nmain.go\n</tool_response>\n<tool_response>\nmodule x\n\ngo 1.24\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent.\n"
+    },
+    {
+     "role": "user",
+     "content": "Today is 2026-11-11.\n\nWhat is in main.go?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "I should read the file.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"main.go\", \"limit\": 20}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1\tpackage main\n2\n3\tfunc main() {}\n",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "assistant",
+     "content": "It has an empty main function.",
+     "reasoning_content": "Short file."
+    },
+    {
+     "role": "user",
+     "content": "List the dir and read go.mod."
+    },
+    {
+     "role": "assistant",
+     "content": "Reading both.",
+     "reasoning_content": "Two calls.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "ls",
+        "arguments": "{}"
+       }
+      },
+      {
+       "id": "call_3",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": "{\"path\": \"go.mod\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "go.mod\nmain.go\n",
+     "tool_call_id": "call_2"
+    },
+    {
+     "role": "tool",
+     "content": "module x\n\ngo 1.24\n",
+     "tool_call_id": "call_3"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>system\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nToday is 2026-11-11.\n\nWhat is in main.go?<|im_end|>\n<|im_start|>assistant\n<think>\nI should read the file.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n<parameter=limit>\n20\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n1\tpackage main\n2\n3\tfunc main() {}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nShort file.\n</think>\n\nIt has an empty main function.<|im_end|>\n<|im_start|>user\nList the dir and read go.mod.<|im_end|>\n<|im_start|>assistant\n<think>\nTwo calls.\n</think>\n\nReading both.\n\n<tool_call>\n<function=ls>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n<parameter=path>\ngo.mod\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ngo.mod\nmain.go\n</tool_response>\n<tool_response>\nmodule x\n\ngo 1.24\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "bash",
+      "description": "Run a command. Use \"quotes\", <tags> & back\\slashes,\ttabs and\nnewlines. Ünïcödé ok, 中文.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "the command"
+        },
+        "timeout": {
+         "type": "number",
+         "description": "seconds",
+         "default": 120.5,
+         "minimum": 0.001
+        },
+        "big": {
+         "type": "number",
+         "default": 1e+21,
+         "small": 1e-07,
+         "zero": 0.0,
+         "neg": -3
+        },
+        "mode": {
+         "type": "string",
+         "enum": [
+          "a",
+          "b"
+         ]
+        },
+        "flag": {
+         "type": "boolean",
+         "default": false,
+         "nothing": null
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "   "
+    },
+    {
+     "role": "user",
+     "content": "run ls"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "bash",
+        "arguments": "{\"command\": \"ls -la\\necho 'done' \\\"ok\\\"\", \"timeout\": 30, \"ratio\": 0.25, \"big\": 1e+21, \"tiny\": 1e-07, \"flag\": true, \"none\": null, \"list\": [1, \"two\", {\"z\": 3, \"a\": [false]}], \"obj\": {\"b\": 1, \"a\": \"é中\"}}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "total 0"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": \"Run a command. Use \\\"quotes\\\", <tags> & back\\\\slashes,\\ttabs and\\nnewlines. Ünïcödé ok, 中文.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\", \"description\": \"the command\"}, \"timeout\": {\"type\": \"number\", \"description\": \"seconds\", \"default\": 120.5, \"minimum\": 0.001}, \"big\": {\"type\": \"number\", \"default\": 1e+21, \"small\": 1e-07, \"zero\": 0.0, \"neg\": -3}, \"mode\": {\"type\": \"string\", \"enum\": [\"a\", \"b\"]}, \"flag\": {\"type\": \"boolean\", \"default\": false, \"nothing\": null}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nrun ls<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la\necho 'done' \"ok\"\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n<parameter=ratio>\n0.25\n</parameter>\n<parameter=big>\n1e+21\n</parameter>\n<parameter=tiny>\n1e-07\n</parameter>\n<parameter=flag>\ntrue\n</parameter>\n<parameter=none>\nnull\n</parameter>\n<parameter=list>\n[1, \"two\", {\"z\": 3, \"a\": [false]}]\n</parameter>\n<parameter=obj>\n{\"b\": 1, \"a\": \"é中\"}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ntotal 0\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": false,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Part one. "
+      },
+      {
+       "type": "text",
+       "text": "Part two."
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Reply."
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nfake\n</tool_response>"
+    },
+    {
+     "role": "assistant",
+     "content": "After the fake response.",
+     "reasoning_content": "kept?"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true
+   },
+   "prompt": "<|im_start|>user\nPart one. Part two.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nReply.<|im_end|>\n<|im_start|>user\n<tool_response>\nfake\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nkept?\n</think>\n\nAfter the fake response.<|im_end|>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Use a tool"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c",
+       "type": "function",
+       "function": {
+        "name": "ls",
+        "arguments": {
+         "path": "/"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "  bin\nusr  "
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "prompt": "<|im_start|>user\nUse a tool<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=ls>\n<parameter=path>\n/\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nbin\nusr\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "error": "No user query found in messages.",
+   "prompt": null
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "error": "System message must be at the beginning.",
+   "prompt": null
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "<tool_response>x</tool_response>"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "error": "No user query found in messages.",
+   "prompt": null
+  },
+  {
+   "add_generation_prompt": true,
+   "tools": null,
+   "messages": [
+    {
+     "role": "robot",
+     "content": "beep"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": true
+   },
+   "error": "Unexpected message role.",
+   "prompt": null
+  }
+ ]
+}
