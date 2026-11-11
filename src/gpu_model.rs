@@ -392,7 +392,7 @@ mod mac {
         logits: View,
         scratch: Scratch,
         /// Samples the next token from `logits` in the same command buffer.
-        sampler: GpuSampler,
+        pub(crate) sampler: GpuSampler,
         pub(crate) capacity: usize,
         pub(crate) position: usize,
     }

@@ -226,7 +226,7 @@ mod mac {
                         plan.params = p.clone();
                         record_embed(&mut plan, &self.embed, &row(&x, r, h));
                     }
-                    plan.params = saved;
+                    plan.params = saved.clone();
                     Norm::rows(m, h, cfg.rms_norm_eps, &self.layers[0].input_norm)
                         .record(&mut plan, &x, &s.normed, false);
                     for (l, layer) in self.layers.iter().enumerate() {
@@ -254,6 +254,13 @@ mod mac {
                         MTLSize::new(m as u64, 1, 1),
                         MTLSize::new(1024, 1, 1),
                     );
+                    // The model's sampler on every row, with that row's
+                    // params, as Prefill::verify does.
+                    for (r, p) in param_views.iter().enumerate().take(m) {
+                        plan.params = p.clone();
+                        self.sampler.record(&mut plan, &row(&logits, r, vocab));
+                    }
+                    plan.params = saved;
                     let built = plan.build();
                     (plan, built)
                 })
