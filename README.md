@@ -2,7 +2,7 @@
 
 An inference engine for the Qwen3.6 MoE models on Apple Silicon, written in Rust with Metal kernels. It runs one model family on one kind of machine and is built to be faster than MLX and llama.cpp there.
 
-Work in progress. Nothing runs a model yet.
+Work in progress. The full model runs on the GPU and matches the CPU reference (logits within 3e-6 relative RMS, the same 16 greedy tokens). Prompts are still read one token at a time, so long prompts are slow.
 
 ## Target
 
@@ -16,6 +16,8 @@ Measured with `mlx_lm.server` on that Mac (one run each):
 - MLX decode today: 76 tokens/s at short context, 66 at about 12k tokens
 
 `tools/bench.py` measures any OpenAI-compatible server the same way. MLX with it, 3 runs each: 71.4 tokens/s and 0.14 s to the first token on a 39-token prompt; 62.5 tokens/s and 13.4 s to the first token on a 15,429-token prompt.
+
+saetta GPU decode, same tool, 3 runs: 90.5 tokens/s on the 39-token prompt (MLX 71.4). Time to first token there is 0.39 s (MLX 0.14 s); the 15k-token prompt took over 14 minutes and was stopped, so batched prefill is the next target.
 
 The gap comes from per-token overhead, not memory speed. The plan is fused kernels, one prebuilt command buffer per token, speculative decoding with the model's MTP layer, and saved recurrent state so a chat never reads its prompt twice. See [docs/PLAN.md](docs/PLAN.md).
 
