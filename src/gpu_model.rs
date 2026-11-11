@@ -66,7 +66,7 @@ mod mac {
     }
 
     /// Records the router: `ids` and `weights` get the `top_k` best of the
-    /// softmax over `logits`, renormalized. One threadgroup.
+    /// softmax over `logits`, renormalized. One simdgroup.
     pub fn record_route(
         plan: &mut Plan,
         logits: &View,
@@ -75,13 +75,14 @@ mod mac {
         ids: &View,
         weights: &View,
     ) {
-        assert!(experts <= 1024 && top_k <= 16);
+        // ROUTE_PER_LANE values in each of 32 lanes.
+        assert!(experts <= 256 && top_k <= 16);
         let shape = plan.constant(&[experts as u32, top_k as u32]);
         plan.op(
             "route_top_k",
             &[logits, ids, weights, &shape],
             MTLSize::new(1, 1, 1),
-            MTLSize::new(experts.next_multiple_of(32) as u64, 1, 1),
+            MTLSize::new(32, 1, 1),
         );
     }
 
@@ -517,6 +518,30 @@ mod mac {
                     assert!((got_w[k] - w).abs() < 1e-6, "case {case} slot {k}");
                 }
             }
+        }
+
+        /// Microseconds per route_top_k, as 40 dependent ops in one plan,
+        /// the way a token runs them. Take the bench lock (timed.sh).
+        #[test]
+        #[ignore = "a timing run"]
+        fn route_time() {
+            let gpu = Gpu::new().unwrap();
+            let logits: Vec<f32> = (0..256).map(|i| (i as f32 * 0.71).sin()).collect();
+            let input = View::new(gpu.buffer_from(&logits));
+            let (ids, weights) = (view(&gpu, 8), view(&gpu, 8));
+            let mut plan = Plan::new(&gpu);
+            for _ in 0..40 {
+                record_route(&mut plan, &input, 256, 8, &ids, &weights);
+            }
+            let built = plan.build();
+            let mut times: Vec<f64> = (0..21)
+                .map(|_| built.run(&gpu).as_secs_f64() * 1e6 / 40.0)
+                .collect();
+            times.sort_by(f64::total_cmp);
+            println!(
+                "route_top_k: best {:.2} us, median {:.2} us per op",
+                times[0], times[10]
+            );
         }
 
         fn open() -> (Config, Weights) {
