@@ -770,11 +770,13 @@ mod mac {
                 // The mma attention sums in another order: 1.2e-4 at token 13.
                 // A key or value that rounds to the next code moves by a
                 // step: 1e-3 of the logits at 8 bits, and 2.6e-2 when that
-                // tips a near tie of the router (token 5).
+                // tips a near tie of the router (token 5). At 4 bits the
+                // values carry 9e-2 of rounding error and many keys sit near
+                // a code boundary: up to 1.2e-1 by token 10.
                 let bound = match bits {
                     KvBits::Half => 3e-4,
                     KvBits::Eight => 5e-2,
-                    KvBits::Four => 1e-1,
+                    KvBits::Four => 2e-1,
                 };
                 assert!(err < bound);
                 if bits == KvBits::Half {
