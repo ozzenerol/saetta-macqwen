@@ -698,6 +698,13 @@ mod mac {
             let gpu = Gpu::new().unwrap();
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
             let mut states = cpu.new_states();
+            // The GPU cache is half; the CPU rounds its keys and values the
+            // same way, so what is left is the f32 arithmetic.
+            for s in &mut states {
+                if let crate::cpu::model::LayerState::Full(c) = s {
+                    c.round_to_half();
+                }
+            }
             let mut cpu_logits = Vec::new();
             let mut gpu_logits = Vec::new();
             for &t in &TOKENS {

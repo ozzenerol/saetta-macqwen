@@ -14,6 +14,13 @@ use crate::speculative::Decider;
 pub const DEFAULT_LIMIT: usize = 16;
 /// A long prefill takes a snapshot at every multiple of this many tokens.
 pub const DEFAULT_EVERY: usize = 1024;
+/// Of the snapshots one prefill takes on the way, it keeps the first and
+/// the last few, so a long prompt does not push out every other
+/// conversation.
+const KEEP_ON_THE_WAY: usize = 4;
+
+/// Snapshots at the end of a first message that eviction keeps.
+pub const MAX_ANCHORS: usize = 2;
 
 /// KV rows a backup holds at most: 16384 rows of the 35B model are 335 MB
 /// in f32, taken only as far as rows are copied.
@@ -56,6 +63,9 @@ struct Snapshot<S> {
     used: u64,
     /// The snapshot at the end of the last prompt, kept when evicting.
     pinned: bool,
+    /// At the end of a first message, the system prompt that a new
+    /// conversation shares; kept when evicting, MAX_ANCHORS at most.
+    anchored: bool,
 }
 
 impl<S> Snapshots<S> {
@@ -87,9 +97,10 @@ impl<S> Snapshots<S> {
     }
 
     /// Adds a snapshot, or marks the existing one for the same tokens as used.
-    /// With `pin`, it becomes the only pinned one. Evicts the least recently
-    /// used unpinned snapshots above the limit.
-    pub fn insert(&mut self, tokens: &[u32], state: impl FnOnce() -> S, pin: bool) {
+    /// With `pin`, it becomes the only pinned one; with `anchor`, an anchor,
+    /// and the least recently used anchor past MAX_ANCHORS a plain snapshot.
+    /// Evicts the least recently used other snapshots above the limit.
+    pub fn insert(&mut self, tokens: &[u32], state: impl FnOnce() -> S, pin: bool, anchor: bool) {
         self.clock += 1;
         if pin {
             for s in &mut self.items {
@@ -100,20 +111,31 @@ impl<S> Snapshots<S> {
             Some(s) => {
                 s.used = self.clock;
                 s.pinned |= pin;
+                s.anchored |= anchor;
             }
             None => self.items.push(Snapshot {
                 tokens: tokens.to_vec(),
                 state: state(),
                 used: self.clock,
                 pinned: pin,
+                anchored: anchor,
             }),
+        }
+        while self.items.iter().filter(|s| s.anchored).count() > MAX_ANCHORS {
+            let oldest = self
+                .items
+                .iter_mut()
+                .filter(|s| s.anchored)
+                .min_by_key(|s| s.used)
+                .unwrap();
+            oldest.anchored = false;
         }
         while self.items.len() > self.limit {
             let oldest = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| !s.pinned)
+                .filter(|(_, s)| !s.pinned && !s.anchored)
                 .min_by_key(|(_, s)| s.used)
                 .map(|(i, _)| i);
             match oldest {
@@ -121,6 +143,12 @@ impl<S> Snapshots<S> {
                 None => break,
             };
         }
+    }
+
+    /// Drops the snapshot of exactly these tokens, unless it is pinned or an anchor.
+    pub fn remove(&mut self, tokens: &[u32]) {
+        self.items
+            .retain(|s| s.pinned || s.anchored || s.tokens != tokens);
     }
 
     /// The tokens of each snapshot.
@@ -160,6 +188,9 @@ pub struct Cached<M: Restore> {
     tokens: Vec<u32>,
     snapshots: Snapshots<M::State>,
     every: usize,
+    /// The token that ends a message (<|im_end|>): prefill keeps an anchor
+    /// snapshot after the first one.
+    message_end: Option<u32>,
     /// The token in each KV row, as far as rows were written; past
     /// `tokens` they belong to an earlier branch. u32::MAX is unknown.
     rows: Vec<u32>,
@@ -183,9 +214,18 @@ impl<M: Model + Restore> Cached<M> {
             tokens: Vec::new(),
             snapshots: Snapshots::new(limit),
             every: every.max(1),
+            message_end: None,
             rows: Vec::new(),
             backup: None,
         }
+    }
+
+    /// Keeps a snapshot after the first `token`, the end of the system
+    /// prompt, past eviction, so a new conversation with the same system
+    /// prompt starts from it.
+    pub fn anchor_after(mut self, token: u32) -> Cached<M> {
+        self.message_end = Some(token);
+        self
     }
 
     /// Records that `tokens` went into the rows from `at`.
@@ -222,11 +262,27 @@ impl<M: Model + Restore> Cached<M> {
     }
 
     fn save(&mut self, pin: bool) {
+        self.save_as(pin, false);
+    }
+
+    fn save_as(&mut self, pin: bool, anchor: bool) {
         if self.tokens.is_empty() {
             return;
         }
         let model = &self.model;
-        self.snapshots.insert(&self.tokens, || model.save(), pin);
+        self.snapshots
+            .insert(&self.tokens, || model.save(), pin, anchor);
+    }
+
+    /// Tokens up to and with the first message end of the state followed by
+    /// `tokens`, if it falls in `tokens`.
+    fn anchor_in(&self, tokens: &[u32]) -> Option<usize> {
+        let end = self.message_end?;
+        if self.tokens.contains(&end) {
+            return None;
+        }
+        let i = tokens.iter().position(|&t| t == end)?;
+        Some(self.tokens.len() + i + 1)
     }
 }
 
@@ -236,22 +292,54 @@ impl<M: Model + Restore> Model for Cached<M> {
     /// The last one lets a retry of the same prompt rerun a single token,
     /// which goes through `step`.
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        match self.prefill_while(tokens, &mut || true) {
+            Ok(logits) => logits,
+            Err(_) => unreachable!("alive is always true"),
+        }
+    }
+
+    /// Asks `alive` before each piece. When it says false, the state ends
+    /// at the last piece run, with its snapshot saved.
+    fn prefill_while(
+        &mut self,
+        tokens: &[u32],
+        alive: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, usize> {
         self.save(false);
         if tokens.is_empty() {
-            return self.model.prefill(tokens);
+            return Ok(self.model.prefill(tokens));
         }
         let start = self.tokens.len();
-        self.write_rows(start, tokens);
         let last = start + tokens.len() - 1;
+        let anchor = self.anchor_in(tokens).filter(|&a| a <= last);
         let mut done = 0;
+        // Lengths of the snapshots taken on the way that were new.
+        let mut taken: Vec<usize> = Vec::new();
         while start + done < last {
-            let next_stop = ((start + done) / self.every + 1) * self.every;
-            let stop = next_stop.min(last);
+            if !alive() {
+                return Err(start + done);
+            }
+            let mut stop = (((start + done) / self.every + 1) * self.every).min(last);
+            if let Some(a) = anchor.filter(|&a| a > start + done) {
+                stop = stop.min(a);
+            }
             let chunk = &tokens[done..stop - start];
+            self.write_rows(start + done, chunk);
             self.model.prefill(chunk);
             self.tokens.extend_from_slice(chunk);
             done = stop - start;
-            self.save(stop == last);
+            let at_anchor = Some(stop) == anchor;
+            if stop == last || at_anchor {
+                // The anchor is not one of the snapshots on the way.
+                self.save_as(stop == last, at_anchor);
+            } else if !self.snapshots.contains(&self.tokens) {
+                self.save(false);
+                taken.push(stop);
+                if taken.len() > KEEP_ON_THE_WAY {
+                    let len = taken.remove(1);
+                    self.snapshots.remove(&self.tokens[..len]);
+                }
+            }
         }
         if start == last {
             self.save(true);
@@ -259,8 +347,9 @@ impl<M: Model + Restore> Model for Cached<M> {
         // One token is left. A decode step runs it in a few ms, where a
         // prefill call has a fixed cost of about half a second on the GPU.
         let token = tokens[done];
+        self.write_rows(start + done, &[token]);
         self.tokens.push(token);
-        self.model.step(token)
+        Ok(self.model.step(token))
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
@@ -610,6 +699,15 @@ mod tests {
     }
 
     #[test]
+    fn long_prefill_keeps_the_first_and_last_snapshots() {
+        let mut c = Cached::new(Toy::default(), 16, 4);
+        c.prefill(&tokens(10, 9));
+        c.reset();
+        c.prefill(&tokens(42, 0));
+        assert_eq!(c.snapshots().lengths(), vec![4, 4, 8, 9, 32, 36, 40, 41]);
+    }
+
+    #[test]
     fn restore_gives_the_same_logits() {
         let mut c = Cached::new(Toy::default(), 16, 4);
         let a = tokens(10, 0);
@@ -691,17 +789,70 @@ mod tests {
     #[test]
     fn evicts_least_used_but_keeps_last_prompt() {
         let mut s = Snapshots::new(3);
-        s.insert(&[1], || 1, true);
-        s.insert(&[2], || 2, false);
-        s.insert(&[3], || 3, false);
-        s.insert(&[4], || 4, false);
+        s.insert(&[1], || 1, true, false);
+        s.insert(&[2], || 2, false, false);
+        s.insert(&[3], || 3, false, false);
+        s.insert(&[4], || 4, false, false);
         assert_eq!(s.lengths(), vec![1, 1, 1]);
         assert!(s.contains(&[1]) && !s.contains(&[2]));
 
         // Using [3] makes [4] the oldest.
         assert_eq!(s.find(&[3, 9]).map(|(n, v)| (n, *v)), Some((1, 3)));
-        s.insert(&[5], || 5, false);
+        s.insert(&[5], || 5, false, false);
         assert!(s.contains(&[1]) && s.contains(&[3]) && !s.contains(&[4]));
+    }
+
+    #[test]
+    fn anchors_survive_eviction_and_are_capped() {
+        let mut s = Snapshots::new(3);
+        s.insert(&[1], || 1, false, true);
+        for t in 2..8 {
+            s.insert(&[t], || t, false, false);
+        }
+        assert!(s.contains(&[1]));
+        s.insert(&[8], || 8, false, true);
+        s.insert(&[9], || 9, false, true);
+        // Three anchors: [1], used least recently, is a plain snapshot again.
+        s.insert(&[10], || 10, false, false);
+        assert!(!s.contains(&[1]) && s.contains(&[8]) && s.contains(&[9]));
+    }
+
+    #[test]
+    fn thinning_keeps_the_anchor() {
+        const END: u32 = 1_000_000;
+        let mut c = Cached::new(Toy::keeping(), 16, 2).anchor_after(END);
+        let mut prompt = tokens(5, 0);
+        prompt.push(END);
+        prompt.extend(tokens(30, 1));
+        c.prefill(&prompt);
+        let lengths = c.snapshots().lengths();
+        assert!(lengths.contains(&6), "{lengths:?}");
+        assert_eq!(lengths.len(), KEEP_ON_THE_WAY + 2, "{lengths:?}");
+    }
+
+    /// A long conversation pushes every early snapshot out, but a new one
+    /// with the same system prompt still starts after it.
+    #[test]
+    fn new_conversation_reuses_the_system_prompt() {
+        const END: u32 = 1_000_000;
+        let mut c = Cached::new(Toy::keeping(), 4, 4).anchor_after(END);
+        let mut system = tokens(6, 0);
+        system.push(END);
+        let mut talk = system.clone();
+        talk.extend(tokens(20, 1));
+        for turn in 0..4 {
+            talk.push(END);
+            talk.extend(tokens(10, 2 + turn));
+            let (logits, _) = request(&mut c, &talk);
+            assert_eq!(logits, fresh(&talk));
+        }
+        assert!(c.snapshots().lengths().iter().all(|&n| n == 7 || n > 40));
+
+        let mut fresh_talk = system.clone();
+        fresh_talk.extend(tokens(9, 50));
+        let (logits, keep) = request(&mut c, &fresh_talk);
+        assert_eq!(keep, 7);
+        assert_eq!(logits, fresh(&fresh_talk));
     }
 
     /// Going back to a snapshot and running the same tokens gives the same
