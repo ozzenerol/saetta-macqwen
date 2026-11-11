@@ -95,9 +95,10 @@ inline device float *partial_out(device float *part_o, constant DecodeParams &p,
 }
 
 // Scores as S^T = K Q^T in 8x8 tiles, so key rows load as they lie in the
-// cache, and the values as O = P V. q is read from device memory (16 KB,
-// it stays in cache), which leaves threadgroup memory to the scores and lets
-// more threadgroups run per core.
+// cache, and the values as O = P V. q, times the scale, sits in threadgroup
+// memory, as in the one-threadgroup-per-chunk kernel this replaced; with q
+// read from device memory on every tile, decode at 262k ran at 39.8 tok/s
+// against that kernel's 42.6.
 kernel void attention_partial_mma(device const float *q [[buffer(0)]],
                                   device const half *keys [[buffer(1)]],
                                   device const half *values [[buffer(2)]],
@@ -106,8 +107,10 @@ kernel void attention_partial_mma(device const float *q [[buffer(0)]],
                                   constant DecodeParams &p [[buffer(5)]],
                                   constant TokenParams &tp [[buffer(6)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
                                   uint simd [[simdgroup_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[DEC_GROUP * DEC_DIM];
     threadgroup float sc[DEC_GROUP][DEC_SC];
     threadgroup float alpha[DEC_GROUP];
     uint len = min(tp.kv_len, p.capacity);
@@ -117,7 +120,11 @@ kernel void attention_partial_mma(device const float *q [[buffer(0)]],
     uint kv = tg.y;
     uint stride = p.kv_heads * DEC_DIM;
     uint2 f = frag(lane);
-    device const float *qh = q + kv * DEC_GROUP * DEC_DIM;
+    for (uint i = tid; i < DEC_GROUP * DEC_DIM; i += 256) {
+        qs[i] = q[kv * DEC_GROUP * DEC_DIM + i] * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const float *qh = qs;
 
     float m = DEC_NO_SCORE, l = 0;
     simdgroup_float8x8 o[4];
@@ -145,7 +152,7 @@ kernel void attention_partial_mma(device const float *q [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        chunk_softmax(sc[simd], n, p.scale, m, l, alpha, simd, lane);
+        chunk_softmax(sc[simd], n, 1.0f, m, l, alpha, simd, lane);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Values: simdgroup s takes dims 32s .. 32s + 31, four tiles of 8.
@@ -207,8 +214,10 @@ kernel void attention_partial_mma_q(device const float *q [[buffer(0)]],
                                     constant DecodeParams &p [[buffer(9)]],
                                     constant TokenParams &tp [[buffer(10)]],
                                     uint2 tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
                                     uint simd [[simdgroup_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[DEC_GROUP * DEC_DIM];
     threadgroup float sc[DEC_GROUP][DEC_SC];
     threadgroup float alpha[DEC_GROUP];
     uint len = min(tp.kv_len, p.capacity);
@@ -219,7 +228,11 @@ kernel void attention_partial_mma_q(device const float *q [[buffer(0)]],
     uint per_token = p.kv_heads * 4;
     constexpr uint WORDS = 2 * BITS;  // words per group
     uint2 f = frag(lane);
-    device const float *qh = q + kv * DEC_GROUP * DEC_DIM;
+    for (uint i = tid; i < DEC_GROUP * DEC_DIM; i += 256) {
+        qs[i] = q[kv * DEC_GROUP * DEC_DIM + i] * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const float *qh = qs;
 
     float m = DEC_NO_SCORE, l = 0;
     simdgroup_float8x8 o[4];
@@ -255,7 +268,7 @@ kernel void attention_partial_mma_q(device const float *q [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        chunk_softmax(sc[simd], n, p.scale, m, l, alpha, simd, lane);
+        chunk_softmax(sc[simd], n, 1.0f, m, l, alpha, simd, lane);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Values: simdgroup s takes dims 32s .. 32s + 31, four tiles of 8,
