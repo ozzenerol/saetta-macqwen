@@ -250,7 +250,7 @@ impl Default for Memory {
             // The full context of Qwen3.6.
             context: 262144,
             cache_bytes: 1 << 30,
-            kv_bits: KvBits::Half,
+            kv_bits: KvBits::Eight,
         }
     }
 }
