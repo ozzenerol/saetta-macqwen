@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-//! attention_flash against prefill's attention_rows2_half on random data.
+//! attention_gq4_128 and attention_g4_128 against prefill's attention_rows2_half on random data.
 
 use metal::MTLSize;
 use saetta::attention_prefill::{FlashParams, encode_kernel};
@@ -53,7 +53,7 @@ fn matches_rows2() {
                 MTLSize::new(128, 1, 1),
             );
         });
-        for kernel in ["attention_flash", "attention_flash_pre", "attention_flash_reg_64", "attention_g4_64", "attention_g8_64", "attention_g4_32", "attention_g4_128", "attention_gq4_64", "attention_gq8_64", "attention_gq4_128", "attention_g2_128", "attention_g2_256", "attention_gq2_128", "attention_gq2_256", "attention_gq1_256"] {
+        for kernel in ["attention_gq4_128", "attention_g4_128"] {
             gpu.run(|enc| encode_kernel(enc, &gpu, kernel, &q, &k, &v, &g, &got, p));
             let n = tokens * HEADS * DIM;
             let (a, b) = (contents::<f32>(&got.buffer, n), contents::<f32>(&want.buffer, n));

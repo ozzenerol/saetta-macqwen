@@ -1,5 +1,5 @@
 //! Causal attention for a prefill chunk (kernels/attention_prefill.metal),
-//! flash style on simdgroup matrices. Half q, keys and values; the buffers
+//! on simdgroup matrices. Half q, keys and values; the buffers
 //! and parameters of prefill's attention_rows.
 
 /// Must match FlashParams in the kernel (and PrefillAttentionParams).
@@ -24,14 +24,14 @@ mod mac {
     use crate::qmv::View;
     use metal::{ComputeCommandEncoderRef, MTLSize};
 
-    /// Tokens per threadgroup; must match AF_TOK.
-    const TOKENS: usize = 8;
+    /// Simdgroups per threadgroup of both kernels.
+    const SIMDS: u64 = 4;
 
     /// out[t, h] = softmax(q[t, h] K^T * scale) V * sigmoid(gate[t, h]).
     /// q is half [tokens][heads][256], keys and values the half cache from
-    /// position 0 ([capacity][kv_heads][256], with room for 31 keys past
-    /// pos + tokens), q_and_gate f32 [tokens][heads][512] with the gate in
-    /// the second half of each head, out f32 [tokens][heads][256].
+    /// position 0 ([capacity][kv_heads][256]), q_and_gate f32
+    /// [tokens][heads][512] with the gate in the second half of each head,
+    /// out f32 [tokens][heads][256].
     #[allow(clippy::too_many_arguments)]
     pub fn encode(
         enc: &ComputeCommandEncoderRef,
@@ -43,10 +43,11 @@ mod mac {
         out: &View,
         p: FlashParams,
     ) {
-        encode_kernel(enc, gpu, "attention_flash", q, keys, values, q_and_gate, out, p);
+        encode_kernel(enc, gpu, "attention_gq4_128", q, keys, values, q_and_gate, out, p);
     }
 
-    /// `encode` with a named variant: attention_flash or attention_flash_pre.
+    /// `encode` with a named kernel: attention_gq4_128 (rows = the 8 q heads
+    /// of a kv head) or attention_g4_128 (rows = 8 tokens of a head).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_kernel(
         enc: &ComputeCommandEncoderRef,
@@ -59,36 +60,21 @@ mod mac {
         out: &View,
         p: FlashParams,
     ) {
-        assert_eq!(p.heads, p.kv_heads * 8, "attention_flash needs 8 q heads per kv head");
-        // attention_flash_reg: 4 tokens of 32 threads each per threadgroup.
-        let (tokens, threads) = if kernel.starts_with("attention_flash_reg") { (4, 128) } else { (TOKENS, 256) };
-        // attention_gS_KB: 8 tokens of S heads per threadgroup.
-        let g_heads = kernel.strip_prefix("attention_g").and_then(|r| r.split('_').next()).and_then(|n| n.parse::<u32>().ok());
         enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
         for (i, v) in [q, keys, values, q_and_gate, out].iter().enumerate() {
             enc.set_buffer(i as u64, Some(&v.buffer), v.offset);
         }
         enc.set_bytes(5, size_of::<FlashParams>() as u64, (&p as *const FlashParams).cast());
-        // attention_gqS_KB: S tokens of one kv head per threadgroup.
-        let gq = kernel.strip_prefix("attention_gq").and_then(|r| r.split('_').next()).and_then(|n| n.parse::<u32>().ok());
-        if let Some(s) = gq {
-            enc.dispatch_thread_groups(
-                MTLSize::new((p.tokens as usize).div_ceil(s as usize) as u64, p.kv_heads as u64, 1),
-                MTLSize::new(32 * s as u64, 1, 1),
-            );
-            return;
-        }
-        if let Some(s) = g_heads {
-            enc.dispatch_thread_groups(
-                MTLSize::new((p.tokens as usize).div_ceil(8) as u64, (p.heads / s) as u64, 1),
-                MTLSize::new(32 * s as u64, 1, 1),
-            );
-            return;
-        }
-        enc.dispatch_thread_groups(
-            MTLSize::new((p.tokens as usize).div_ceil(tokens) as u64, p.kv_heads as u64, 1),
-            MTLSize::new(threads, 1, 1),
-        );
+        let tokens = p.tokens as u64;
+        let grid = match kernel {
+            "attention_gq4_128" => {
+                assert_eq!(p.heads, p.kv_heads * 8, "{kernel} needs 8 q heads per kv head");
+                MTLSize::new(tokens.div_ceil(SIMDS), p.kv_heads as u64, 1)
+            }
+            "attention_g4_128" => MTLSize::new(tokens.div_ceil(8), p.heads as u64 / SIMDS, 1),
+            _ => panic!("no prefill attention kernel {kernel}"),
+        };
+        enc.dispatch_thread_groups(grid, MTLSize::new(32 * SIMDS, 1, 1));
     }
 }
 
@@ -115,7 +101,7 @@ pub fn bench(tokens: usize, chunk: usize) -> Result<(), Box<dyn std::error::Erro
         flops += 4.0 * (heads * dim) as f64 * (t * pos + t * (t + 1) / 2) as f64;
         pos += t;
     }
-    for kernel in ["attention_rows2_half", "attention_g4_128", "attention_gq4_128", "attention_g2_128", "attention_g2_256", "attention_gq2_128", "attention_gq2_256", "attention_gq1_256"] {
+    for kernel in ["attention_rows2_half", "attention_gq4_128", "attention_g4_128"] {
         let mut total = 0.0;
         let mut pos = 0;
         while pos < tokens {
