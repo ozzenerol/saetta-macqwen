@@ -47,14 +47,22 @@ inline ulong prefill_ag_kv_row(constant AttGemmParams &p, uint g, uint j) {
     return (ulong(j) * p.kv_heads + g) * PREFILL_AG_D;
 }
 
+// BITS of the kernels that read a block staged as half by
+// prefill_ag_stage: h holds keys j0 .. j0 + n only.
+constant uint PREFILL_AG_STAGED = 1;
+
 // Dims dim .. dim + 3 of key (or value) j of kv head g: from the half
-// cache h, or with BITS 8 or 4 from the codes in place.
+// cache h, from the staged block h with BITS PREFILL_AG_STAGED, or with
+// BITS 8 or 4 from the codes in place.
 template <uint BITS>
 inline half4 prefill_ag_kv4(device const half *h, device const uint *codes,
                             device const half *scales, device const half *biases,
                             constant AttGemmParams &p, uint g, uint j, uint dim) {
     if (BITS == 16) {
         return *(device const half4 *)(h + prefill_ag_kv_row(p, g, j) + dim);
+    }
+    if (BITS == PREFILL_AG_STAGED) {
+        return *(device const half4 *)(h + prefill_ag_kv_row(p, g, j - p.j0) + dim);
     }
     uint group = (j * p.kv_heads + g) * (PREFILL_AG_D / 64) + dim / 64;
     return half4(kv_load4<BITS>(codes, scales, biases, group, dim % 64));
@@ -278,6 +286,35 @@ template [[host_name("prefill_ag_scores_q4")]] kernel decltype(prefill_ag_scores
 template [[host_name("prefill_ag_pv")]] kernel decltype(prefill_ag_pv<16>) prefill_ag_pv<16>;
 template [[host_name("prefill_ag_pv_q8")]] kernel decltype(prefill_ag_pv<8>) prefill_ag_pv<8>;
 template [[host_name("prefill_ag_pv_q4")]] kernel decltype(prefill_ag_pv<4>) prefill_ag_pv<4>;
+template [[host_name("prefill_ag_scores_staged")]] kernel decltype(prefill_ag_scores<PREFILL_AG_STAGED>) prefill_ag_scores<PREFILL_AG_STAGED>;
+template [[host_name("prefill_ag_pv_staged")]] kernel decltype(prefill_ag_pv<PREFILL_AG_STAGED>) prefill_ag_pv<PREFILL_AG_STAGED>;
+
+// Keys or values j0 .. j0 + n of every kv head of an 8- or 4-bit cache as
+// half, dst[(j - j0) * kv_heads + g][256], one thread per 4 values. The
+// _q8 and _q4 scores and pv kernels dequantize the block again for every
+// 64-row tile (256 times for a chunk of 2048 tokens); staging it once lets
+// the _staged kernels read plain half instead. The values are the same:
+// both round s * q + z to half.
+template <uint BITS>
+kernel void prefill_ag_stage(device const uint *codes [[buffer(0)]],
+                             device const half *scales [[buffer(1)]],
+                             device const half *biases [[buffer(2)]],
+                             device half *dst [[buffer(3)]],
+                             constant AttGemmParams &p [[buffer(4)]],
+                             uint i [[thread_position_in_grid]]) {
+    constexpr uint QUADS = PREFILL_AG_D / 4;
+    uint per_key = p.kv_heads * QUADS;
+    if (i >= p.n * per_key) {
+        return;
+    }
+    uint jj = i / per_key, r = i % per_key;
+    uint g = r / QUADS, dim = 4 * (r % QUADS);
+    uint group = ((p.j0 + jj) * p.kv_heads + g) * (PREFILL_AG_D / 64) + dim / 64;
+    ((device half4 *)dst)[i] = half4(kv_load4<BITS>(codes, scales, biases, group, dim % 64));
+}
+
+template [[host_name("prefill_ag_stage_q8")]] kernel decltype(prefill_ag_stage<8>) prefill_ag_stage<8>;
+template [[host_name("prefill_ag_stage_q4")]] kernel decltype(prefill_ag_stage<4>) prefill_ag_stage<4>;
 
 // y[token][head][d] = O / l * sigmoid(gate), thread id = (d, r, g).
 kernel void prefill_ag_final(device const float *o [[buffer(0)]],

@@ -49,11 +49,15 @@ mod mac {
         m: Buffer,
         l: Buffer,
         alpha: Buffer,
+        /// One block of keys and of values of a quantized cache as half
+        /// (`prefill_ag_stage`): 1 MB each with 2 kv heads.
+        staged_keys: Buffer,
+        staged_values: Buffer,
     }
 
     impl AttGemm {
         /// About 7 KB per query row: 112 KB per token of chunk with 2 kv
-        /// heads, 230 MB for 2048 tokens.
+        /// heads, 230 MB for 2048 tokens, plus 2 MB for a staged block.
         pub fn new(gpu: &Gpu, chunk: usize, kv_heads: usize) -> AttGemm {
             let rows_pad = (chunk * GROUP).next_multiple_of(64);
             let rows = kv_heads * rows_pad;
@@ -65,6 +69,8 @@ mod mac {
                 m: gpu.buffer(rows * 4),
                 l: gpu.buffer(rows * 4),
                 alpha: gpu.buffer(rows * 4),
+                staged_keys: gpu.buffer(KEYS * kv_heads * DIM * 2),
+                staged_values: gpu.buffer(KEYS * kv_heads * DIM * 2),
             }
         }
 
@@ -118,6 +124,18 @@ mod mac {
                 Some(KvBits::Four) => "_q4",
                 Some(b) => panic!("no gemm attention for {b:?} rows"),
             };
+            // A quantized block is staged as half once, unless
+            // SAETTA_KV_STAGE=0 (to compare with reading it in place).
+            let stage = quant.is_some() && std::env::var("SAETTA_KV_STAGE").as_deref() != Ok("0");
+            let stage_kernel = stage.then(|| gpu.pipeline(&format!("prefill_ag_stage{suffix}")));
+            let suffix = if stage { "_staged" } else { suffix };
+            let (staged_keys, staged_values) =
+                (whole(&self.staged_keys), whole(&self.staged_values));
+            let (keys, values) = if stage {
+                (&staged_keys, &staged_values)
+            } else {
+                (keys, values)
+            };
             let (scores, pv) = (
                 gpu.pipeline(&format!("prefill_ag_scores{suffix}")),
                 gpu.pipeline(&format!("prefill_ag_pv{suffix}")),
@@ -126,8 +144,8 @@ mod mac {
             // kernels do not read these slots, so they get the half cache.
             let parts = |r: &QuantRows| [whole(&r.data), whole(&r.scales), whole(&r.biases)];
             let (kq, vq) = match quant {
-                Some((k, v)) => (parts(k), parts(v)),
-                None => (
+                Some((k, v)) if !stage => (parts(k), parts(v)),
+                _ => (
                     [keys.clone(), keys.clone(), keys.clone()],
                     [values.clone(), values.clone(), values.clone()],
                 ),
@@ -149,6 +167,15 @@ mod mac {
                     n: n as u32,
                     scale: f.scale,
                 };
+                if let (Some(kernel), Some((kr, vr))) = (&stage_kernel, quant) {
+                    enc.set_compute_pipeline_state(kernel);
+                    let quads = (n * f.kv_heads as usize * DIM / 4) as u64;
+                    for (r, dst) in [(kr, keys), (vr, values)] {
+                        set(&[&whole(&r.data), &whole(&r.scales), &whole(&r.biases), dst]);
+                        bytes(4, &params);
+                        enc.dispatch_threads(MTLSize::new(quads, 1, 1), MTLSize::new(256, 1, 1));
+                    }
+                }
                 enc.set_compute_pipeline_state(&scores);
                 set(&[q, keys, &s]);
                 bytes(3, &params);
