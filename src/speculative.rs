@@ -8,8 +8,6 @@
 //! The verify pass runs over all `k + 1` tokens, as a batched GPU pass will,
 //! so the rollback is exercised on every rejection.
 
-use std::collections::HashMap;
-
 use crate::cpu::deltanet::DeltaNetState;
 use crate::cpu::model::{LayerState, Model};
 use crate::mtp::Mtp;
@@ -32,16 +30,14 @@ impl Stats {
     }
 }
 
-/// How tokens are picked and drafts checked.
+/// How tokens are picked and drafts checked. Drafts are always the MTP
+/// layer's argmax, so a GPU drafter only has to return a token id.
 pub trait Decider {
     /// A token from the main model's logits.
     fn pick(&mut self, logits: &[f32]) -> u32;
-    /// A draft token from the MTP layer's logits.
-    fn draft(&mut self, logits: &[f32]) -> u32;
-    /// Checks `draft`, drafted from `draft_logits`, against the main model's
-    /// `logits`. `None` accepts it; `Some(t)` rejects it and puts `t` in its
-    /// place.
-    fn check(&mut self, logits: &[f32], draft_logits: &[f32], draft: u32) -> Option<u32>;
+    /// Checks `draft` against the main model's `logits`. `None` accepts it;
+    /// `Some(t)` rejects it and puts `t` in its place.
+    fn check(&mut self, logits: &[f32], draft: u32) -> Option<u32>;
 }
 
 /// Greedy decoding: a draft is accepted when it is the main model's argmax,
@@ -53,22 +49,19 @@ impl Decider for Greedy {
         argmax(logits)
     }
 
-    fn draft(&mut self, logits: &[f32]) -> u32 {
-        argmax(logits)
-    }
-
-    fn check(&mut self, logits: &[f32], _: &[f32], draft: u32) -> Option<u32> {
+    fn check(&mut self, logits: &[f32], draft: u32) -> Option<u32> {
         let best = argmax(logits);
         (best != draft).then_some(best)
     }
 }
 
-/// Sampling with the standard rejection rule: draft `d` drawn from the
-/// drafter's distribution `q` is kept with probability `min(1, p(d) / q(d))`,
-/// and a rejected draft is replaced by a draw from `max(0, p - q)`. The
-/// output then has the same distribution as sampling from the main model.
-/// `p` and `q` are the distributions `Sampler::sample` draws from: top_k
-/// and top_p cut at temperature 1, then the temperature.
+/// Sampling with the rejection rule for a drafter that always proposes one
+/// token `d` (its distribution `q` is one-hot): `d` is kept with probability
+/// `p(d)`, and a rejected `d` is replaced by a draw from `p` without `d`,
+/// which is `max(0, p - q)` normalized. The output then has the same
+/// distribution as sampling from the main model. `p` is the distribution
+/// `Sampler::sample` draws from: top_k and top_p cut at temperature 1, then
+/// the temperature.
 pub struct Sampled {
     pub params: Params,
     pub sampler: Sampler,
@@ -106,29 +99,20 @@ impl Decider for Sampled {
         self.sampler.sample(logits, &self.params)
     }
 
-    fn draft(&mut self, logits: &[f32]) -> u32 {
-        self.sampler.sample(logits, &self.params)
-    }
-
-    fn check(&mut self, logits: &[f32], draft_logits: &[f32], draft: u32) -> Option<u32> {
+    fn check(&mut self, logits: &[f32], draft: u32) -> Option<u32> {
         if self.params.temperature <= 0.0 {
-            return Greedy.check(logits, draft_logits, draft);
+            return Greedy.check(logits, draft);
         }
-        let p = self.distribution(logits);
-        let q: HashMap<u32, f32> = self.distribution(draft_logits).into_iter().collect();
-        let q_of = |id: u32| q.get(&id).copied().unwrap_or(0.0);
+        let mut p = self.distribution(logits);
         let pd = p.iter().find(|d| d.0 == draft).map_or(0.0, |d| d.1);
-        if self.sampler.next_f32() * q_of(draft) < pd {
+        if self.sampler.next_f32() < pd {
             return None;
         }
-        let residual: Vec<(u32, f32)> = p
-            .iter()
-            .map(|&(id, pi)| (id, (pi - q_of(id)).max(0.0)))
-            .collect();
-        if residual.iter().all(|r| r.1 == 0.0) {
-            return Some(self.draw(&p));
+        p.retain(|d| d.0 != draft);
+        if p.is_empty() {
+            return Some(draft);
         }
-        Some(self.draw(&residual))
+        Some(self.draw(&p))
     }
 }
 
@@ -194,15 +178,14 @@ pub fn generate(
         let mut drafts = Vec::with_capacity(k);
         for _ in 0..k {
             g = mtp.step(model, &g, token, &mut mtp_state)?;
-            let logits = model.logits(&g);
-            token = decider.draft(&logits);
-            drafts.push((token, logits));
+            token = argmax(&model.logits(&g));
+            drafts.push(token);
         }
 
         // Verify: run `pending` and all drafts, saving the state after each.
         let mut hiddens = Vec::with_capacity(k + 1);
         let mut saved = Vec::with_capacity(k);
-        for t in std::iter::once(pending).chain(drafts.iter().map(|d| d.0)) {
+        for t in std::iter::once(pending).chain(drafts.iter().copied()) {
             hiddens.push(model.forward_hidden(t, &mut states)?);
             if saved.len() < k {
                 saved.push(save(&states));
@@ -211,9 +194,9 @@ pub fn generate(
 
         let mut accepted = 0;
         let mut next = None;
-        for (i, (draft, draft_logits)) in drafts.iter().enumerate() {
+        for (i, &draft) in drafts.iter().enumerate() {
             let logits = model.logits(&hiddens[i]);
-            match decider.check(&logits, draft_logits, *draft) {
+            match decider.check(&logits, draft) {
                 None => accepted += 1,
                 Some(t) => {
                     next = Some(t);
@@ -242,10 +225,10 @@ pub fn generate(
         // states of the accepted tokens.
         truncate_mtp(&mut mtp_state, mtp_len + 1);
         for i in 0..accepted {
-            mtp.step(model, &hiddens[i], drafts[i].0, &mut mtp_state)?;
+            mtp.step(model, &hiddens[i], drafts[i], &mut mtp_state)?;
         }
 
-        out.extend(drafts.iter().take(accepted).map(|d| d.0));
+        out.extend(&drafts[..accepted]);
         hidden = hiddens.swap_remove(accepted);
         pending = next;
     }
@@ -253,8 +236,8 @@ pub fn generate(
     Ok(out)
 }
 
-/// Greedy decoding of `count` tokens with the MTP layer drafting `k`
-/// tokens at every position. Returns the tokens and, per position, how many
+/// Greedy decoding of up to `count` tokens, stopping after a token in
+/// `stop`, with the MTP layer drafting `k` tokens at every position. Returns the tokens and, per position, how many
 /// leading drafts match the tokens that follow. The MTP cache holds the same
 /// entries as in `generate` at the start of a round, so `lengths[t]` is the
 /// number of drafts a round starting at `t` would accept.
@@ -264,6 +247,7 @@ pub fn draft_lengths(
     prompt: &[u32],
     count: usize,
     k: usize,
+    stop: &[u32],
 ) -> Result<(Vec<u32>, Vec<usize>), String> {
     let mut states = model.new_states();
     let mut mtp_state = mtp.new_state();
@@ -288,6 +272,9 @@ pub fn draft_lengths(
         }
         truncate_mtp(&mut mtp_state, len + 1);
         drafts.push(chain);
+        if stop.contains(&token) {
+            break;
+        }
         hidden = model.forward_hidden(token, &mut states)?;
     }
 
@@ -419,35 +406,46 @@ mod real {
                 vec![read_file],
             ),
             (
+                "json",
+                vec![user(
+                    "Reply with only a JSON object describing a user with fields id (a number), name, email and roles (a list of strings).",
+                )],
+                vec![],
+            ),
+            (
                 "prose",
                 vec![user("Explain in one short paragraph why the sky is blue.")],
                 vec![],
             ),
         ];
-        let (count, k) = (64, 3);
-        for position in [MtpPosition::Hidden, MtpPosition::Token] {
+        // RoPE is relative, so both MTP positions give the same drafts up to
+        // rounding (the greedy test runs both); one is enough here.
+        let (count, k) = (96, 4);
+        for position in [MtpPosition::Hidden] {
             let mtp = Mtp::new(&cfg, &weights, position).unwrap();
             let mut all = Vec::new();
             for (name, messages, tools) in &cases {
                 let prompt = tok.encode(&chat::render(messages, tools, &opts).unwrap());
                 let start = Instant::now();
-                let (tokens, lengths) = draft_lengths(&model, &mtp, &prompt, count, k).unwrap();
+                let (tokens, lengths) =
+                    draft_lengths(&model, &mtp, &prompt, count, k, &cfg.eos_token_ids).unwrap();
                 let elapsed = start.elapsed();
-                let s = simulate(&lengths, k);
+                let per_k: Vec<String> = (2..=k)
+                    .map(|k| format!("k={k} {:.2}", simulate(&lengths, k).tokens_per_round()))
+                    .collect();
                 println!(
-                    "{position:?} {name}: prompt {} tokens, {:.2?} per token, first draft accepted {:.0}%, accepted_at {:?} of {} rounds, {:.2} tokens per round",
+                    "{name}: prompt {} tokens, {} generated, {:.2?} per token, first draft accepted {:.0}%, tokens per round {}",
                     prompt.len(),
-                    elapsed / (prompt.len() + count) as u32,
+                    tokens.len(),
+                    elapsed / (prompt.len() + tokens.len()) as u32,
                     100.0 * lengths.iter().filter(|&&l| l > 0).count() as f32
                         / lengths.len() as f32,
-                    s.accepted_at,
-                    s.rounds,
-                    s.tokens_per_round()
+                    per_k.join(", ")
                 );
                 println!("  {:?}", tok.decode(&tokens));
                 all.extend(lengths);
             }
-            for k in 1..=3 {
+            for k in 1..=4 {
                 println!(
                     "{position:?} all prompts, k={k}: {:.2} tokens per round",
                     simulate(&all, k).tokens_per_round()
@@ -461,12 +459,11 @@ mod real {
 mod tests {
     use super::*;
 
-    /// Drafting from q and applying the rule must give tokens distributed
-    /// as p, whatever q is.
+    /// A one-hot drafter plus the rule must give tokens distributed as p,
+    /// whichever token it drafts.
     #[test]
     fn rejection_rule_keeps_the_target_distribution() {
         let target = [2.0f32, 1.0, 0.5, 0.0, -1.0, -3.0];
-        let draft = [0.0f32, 2.0, 0.0, 1.0, 0.5, -1.0];
         let params = Params {
             temperature: 0.8,
             top_p: 1.0,
@@ -478,32 +475,41 @@ mod tests {
         };
         let p = d.distribution(&target);
 
-        let n = 200_000;
-        let mut counts = [0usize; 6];
-        let mut kept = 0;
-        for _ in 0..n {
-            let token = d.draft(&draft);
-            let out = match d.check(&target, &draft, token) {
-                None => {
-                    kept += 1;
-                    token
-                }
-                Some(t) => t,
-            };
-            counts[out as usize] += 1;
+        for draft in [0, 3, 5] {
+            let n = 200_000;
+            let mut counts = [0usize; 6];
+            let mut kept = 0;
+            for _ in 0..n {
+                let out = match d.check(&target, draft) {
+                    None => {
+                        kept += 1;
+                        draft
+                    }
+                    Some(t) => t,
+                };
+                counts[out as usize] += 1;
+            }
+            for (id, want) in &p {
+                let got = counts[*id as usize] as f32 / n as f32;
+                assert!(
+                    (got - want).abs() < 0.005,
+                    "draft {draft}, token {id}: {got} vs {want}"
+                );
+            }
+            assert_eq!(counts[5], 0, "token 5 is cut by top_k");
+            let want_kept = p.iter().find(|x| x.0 == draft).map_or(0.0, |x| x.1);
+            let got_kept = kept as f32 / n as f32;
+            assert!(
+                (got_kept - want_kept).abs() < 0.005,
+                "draft {draft} kept {got_kept}"
+            );
         }
-        for (id, want) in &p {
-            let got = counts[*id as usize] as f32 / n as f32;
-            assert!((got - want).abs() < 0.005, "token {id}: {got} vs {want}");
-        }
-        assert_eq!(counts[5], 0, "token 5 is cut by top_k");
-        assert!(kept > n / 4 && kept < n, "kept {kept} of {n}");
     }
 
     #[test]
     fn greedy_check_takes_the_argmax() {
         let logits = [0.0, 3.0, 1.0];
-        assert_eq!(Greedy.check(&logits, &[], 1), None);
-        assert_eq!(Greedy.check(&logits, &[], 2), Some(1));
+        assert_eq!(Greedy.check(&logits, 1), None);
+        assert_eq!(Greedy.check(&logits, 2), Some(1));
     }
 }
