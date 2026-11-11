@@ -15,11 +15,11 @@ mod mac {
     use crate::config::{Config, LayerType};
     use crate::gpu::{Gpu, contents};
     use crate::gpu_layers::{
-        GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm, add_norm, mix_norm,
+        GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm, mix_norm,
     };
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
-    use crate::qmv::{GpuQuant, View};
+    use crate::qmv::{GpuQuant, Mode, Norm as FoldNorm, View};
     use crate::sample::{Params, Sampler};
     use crate::sample_gpu::GpuSampler;
     use crate::weights::Weights;
@@ -126,7 +126,6 @@ mod mac {
     /// The scratch buffers of one layer step, shared by all layers.
     pub(crate) struct Scratch {
         pub(crate) normed: View,
-        pub(crate) mixed: View,
         pub(crate) moe: MoeScratch,
     }
 
@@ -137,7 +136,6 @@ mod mac {
             let router = view(gpu, cfg.num_experts + 1);
             Scratch {
                 normed: view(gpu, hidden),
-                mixed: view(gpu, hidden),
                 moe: MoeScratch {
                     normed: view(gpu, hidden),
                     router: router.clone(),
@@ -202,10 +200,18 @@ mod mac {
             next_out: &View,
         ) {
             let hidden = cfg.hidden_size;
-            self.router.record(plan, &s.normed, &s.router, false);
+            // The post-attention norm is folded into the four ops that read
+            // it, so they take the residual x itself.
+            let norm = FoldNorm {
+                weight: &self.post_norm,
+                eps: cfg.rms_norm_eps,
+            };
+            self.router
+                .record_norm(plan, x, Some(norm), &s.router, false);
             self.shared_gate
-                .record(plan, &s.normed, &s.shared_gate, true);
-            self.shared_up.record(plan, &s.normed, &s.shared_up, true);
+                .record_mode(plan, x, &s.shared_gate, true, Mode::Norm(norm));
+            self.shared_up
+                .record_mode(plan, x, &s.shared_up, true, Mode::Norm(norm));
             record_route(
                 plan,
                 &s.router,
@@ -226,7 +232,7 @@ mod mac {
             self.shared_down.record(plan, &s.shared_h, &s.shared, false);
             let k = cfg.num_experts_per_tok;
             self.experts
-                .record_gate_up(plan, &s.normed, &s.ids, k, &s.experts_h, true);
+                .record_gate_up_norm(plan, x, Some(norm), &s.ids, k, &s.experts_h, true);
             self.experts
                 .record_down(plan, &s.experts_h, &s.ids, &s.weights, k, &s.routed);
             mix_norm(
@@ -316,16 +322,11 @@ mod mac {
             next_norm: &View,
             next_out: &View,
         ) {
+            // The output projection adds into the residual x.
             match &self.mixer {
-                Mixer::Linear(m, state) => m.record(plan, &s.normed, &s.mixed, state),
-                Mixer::Full(m, cache) => m.record(plan, &s.normed, &s.mixed, cache),
+                Mixer::Linear(m, state) => m.record_mode(plan, &s.normed, x, state, Mode::Acc),
+                Mixer::Full(m, cache) => m.record_mode(plan, &s.normed, x, cache, Mode::Acc),
             }
-            add_norm(
-                plan,
-                [x, &s.mixed, &self.moe.post_norm, &s.moe.normed],
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-            );
             self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
         }
 

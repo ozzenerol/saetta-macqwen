@@ -427,8 +427,6 @@ mod mac {
             let k = cfg.num_experts_per_tok;
             for (name, a, b, n) in [
                 ("normed0", &normed0, &rnormed0, h),
-                ("mixed", &ds.mixed, &s.mixed, h),
-                ("moe normed", &ds.moe.normed, &s.moe_normed, h),
                 ("router", &ds.moe.router, &s.router, cfg.num_experts + 1),
                 ("weights", &ds.moe.weights, &s.weights, k),
                 ("shared", &ds.moe.shared, &s.shared, h),

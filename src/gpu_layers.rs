@@ -16,7 +16,7 @@ mod mac {
     use crate::cpu::model::{attention_config, deltanet_config};
     use crate::gpu::Gpu;
     use crate::plan::Plan;
-    use crate::qmv::{GpuQuant, View};
+    use crate::qmv::{GpuQuant, Mode, View};
     use crate::rows;
     use crate::weights::Weights;
     use metal::{Buffer, MTLSize};
@@ -255,6 +255,19 @@ mod mac {
         /// layer output, and the token's key and value go into `cache` at
         /// its position.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, cache: &GpuKvCache) {
+            self.record_mode(plan, x, out, cache, Mode::Plain);
+        }
+
+        /// `record` with `mode` on the output projection: `Mode::Acc` adds
+        /// the layer output to `out` (the residual).
+        pub fn record_mode(
+            &self,
+            plan: &mut Plan,
+            x: &View,
+            out: &View,
+            cache: &GpuKvCache,
+            mode: Mode,
+        ) {
             let c = &self.cfg;
             let d = c.head_dim;
             let [q_and_gate, q, k, v, attn] =
@@ -296,7 +309,7 @@ mod mac {
                 .decode
                 .record(plan, &q, &keys, &values, &q_and_gate, &attn);
 
-            self.o_proj.record(plan, &attn, out, false);
+            self.o_proj.record_mode(plan, &attn, out, false, mode);
         }
     }
 
@@ -504,6 +517,19 @@ mod mac {
         /// Records one token: `x` is the normed hidden state, `out` gets the
         /// layer output, `state` is updated.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, state: &GpuDeltaNetState) {
+            self.record_mode(plan, x, out, state, Mode::Plain);
+        }
+
+        /// `record` with `mode` on the output projection, as
+        /// `GpuAttention::record_mode`.
+        pub fn record_mode(
+            &self,
+            plan: &mut Plan,
+            x: &View,
+            out: &View,
+            state: &GpuDeltaNetState,
+            mode: Mode,
+        ) {
             let c = &self.cfg;
             let key_size = c.k_heads * c.k_dim;
             let channels = 2 * key_size + c.v_heads * c.v_dim;
@@ -557,7 +583,7 @@ mod mac {
                 size(1024, 1),
             );
 
-            self.out_proj.record(plan, &y, out, false);
+            self.out_proj.record_mode(plan, &y, out, false, mode);
         }
 
         /// Records `m` tokens one after the other, as `m` calls of `record`
