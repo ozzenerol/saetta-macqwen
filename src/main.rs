@@ -283,6 +283,7 @@ fn load_gpu(
         pool,
         last_blit: RefCell::new(None),
         drafting: spec,
+        rows: saetta::gpu_cache::RowBackup::new(),
     })
 }
 
@@ -295,6 +296,22 @@ struct GpuServed {
     last_blit: RefCell<Option<metal::CommandBuffer>>,
     prefill: saetta::prefill::Prefill<'static>,
     drafting: Option<Drafting>,
+    /// KV rows kept aside during a detour (cache::Restore::backup_rows).
+    rows: saetta::gpu_cache::RowBackup,
+}
+
+/// The KV cache of each attention layer.
+#[cfg(target_os = "macos")]
+fn kv_caches<'m>(
+    model: &'m saetta::gpu_model::GpuModel<'static>,
+) -> Vec<&'m saetta::gpu_layers::GpuKvCache> {
+    model
+        .states()
+        .filter_map(|s| match s {
+            saetta::gpu_model::State::Full(c) => Some(c),
+            saetta::gpu_model::State::Linear(_) => None,
+        })
+        .collect()
 }
 
 /// Inputs shorter than this run as decode steps. Measured with bench-prefill
@@ -479,6 +496,32 @@ impl Restore for GpuServed {
         if let Some(d) = &mut self.drafting {
             d.spec.after_restore(len, &state.1);
         }
+    }
+
+    /// The KV rows stay in their slots. The fast prefill keeps a half copy
+    /// of them that would not see rows put back, so only the exact one.
+    fn keeps_rows(&self) -> bool {
+        self.prefill.exact
+    }
+
+    fn backup_rows(&mut self, from: usize, n: usize) {
+        let caches = kv_caches(&self.model);
+        self.rows.save(self.model.gpu(), &caches, from, n);
+        eprintln!(
+            "kv rows {from}..{} backed up, {:.0} MB",
+            from + n,
+            self.rows.bytes() as f64 / 1e6
+        );
+    }
+
+    fn restore_rows(&mut self) {
+        let caches = kv_caches(&self.model);
+        self.rows.restore(self.model.gpu(), &caches);
+        eprintln!("kv rows put back");
+    }
+
+    fn discard_rows(&mut self) {
+        self.rows.clear();
     }
 }
 
