@@ -577,7 +577,9 @@ kernel void moe_down_mma(device const uint *words [[buffer(0)]],
 // per step (32 lanes cover 512), holds those 16 values of all M rows of x,
 // and reuses them for the QR weight rows of its simdgroup. 16 BITS-bit
 // values start at a word (8-bit) or at bit 0 or 16 of a word (5-bit).
-constant uint QR = 8;
+// Weight rows per simdgroup of the reg kernels (qmv_reg takes it as a
+// template parameter) and simdgroups per threadgroup.
+constant uint MOE_QR = 8;
 constant uint QR_SIMDS = 2;
 
 template <uint BITS>
@@ -597,7 +599,7 @@ struct QmvRegShape {
     uint y_stride;  // floats between rows of y
 };
 
-template <uint BITS, uint M>
+template <uint BITS, uint M, uint QR>
 kernel void qmv_reg(device const uint *words [[buffer(0)]],
                     device const ushort *scales [[buffer(1)]],
                     device const ushort *biases [[buffer(2)]],
@@ -670,11 +672,13 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
     }
 }
 
-#define QMV_REG(BITS, M) \
-    template [[host_name("qmv_reg_" #BITS "bit_" #M)]] kernel decltype(qmv_reg<BITS, M>) \
-        qmv_reg<BITS, M>;
-QMV_REG(5, 1) QMV_REG(5, 2) QMV_REG(5, 3) QMV_REG(5, 4)
-QMV_REG(8, 1) QMV_REG(8, 2) QMV_REG(8, 3) QMV_REG(8, 4)
+#define QMV_REG(BITS, M, QR) \
+    template [[host_name("qmv_reg_" #BITS "bit_" #M "_" #QR)]] kernel \
+        decltype(qmv_reg<BITS, M, QR>) qmv_reg<BITS, M, QR>;
+#define QMV_REG_QR(QR) \
+    QMV_REG(5, 1, QR) QMV_REG(5, 2, QR) QMV_REG(5, 3, QR) QMV_REG(5, 4, QR) \
+    QMV_REG(8, 1, QR) QMV_REG(8, 2, QR) QMV_REG(8, 3, QR) QMV_REG(8, 4, QR)
+QMV_REG_QR(2) QMV_REG_QR(4) QMV_REG_QR(8)
 
 // This lane's 16 values of weight row `row` from k, dequantized as q (the
 // scale and bias are applied by the caller): the qmv_reg layout.
@@ -732,11 +736,11 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
         return;
     }
     uint e = list[1 + u];
-    uint out0 = (tg.x * QR_SIMDS + simd) * QR;
+    uint out0 = (tg.x * QR_SIMDS + simd) * MOE_QR;
     uint row_words = shape.cols * BITS / 32;
     uint groups = shape.cols / 64;
-    float g[QR][M], up[QR][M];
-    for (uint r = 0; r < QR; r++) {
+    float g[MOE_QR][M], up[MOE_QR][M];
+    for (uint r = 0; r < MOE_QR; r++) {
         for (uint j = 0; j < M; j++) {
             g[r][j] = 0;
             up[r][j] = 0;
@@ -755,7 +759,7 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
             }
             xsum[j] = sum;
         }
-        for (uint r = 0; r < QR; r++) {
+        for (uint r = 0; r < MOE_QR; r++) {
             uint row = e * shape.rows + out0 + r;
             uint grp = row * groups + k / 64;
             float4 qg[4], qu[4];
@@ -774,7 +778,7 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
         }
     }
 
-    for (uint r = 0; r < QR; r++) {
+    for (uint r = 0; r < MOE_QR; r++) {
         for (uint j = 0; j < M; j++) {
             float gsum = simd_sum(g[r][j]);
             float usum = simd_sum(up[r][j]);

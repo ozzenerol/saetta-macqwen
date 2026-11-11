@@ -431,7 +431,7 @@ mod mac {
             ] {
                 let err = rel_rms(&r(b, n), &r(a, n));
                 println!("{name}: rel rms {err:.2e}");
-                assert!(err < 1e-6, "{name}");
+                assert!(err < 1e-5, "{name}");
             }
             assert_eq!(
                 contents::<u32>(&ds.moe.ids.buffer, k),

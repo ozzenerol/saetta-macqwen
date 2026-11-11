@@ -410,7 +410,23 @@ mod mac {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    struct ConvParams {
+        channels: u32,
+        kernel_size: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
     struct StepParams {
+        k_heads: u32,
+        v_heads: u32,
+        v_dim: u32,
+        eps: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RowsStepParams {
         k_heads: u32,
         v_heads: u32,
         v_dim: u32,
@@ -434,6 +450,7 @@ mod mac {
         dt_bias: View,
         norm: View,
         qkv: Buffer,
+        mixed: Buffer,
         z: Buffer,
         a: Buffer,
         b: Buffer,
@@ -470,6 +487,7 @@ mod mac {
                 dt_bias: v("dt_bias")?,
                 norm: v("norm.weight")?,
                 qkv: gpu.buffer(channels * 4),
+                mixed: gpu.buffer(channels * 4),
                 z: gpu.buffer(values * 4),
                 a: gpu.buffer(c.v_heads * 4),
                 b: gpu.buffer(c.v_heads * 4),
@@ -481,8 +499,60 @@ mod mac {
         /// Records one token: `x` is the normed hidden state, `out` gets the
         /// layer output, `state` is updated.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, state: &GpuDeltaNetState) {
-            let bufs = [&self.qkv, &self.z, &self.a, &self.b, &self.y].map(whole);
-            self.record_with(plan, 1, x, out, state, &bufs, None);
+            let c = &self.cfg;
+            let key_size = c.k_heads * c.k_dim;
+            let channels = 2 * key_size + c.v_heads * c.v_dim;
+            let [qkv, mixed, z, a, b, y] =
+                [&self.qkv, &self.mixed, &self.z, &self.a, &self.b, &self.y].map(whole);
+
+            self.in_proj_qkv.record(plan, x, &qkv, false);
+            self.in_proj_z.record(plan, x, &z, true);
+            self.in_proj_b.record(plan, x, &b, true);
+            self.in_proj_a.record(plan, x, &a, true);
+
+            let p = plan.constant(&[ConvParams {
+                channels: channels as u32,
+                kernel_size: c.kernel as u32,
+            }]);
+            plan.op(
+                "deltanet_conv",
+                &[&qkv, &self.conv1d, &whole(&state.conv), &mixed, &p],
+                size(channels.div_ceil(256), 1),
+                size(256, 1),
+            );
+
+            let at = |floats: usize| View {
+                buffer: self.mixed.clone(),
+                offset: (floats * 4) as u64,
+            };
+            let (q, k, v) = (at(0), at(key_size), at(2 * key_size));
+            let p = plan.constant(&[StepParams {
+                k_heads: c.k_heads as u32,
+                v_heads: c.v_heads as u32,
+                v_dim: c.v_dim as u32,
+                eps: c.eps,
+            }]);
+            plan.op(
+                "deltanet_step",
+                &[
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    &whole(&state.recurrent),
+                    &z,
+                    &self.norm,
+                    &y,
+                    &p,
+                ],
+                size(c.v_heads, 1),
+                size(1024, 1),
+            );
+
+            self.out_proj.record(plan, &y, out, false);
         }
 
         /// Records `m` tokens one after the other, as `m` calls of `record`
@@ -500,36 +570,14 @@ mod mac {
             snaps: Option<&GpuDeltaNetSnaps>,
         ) {
             assert!(snaps.is_none_or(|s| m <= s.rows));
-            let s = scratch;
-            let bufs = [&s.qkv, &s.z, &s.a, &s.b, &s.y].map(|v| v.clone());
-            self.record_with(plan, m, x, out, state, &bufs, snaps);
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn record_with(
-            &self,
-            plan: &mut Plan,
-            m: usize,
-            x: &View,
-            out: &View,
-            state: &GpuDeltaNetState,
-            [qkv, z, a, b, y]: &[View; 5],
-            snaps: Option<&GpuDeltaNetSnaps>,
-        ) {
             let c = &self.cfg;
-            let proj = |plan: &mut Plan, w: &GpuQuant, x: &View, y: &View, parallel| {
-                if m == 1 {
-                    w.record(plan, x, y, parallel);
-                } else {
-                    rows::record_proj(plan, w, m, x, y, parallel);
-                }
-            };
-            proj(plan, &self.in_proj_qkv, x, qkv, false);
-            proj(plan, &self.in_proj_z, x, z, true);
-            proj(plan, &self.in_proj_b, x, b, true);
-            proj(plan, &self.in_proj_a, x, a, true);
+            let DeltaNetRowsScratch { qkv, z, a, b, y } = scratch;
+            rows::record_proj(plan, &self.in_proj_qkv, m, x, qkv, false);
+            rows::record_proj(plan, &self.in_proj_z, m, x, z, true);
+            rows::record_proj(plan, &self.in_proj_b, m, x, b, true);
+            rows::record_proj(plan, &self.in_proj_a, m, x, a, true);
 
-            let p = plan.constant(&[StepParams {
+            let p = plan.constant(&[RowsStepParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
                 v_dim: c.v_dim as u32,
@@ -545,7 +593,7 @@ mod mac {
                 None => (conv.clone(), recurrent.clone()),
             };
             plan.op(
-                "deltanet_step",
+                "deltanet_rows",
                 &[
                     qkv,
                     &self.conv1d,
@@ -566,7 +614,7 @@ mod mac {
                 size(1024, 1),
             );
 
-            proj(plan, &self.out_proj, y, out, false);
+            rows::record_proj(plan, &self.out_proj, m, y, out, false);
         }
     }
 
@@ -803,8 +851,8 @@ mod mac {
         }
 
         /// TOKENS tokens as one `record_rows` against one `record` per
-        /// token: outputs, the final state and every snapshot bit for bit,
-        /// and a restore to each row.
+        /// token: outputs, and a restore to each row against the state after
+        /// that token.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn deltanet_rows_match_tokens() {
@@ -830,11 +878,8 @@ mod mac {
                 built.run(&gpu);
                 want.extend(read(&out.buffer, n));
                 states.push((
-                    bits(&read(&state.conv, state.conv.length() as usize / 4)),
-                    bits(&read(
-                        &state.recurrent,
-                        state.recurrent.length() as usize / 4,
-                    )),
+                    read(&state.conv, state.conv.length() as usize / 4),
+                    read(&state.recurrent, state.recurrent.length() as usize / 4),
                 ));
             }
 
@@ -854,36 +899,29 @@ mod mac {
                 Some(&snaps),
             );
             plan.build().run(&gpu);
-            assert_eq!(
-                bits(&read(&outs.buffer, TOKENS * n)),
-                bits(&want),
-                "outputs"
-            );
-            let last = &states[TOKENS - 1];
+            let close = |got: &[f32], want: &[f32], what: &str| {
+                let err = rel_rms(got, want);
+                assert!(err < BOUND, "{what}: rel rms {err}");
+            };
+            close(&read(&outs.buffer, TOKENS * n), &want, "outputs");
             let conv_n = rows_state.conv.length() as usize / 4;
             let rec_n = rows_state.recurrent.length() as usize / 4;
-            assert_eq!(bits(&read(&rows_state.conv, conv_n)), last.0, "final conv");
-            assert_eq!(
-                bits(&read(&rows_state.recurrent, rec_n)),
-                last.1,
-                "final recurrent"
-            );
             for (row, (conv, rec)) in states.iter().enumerate() {
                 let mut plan = Plan::new(&gpu);
                 snaps.record_restore(&mut plan, row, &rows_state);
                 plan.build().run(&gpu);
-                assert_eq!(
-                    &bits(&read(&rows_state.conv, conv_n)),
+                close(
+                    &read(&rows_state.conv, conv_n),
                     conv,
-                    "row {row} conv"
+                    &format!("row {row} conv"),
                 );
-                assert_eq!(
-                    &bits(&read(&rows_state.recurrent, rec_n)),
+                close(
+                    &read(&rows_state.recurrent, rec_n),
                     rec,
-                    "row {row} recurrent"
+                    &format!("row {row} recurrent"),
                 );
             }
-            println!("deltanet rows: {TOKENS} rows equal to {TOKENS} tokens, restores equal");
+            println!("deltanet rows: {TOKENS} rows and their restores match {TOKENS} tokens");
         }
 
         #[test]

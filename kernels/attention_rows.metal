@@ -41,9 +41,6 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
     uint kv = tg.y;
     uint stride = p.kv_heads * DEC_DIM;
     uint chunks = p.chunks;
-    uint qid = lane / 4;
-    uint fm = (qid & 4) + (lane / 2) % 4;
-    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
 
     for (uint r0 = 0; r0 < p.rows; r0 += ROWS_PASS) {
         uint rows = min(ROWS_PASS, p.rows - r0);

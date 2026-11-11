@@ -55,9 +55,11 @@ mod mac {
         record_qmv_reg(plan, w, m, x, y, parallel);
     }
 
-    /// Must match QR and QR_SIMDS in rows.metal.
+    /// Must match MOE_QR and QR_SIMDS in rows.metal.
     const QR: usize = 8;
     const QR_SIMDS: usize = 2;
+    /// Weight rows per simdgroup of qmv_reg: 2, 4 or 8.
+    pub static REG_QR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8);
     /// Rows of x one qmv_reg dispatch takes.
     const REG_ROWS: usize = 4;
 
@@ -93,7 +95,8 @@ mod mac {
             w.bits
         );
         let shape = plan.constant(&[w.rows as u32, w.cols as u32, y_stride as u32]);
-        let grid = MTLSize::new(w.rows.div_ceil(QR * QR_SIMDS) as u64, 1, 1);
+        let qr = REG_QR.load(std::sync::atomic::Ordering::Relaxed);
+        let grid = MTLSize::new(w.rows.div_ceil(qr * QR_SIMDS) as u64, 1, 1);
         let threads = MTLSize::new(32 * QR_SIMDS as u64, 1, 1);
         for (pass, r0) in (0..m).step_by(REG_ROWS).enumerate() {
             let rows = REG_ROWS.min(m - r0);
@@ -101,7 +104,7 @@ mod mac {
                 buffer: v.buffer.clone(),
                 offset: v.offset + (r0 * floats * 4) as u64,
             };
-            let kernel = format!("qmv_reg_{}bit_{rows}", w.bits);
+            let kernel = format!("qmv_reg_{}bit_{rows}_{qr}", w.bits);
             let buffers = [
                 &w.words,
                 &w.scales,
@@ -668,6 +671,14 @@ mod mac {
                     t[5]
                 };
                 let base = time(0);
+                for qr in [2, 4] {
+                    REG_QR.store(qr, std::sync::atomic::Ordering::Relaxed);
+                    let t: Vec<String> = (1..=MAX_ROWS)
+                        .map(|m| format!("m{m} {:.1}", time(m + 8)))
+                        .collect();
+                    println!("{module}: reg qr {qr}: {}", t.join(", "));
+                }
+                REG_QR.store(8, std::sync::atomic::Ordering::Relaxed);
                 let rows: Vec<String> = (1..=MAX_ROWS)
                     .map(|m| format!("m{m} {:.1}/{:.1}/{:.1}", time(m), time(m + 8), time(m + 16)))
                     .collect();
