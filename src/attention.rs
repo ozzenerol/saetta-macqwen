@@ -33,6 +33,9 @@ mod mac {
         capacity: usize,
         part_o: Buffer,
         part_ml: Buffer,
+        /// attention_partial or attention_partial_mma; over a quantized
+        /// cache, the _q8 or _q4 variant of it.
+        pub kernel: &'static str,
     }
 
     impl DecodeAttention {
@@ -59,6 +62,7 @@ mod mac {
                 capacity,
                 part_o: gpu.buffer(chunks * heads * DIM * 4),
                 part_ml: gpu.buffer(chunks * heads * 2 * 4),
+                kernel: "attention_partial_mma",
             }
         }
 
@@ -79,7 +83,7 @@ mod mac {
             let params = plan.params.clone();
             let (o, ml) = self.parts();
             plan.op(
-                "attention_partial",
+                self.kernel,
                 &[q, keys, values, &o, &ml, &p, &params],
                 self.grid(),
                 MTLSize::new(256, 1, 1),
@@ -97,10 +101,13 @@ mod mac {
             q_and_gate: &View,
             out: &View,
         ) {
-            let kernel = match keys.bits {
-                KvBits::Eight => "attention_partial_q8",
-                KvBits::Four => "attention_partial_q4",
-                KvBits::Half => unreachable!("a half cache goes through record"),
+            let mma = self.kernel == "attention_partial_mma";
+            let kernel = match (keys.bits, mma) {
+                (KvBits::Eight, true) => "attention_partial_mma_q8",
+                (KvBits::Four, true) => "attention_partial_mma_q4",
+                (KvBits::Eight, false) => "attention_partial_q8",
+                (KvBits::Four, false) => "attention_partial_q4",
+                (KvBits::Half, _) => unreachable!("a half cache goes through record"),
             };
             let p = self.params(plan);
             let params = plan.params.clone();
@@ -157,8 +164,8 @@ mod mac {
             plan.op(
                 "attention_reduce",
                 &[&o, &ml, q_and_gate, out, p, &params],
-                MTLSize::new(self.heads as u64, 1, 1),
-                MTLSize::new(DIM as u64, 1, 1),
+                MTLSize::new(self.heads as u64, (DIM / 64) as u64, 1),
+                MTLSize::new(1024, 1, 1),
             );
         }
     }
@@ -185,30 +192,40 @@ mod mac {
         let q = View::new(gpu.buffer_from(&vec![0.01f32; heads * DIM]));
         let qg = View::new(gpu.buffer_from(&vec![0.5f32; heads * 2 * DIM]));
         let out = View::new(gpu.buffer(heads * DIM * 4));
-        let att = DecodeAttention::new(&gpu, heads, kv, DIM, capacity);
-
-        let mut plan = Plan::new(&gpu);
-        for (k, v) in &caches {
-            att.record(&mut plan, &q, k, v, &qg, &out);
-        }
-        let built = plan.build();
+        let mut att = DecodeAttention::new(&gpu, heads, kv, DIM, capacity);
         println!(
             "attention for one token, {layers} layers, 16 q / 2 kv heads of 256, half cache; median of {runs} runs after 1 warm-up:"
         );
-        for &len in lengths {
-            plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
-            let mut t: Vec<f64> = (0..=runs)
-                .map(|_| built.run(&gpu).as_secs_f64())
-                .skip(1)
-                .collect();
-            t.sort_by(f64::total_cmp);
-            let time = t[runs / 2];
-            let bytes = (layers * len * token * 2 * 2) as f64;
-            println!(
-                "  {len:>6} tokens: {:.3} ms ({:.0} GB/s)",
-                time * 1e3,
-                bytes / time / 1e9
-            );
+        for kernel in ["attention_partial", "attention_partial_mma"] {
+            att.kernel = kernel;
+            let mut plan = Plan::new(&gpu);
+            for (k, v) in &caches {
+                att.record(&mut plan, &q, k, v, &qg, &out);
+            }
+            let built = plan.build();
+            let reduce = plan.build_where(|k| k == "attention_reduce", true);
+            println!("  {kernel}:");
+            for &len in lengths {
+                plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
+                let mut t: Vec<f64> = (0..=runs)
+                    .map(|_| built.run(&gpu).as_secs_f64())
+                    .skip(1)
+                    .collect();
+                t.sort_by(f64::total_cmp);
+                let time = t[runs / 2];
+                let mut r: Vec<f64> = (0..=runs)
+                    .map(|_| reduce.run(&gpu).as_secs_f64())
+                    .skip(1)
+                    .collect();
+                r.sort_by(f64::total_cmp);
+                let bytes = (layers * len * token * 2 * 2) as f64;
+                println!(
+                    "    {len:>6} tokens: {:.3} ms ({:.0} GB/s), reduce alone {:.3} ms",
+                    time * 1e3,
+                    bytes / time / 1e9,
+                    r[runs / 2] * 1e3
+                );
+            }
         }
         Ok(())
     }

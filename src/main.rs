@@ -75,9 +75,10 @@ fn main() -> ExitCode {
         #[cfg(target_os = "macos")]
         ["profile-token", dir] => report(saetta::profile::profile_token(Path::new(dir), 40, 9)),
         #[cfg(target_os = "macos")]
-        ["bench-attention"] => {
-            report(saetta::attention::bench(&[1024, 8192, 16384, 32768], 10, 5).map_err(Into::into))
-        }
+        ["bench-attention"] => report(
+            saetta::attention::bench(&[1024, 8192, 32768, 131072, 262144], 10, 5)
+                .map_err(Into::into),
+        ),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
