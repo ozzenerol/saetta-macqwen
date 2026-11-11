@@ -55,7 +55,7 @@ fn reference(q: &[f32], k: &[f32], v: &[f32], gate: &[f32], len: usize) -> Vec<f
 fn matches_cpu_at_several_lengths() {
     let gpu = Gpu::new().unwrap();
     let capacity = 4096;
-    let att = DecodeAttention::new(&gpu, HEADS, KV, DIM, capacity);
+    let mut att = DecodeAttention::new(&gpu, HEADS, KV, DIM, capacity);
     // Big keys make the softmax peaky, which tests the max handling.
     let keys: Vec<f32> = noise(capacity * KV * DIM, 1)
         .iter()
@@ -72,20 +72,23 @@ fn matches_cpu_at_several_lengths() {
     let [qb, gb] = [&q, &q_and_gate].map(|d| View::new(gpu.buffer_from(d)));
     let out = View::new(gpu.buffer(HEADS * DIM * 4));
 
-    let mut plan = Plan::new(&gpu);
-    att.record(&mut plan, &qb, &kb, &vb, &gb, &out);
-    let built = plan.build();
-    for len in [1, 2, 127, 128, 129, 1000, 4096] {
-        plan.set_params(TokenParams::new(0, len as u32 - 1));
-        built.run(&gpu);
-        let got = contents::<f32>(&out.buffer, HEADS * DIM);
-        let want = reference(&q, &keys, &values, &q_and_gate, len);
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(&a, &b)| (a as f64 - b).abs())
-            .fold(0.0, f64::max);
-        eprintln!("len {len}: worst error {worst:e}");
-        assert!(worst < 2e-5, "len {len}: {worst}");
+    for kernel in ["attention_partial", "attention_partial_mma"] {
+        att.kernel = kernel;
+        let mut plan = Plan::new(&gpu);
+        att.record(&mut plan, &qb, &kb, &vb, &gb, &out);
+        let built = plan.build();
+        for len in [1, 2, 127, 128, 129, 1000, 4096] {
+            plan.set_params(TokenParams::new(0, len as u32 - 1));
+            built.run(&gpu);
+            let got = contents::<f32>(&out.buffer, HEADS * DIM);
+            let want = reference(&q, &keys, &values, &q_and_gate, len);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(&a, &b)| (a as f64 - b).abs())
+                .fold(0.0, f64::max);
+            eprintln!("{kernel} len {len}: worst error {worst:e}");
+            assert!(worst < 2e-5, "{kernel} len {len}: {worst}");
+        }
     }
 }
