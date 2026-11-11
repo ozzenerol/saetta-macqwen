@@ -8,8 +8,8 @@
 // the sigmoid output gate.
 //
 // The cache is half, token-major, kv_heads * 256 values per token, the
-// layout kv_store writes. The math is f32. Head dim 256 and 8 q heads per kv head are fixed here;
-// src/attention.rs checks them.
+// layout kv_store writes. The math is f32. Head dim 256 and 8 q heads per
+// kv head are fixed here; src/attention.rs checks them.
 
 constant uint DEC_CHUNK = 128;
 constant uint DEC_GROUP = 8;
