@@ -444,9 +444,11 @@ struct Drafting {
 #[cfg(target_os = "macos")]
 const MTP_WINDOW: usize = 32;
 
-/// Tokens per prefill dispatch.
+/// Tokens per prefill dispatch. Measured with bench-prefill: 2048 is about
+/// 5% faster than 1024 at 4k and 15k tokens (more rows per expert tile),
+/// and 4096 no better at 15k.
 #[cfg(target_os = "macos")]
-const PREFILL_CHUNK: usize = 1024;
+const PREFILL_CHUNK: usize = 2048;
 
 #[cfg(target_os = "macos")]
 /// Fast prefill unless SAETTA_EXACT=1: track F's eval found it within

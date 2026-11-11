@@ -714,6 +714,142 @@ kernel void delta_rows(device const float *mixed [[buffer(0)]],
     }
 }
 
+// delta_rows in two steps. delta_prep runs over all tokens at once: q and
+// k of each k head are normalized in place in `mixed` (q also scaled by
+// 1/sqrt(K_DIM)), and a and b become the decay g and the rate beta. Then
+// delta_rows2 walks the tokens with only the state update left, 8 lanes per
+// state row of 16 values each, loading token t + 1 while it computes t.
+kernel void delta_prep(device float *mixed [[buffer(0)]],
+                       device float *a [[buffer(1)]],
+                       device float *b [[buffer(2)]],
+                       device const float *a_log [[buffer(3)]],
+                       device const float *dt_bias [[buffer(4)]],
+                       constant DeltaRowsParams &p [[buffer(5)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K_DIM = 128;
+    uint t = tg.x;
+    uint head = tg.y;  // q heads, then k heads, then v heads for g, beta
+    if (head < 2 * p.k_heads) {
+        device float4 *v = (device float4 *)(mixed + ulong(t) * p.channels + head * K_DIM) + lane;
+        float4 x = *v;
+        float ss = simd_sum(dot(x, x));
+        float scale = head < p.k_heads ? 1.0f / sqrt(float(K_DIM)) : 1.0f;
+        *v = x * (scale / sqrt(ss + p.eps));
+    } else {
+        uint h = head - 2 * p.k_heads + lane * (p.v_heads / 32);
+        for (uint i = 0; i < p.v_heads / 32; i++, h++) {
+            ulong at = ulong(t) * p.v_heads + h;
+            float x = a[at] + dt_bias[h];
+            float softplus = max(x, 0.0f) + log(1.0f + exp(-abs(x)));
+            a[at] = exp(-exp(a_log[h]) * softplus);
+            b[at] = sigmoid(b[at]);
+        }
+    }
+}
+
+kernel void delta_rows2(device const float *mixed [[buffer(0)]],
+                        device const float *g [[buffer(1)]],
+                        device const float *beta [[buffer(2)]],
+                        device float *state [[buffer(5)]],
+                        device float *y [[buffer(6)]],
+                        constant DeltaRowsParams &p [[buffer(7)]],
+                        device float *snaps [[buffer(8)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint simd [[simdgroup_index_in_threadgroup]],
+                        uint simds [[simdgroups_per_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K_DIM = 128;
+    constexpr uint PER = 16;
+    uint h = tg.y;
+    uint row = (tg.x * simds + simd) * 4 + lane / 8;
+    uint part = lane % 8;
+    if (row >= p.v_dim) {
+        return;
+    }
+    uint kh = h / (p.v_heads / p.k_heads);
+    uint key_size = p.k_heads * K_DIM;
+    uint value_size = p.v_heads * p.v_dim;
+
+    device float *sp = state + (ulong(h) * p.v_dim + row) * K_DIM + part * PER;
+    float st[PER];
+    for (uint i = 0; i < PER; i++) {
+        st[i] = sp[i];
+    }
+
+    device const float *qp = mixed + kh * K_DIM + part * PER;
+    device const float *kp = qp + key_size;
+    device const float *vp = mixed + 2 * key_size + h * p.v_dim + row;
+    float4 nq[PER / 4], nk[PER / 4];
+    float nv = 0, ng = 0, nb = 0;
+    if (p.tokens > 0) {
+        for (uint i = 0; i < PER / 4; i++) {
+            nq[i] = ((device const float4 *)qp)[i];
+            nk[i] = ((device const float4 *)kp)[i];
+        }
+        nv = vp[0];
+        ng = g[h];
+        nb = beta[h];
+    }
+    for (uint t = 0; t < p.tokens; t++) {
+        float4 q[PER / 4], k[PER / 4];
+        for (uint i = 0; i < PER / 4; i++) {
+            q[i] = nq[i];
+            k[i] = nk[i];
+        }
+        float v = nv, gt = ng, bt = nb;
+        if (t + 1 < p.tokens) {
+            ulong o = ulong(t + 1) * p.channels;
+            for (uint i = 0; i < PER / 4; i++) {
+                nq[i] = ((device const float4 *)(qp + o))[i];
+                nk[i] = ((device const float4 *)(kp + o))[i];
+            }
+            nv = vp[o];
+            ng = g[(t + 1) * p.v_heads + h];
+            nb = beta[(t + 1) * p.v_heads + h];
+        }
+
+        float mem = 0;
+        for (uint i = 0; i < PER / 4; i++) {
+            float4 s4 = float4(st[4 * i], st[4 * i + 1], st[4 * i + 2], st[4 * i + 3]) * gt;
+            st[4 * i] = s4.x;
+            st[4 * i + 1] = s4.y;
+            st[4 * i + 2] = s4.z;
+            st[4 * i + 3] = s4.w;
+            mem += dot(s4, k[i]);
+        }
+        mem += simd_shuffle_xor(mem, 1);
+        mem += simd_shuffle_xor(mem, 2);
+        mem += simd_shuffle_xor(mem, 4);
+        float delta = (v - mem) * bt;
+        float out = 0;
+        for (uint i = 0; i < PER / 4; i++) {
+            float4 s4 = float4(st[4 * i], st[4 * i + 1], st[4 * i + 2], st[4 * i + 3]) + k[i] * delta;
+            st[4 * i] = s4.x;
+            st[4 * i + 1] = s4.y;
+            st[4 * i + 2] = s4.z;
+            st[4 * i + 3] = s4.w;
+            out += dot(s4, q[i]);
+        }
+        out += simd_shuffle_xor(out, 1);
+        out += simd_shuffle_xor(out, 2);
+        out += simd_shuffle_xor(out, 4);
+        if (part == 0) {
+            y[ulong(t) * value_size + h * p.v_dim + row] = out;
+        }
+        if (p.snapshots) {
+            device float *snap = snaps + ulong(t) * p.v_heads * p.v_dim * K_DIM +
+                                 (ulong(h) * p.v_dim + row) * K_DIM + part * PER;
+            for (uint i = 0; i < PER; i++) {
+                snap[i] = st[i];
+            }
+        }
+    }
+    for (uint i = 0; i < PER; i++) {
+        sp[i] = st[i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Causal attention of T new tokens over the KV cache, which already holds
 // them at positions pos .. pos + T - 1. A simdgroup takes 8 query tokens of
