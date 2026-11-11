@@ -23,6 +23,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait Model: Send {
     /// Runs the tokens and returns the logits after the last one.
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32>;
+    /// `prefill` that asks `alive` between pieces of a long input and stops
+    /// when it says false. The error is the number of tokens the state holds
+    /// then, all of them from the start of `tokens`' prompt.
+    fn prefill_while(
+        &mut self,
+        tokens: &[u32],
+        _alive: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, usize> {
+        Ok(self.prefill(tokens))
+    }
     /// Runs one token and returns the logits after it.
     fn step(&mut self, token: u32) -> Vec<f32>;
     /// Goes back to at most `len` tokens and returns how many the state
@@ -335,11 +345,30 @@ impl<M: Model + 'static> Server<M> {
                 tool_calls: 0,
             };
         }
-        let (logits, cached) = engine.start(&prompt);
+        let started = engine.start(&prompt, &mut alive);
+        let cached = match started {
+            Ok((_, cached)) | Err((_, cached)) => cached,
+        };
         eprintln!(
             "{}",
             reuse_report(how, &held, &prompt, cached, &self.tokenizer)
         );
+        let logits = match started {
+            Ok((logits, _)) => logits,
+            Err((kept, _)) => {
+                eprintln!(
+                    "client left during the prefill, at {kept} of {} tokens",
+                    prompt.len()
+                );
+                return Done {
+                    prompt_tokens: prompt.len(),
+                    cached_tokens: cached,
+                    completion_tokens: 0,
+                    hit_limit: false,
+                    tool_calls: 0,
+                };
+            }
+        };
         let mut decide = Sampled {
             params: r.sampling,
             sampler: Sampler::new(r.seed),
@@ -471,14 +500,27 @@ enum Take {
 
 impl<M: Model> Engine<M> {
     /// Reuses the longest state the model has for the prompt, runs the rest,
-    /// and returns the logits with the number of reused tokens.
-    fn start(&mut self, prompt: &[u32]) -> (Vec<f32>, usize) {
+    /// and returns the logits with the number of reused tokens. When the
+    /// client leaves first, the error has the tokens the state holds instead
+    /// of the logits.
+    fn start(
+        &mut self,
+        prompt: &[u32],
+        alive: &mut dyn FnMut() -> bool,
+    ) -> Result<(Vec<f32>, usize), (usize, usize)> {
         // At least one token has to run to get logits.
         let usable = &prompt[..prompt.len().saturating_sub(1)];
         let keep = self.model.resume(&self.tokens, usable);
-        let logits = self.model.prefill(&prompt[keep..]);
-        self.tokens = prompt.to_vec();
-        (logits, keep)
+        match self.model.prefill_while(&prompt[keep..], alive) {
+            Ok(logits) => {
+                self.tokens = prompt.to_vec();
+                Ok((logits, keep))
+            }
+            Err(held) => {
+                self.tokens = prompt[..held].to_vec();
+                Err((held, keep))
+            }
+        }
     }
 }
 

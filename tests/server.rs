@@ -98,6 +98,7 @@ impl Fake {
 
 impl Model for Fake {
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        thread::sleep(self.delay * tokens.len() as u32);
         self.log.lock().unwrap().prefills.push(tokens.len());
         self.len += tokens.len();
         self.at = 0;
@@ -719,15 +720,10 @@ fn answer_stops_at_capacity() {
     assert_eq!(status, 200);
 }
 
-#[test]
-fn client_leaving_in_a_tool_call_stops_it() {
-    let (mut model, log) = fake(script(&[Err(TOOL), Ok(&"a".repeat(3000)), Err(TOOL_END)]));
-    model.delay = Duration::from_micros(500);
-    let addr = serve(model);
-    let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true,
-                      "chat_template_kwargs": {"enable_thinking": false}})
-    .to_string();
-    let mut s = TcpStream::connect(&addr).unwrap();
+/// Sends a streaming request and closes the connection `wait` after the
+/// first event.
+fn leave_after_first_event(addr: &str, body: &str, wait: Duration) {
+    let mut s = TcpStream::connect(addr).unwrap();
     write!(
         s,
         "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
@@ -741,7 +737,18 @@ fn client_leaving_in_a_tool_call_stops_it() {
         s.read_exact(&mut byte).unwrap();
         seen.push(byte[0]);
     }
-    drop(s);
+    thread::sleep(wait);
+}
+
+#[test]
+fn client_leaving_in_a_tool_call_stops_it() {
+    let (mut model, log) = fake(script(&[Err(TOOL), Ok(&"a".repeat(3000)), Err(TOOL_END)]));
+    model.delay = Duration::from_micros(500);
+    let addr = serve(model);
+    let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true,
+                      "chat_template_kwargs": {"enable_thinking": false}})
+    .to_string();
+    leave_after_first_event(&addr, &body, Duration::ZERO);
 
     // The next request waits for the first to end, and runs one step.
     let (status, _) = post(
@@ -752,4 +759,35 @@ fn client_leaving_in_a_tool_call_stops_it() {
     assert_eq!(status, 200);
     let steps = log.lock().unwrap().steps;
     assert!(steps < 500, "{steps} steps");
+}
+
+#[test]
+fn client_leaving_in_the_prefill_keeps_whole_pieces() {
+    let (mut model, log) = fake(script(&[Ok("ok")]));
+    model.delay = Duration::from_micros(200);
+    let addr = serve(Cached::new(model, 16, 64));
+    let request = |stream: bool| {
+        json!({"messages": [{"role": "user", "content": "w ".repeat(1000)}], "stream": stream,
+               "chat_template_kwargs": {"enable_thinking": false}})
+    };
+    leave_after_first_event(
+        &addr,
+        &request(true).to_string(),
+        Duration::from_millis(100),
+    );
+
+    let (status, body) = post(&addr, request(false));
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let (prompt, cached) = (
+        v["usage"]["prompt_tokens"].as_u64().unwrap(),
+        v["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap(),
+    );
+    let run: usize = log.lock().unwrap().prefills.iter().sum();
+    // The first request stopped early, at the end of a piece the second one
+    // starts from.
+    assert!(cached > 0 && cached % 64 == 0, "cached {cached}");
+    assert!((run as u64) < prompt + 64, "ran {run} of {prompt}");
 }
