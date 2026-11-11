@@ -225,6 +225,140 @@ kernel void attention_partial_mma(device const float *q [[buffer(0)]],
     }
 }
 
+// attention_partial_mma over an 8- or 4-bit cache (kernels/kv_quant.metal
+// layout): per token and kv head, 4 groups of 64 values, x = s q + z with
+// half s and z; group G = token * per_token + kv * 4 + dim / 64 holds its
+// codes in words 2 BITS G .., lowest bits first. Each tile is dequantized
+// as it is loaded: a lane builds its two values of the 8 x 8 matrix.
+struct QuantRows {
+    device const uint *codes;
+    device const half *scales;
+    device const half *biases;
+    uint per_token;
+    uint kv;
+};
+
+// The 8 x 8 tile of tokens token0 .. + 7 and dims dim0 .. + 7.
+template <uint BITS>
+inline void load_quant_tile(thread simdgroup_float8x8 &m, QuantRows r, uint token0, uint dim0, uint lane) {
+    uint qid = lane / 4;
+    uint row = (qid & 4) + (lane / 2) % 4;
+    uint col = (qid & 2) * 2 + (lane % 2) * 2;
+    uint dim = dim0 + col;
+    uint g = (token0 + row) * r.per_token + r.kv * 4 + dim / 64;
+    uint i = dim % 64;
+    constexpr uint PER_WORD = 32 / BITS;
+    uint word = r.codes[2 * BITS * g + i / PER_WORD];
+    uint shift = (i % PER_WORD) * BITS;
+    constexpr uint MASK = (1u << BITS) - 1;
+    float s = float(r.scales[g]), z = float(r.biases[g]);
+    m.thread_elements()[0] = s * float((word >> shift) & MASK) + z;
+    m.thread_elements()[1] = s * float((word >> (shift + BITS)) & MASK) + z;
+}
+
+template <uint BITS>
+kernel void attention_partial_mma_q(device const float *q [[buffer(0)]],
+                                  device const uint *keys [[buffer(1)]],
+                                  device const uint *values [[buffer(2)]],
+                                  device const half *key_scales [[buffer(3)]],
+                                  device const half *key_biases [[buffer(4)]],
+                                  device const half *value_scales [[buffer(5)]],
+                                  device const half *value_biases [[buffer(6)]],
+                                  device float *part_o [[buffer(7)]],
+                                  device float *part_ml [[buffer(8)]],
+                                  constant DecodeParams &p [[buffer(9)]],
+                                  constant TokenParams &tp [[buffer(10)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint simd [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[DEC_GROUP * DEC_DIM];
+    threadgroup float sc[DEC_GROUP][DEC_CHUNK];
+    uint len = min(tp.kv_len, p.capacity);
+    uint start = tg.x * DEC_CHUNK;
+    if (start >= len) {
+        return;
+    }
+    uint n = min(DEC_CHUNK, len - start);
+    uint kv = tg.y;
+    uint per_token = p.kv_heads * 4;
+    QuantRows kr = {keys, key_scales, key_biases, per_token, kv};
+    QuantRows vr = {values, value_scales, value_biases, per_token, kv};
+
+    for (uint i = tid; i < DEC_GROUP * DEC_DIM; i += 256) {
+        qs[i] = q[kv * DEC_GROUP * DEC_DIM + i] * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scores: simdgroup s takes tokens 16s .. 16s + 15, two tiles of 8.
+    {
+        uint k = start + 16 * simd;
+        simdgroup_float8x8 s0 = simdgroup_float8x8(0), s1 = simdgroup_float8x8(0);
+        for (uint d = 0; d < DEC_DIM; d += 8) {
+            simdgroup_float8x8 qt, k0, k1;
+            simdgroup_load(qt, qs + d, DEC_DIM, ulong2(0, 0), true);
+            load_quant_tile<BITS>(k0, kr, k, d, lane);
+            load_quant_tile<BITS>(k1, kr, k + 8, d, lane);
+            simdgroup_multiply_accumulate(s0, k0, qt, s0);
+            simdgroup_multiply_accumulate(s1, k1, qt, s1);
+        }
+        simdgroup_store(s0, &sc[0][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
+        simdgroup_store(s1, &sc[0][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Softmax pieces: simdgroup g takes query head g.
+    {
+        uint g = simd;
+        float m = -INFINITY;
+        for (uint t = lane; t < n; t += 32) {
+            m = max(m, sc[g][t]);
+        }
+        m = simd_max(m);
+        float l = 0;
+        for (uint t = lane; t < DEC_CHUNK; t += 32) {
+            float e = t < n ? exp(sc[g][t] - m) : 0;
+            sc[g][t] = e;
+            l += e;
+        }
+        l = simd_sum(l);
+        if (lane == 0) {
+            uint i = tg.x * p.heads + kv * DEC_GROUP + g;
+            part_ml[2 * i] = m;
+            part_ml[2 * i + 1] = l;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Values: simdgroup s takes dims 32s .. 32s + 31, four tiles of 8.
+    {
+        uint vd = 32 * simd;
+        simdgroup_float8x8 o0 = simdgroup_float8x8(0), o1 = simdgroup_float8x8(0);
+        simdgroup_float8x8 o2 = simdgroup_float8x8(0), o3 = simdgroup_float8x8(0);
+        for (uint t = 0; t < DEC_CHUNK; t += 8) {
+            simdgroup_float8x8 pt, v0, v1, v2, v3;
+            simdgroup_load(pt, &sc[0][t], DEC_CHUNK);
+            uint vt = start + t;
+            load_quant_tile<BITS>(v0, vr, vt, vd, lane);
+            load_quant_tile<BITS>(v1, vr, vt, vd + 8, lane);
+            load_quant_tile<BITS>(v2, vr, vt, vd + 16, lane);
+            load_quant_tile<BITS>(v3, vr, vt, vd + 24, lane);
+            simdgroup_multiply_accumulate(o0, pt, v0, o0);
+            simdgroup_multiply_accumulate(o1, pt, v1, o1);
+            simdgroup_multiply_accumulate(o2, pt, v2, o2);
+            simdgroup_multiply_accumulate(o3, pt, v3, o3);
+        }
+        device float *o = part_o + (tg.x * p.heads + kv * DEC_GROUP) * DEC_DIM + 32 * simd;
+        simdgroup_store(o0, o, DEC_DIM);
+        simdgroup_store(o1, o + 8, DEC_DIM);
+        simdgroup_store(o2, o + 16, DEC_DIM);
+        simdgroup_store(o3, o + 24, DEC_DIM);
+    }
+}
+
+template [[host_name("attention_partial_mma_q8")]] kernel decltype(attention_partial_mma_q<8>) attention_partial_mma_q<8>;
+template [[host_name("attention_partial_mma_q4")]] kernel decltype(attention_partial_mma_q<4>) attention_partial_mma_q<4>;
+
 // attention_reduce: grid (heads, DEC_DIM / 64), 1024 threads. Thread
 // (phase, d) merges chunks phase, phase + 16, ... for dim d of its 64-dim
 // slice with a running max, then the 16 phases are merged.
