@@ -158,7 +158,8 @@ impl<M: Model + Restore> Cached<M> {
 impl<M: Model + Restore> Model for Cached<M> {
     /// Saves the state left by the last generation, then runs the tokens with
     /// a snapshot at every multiple of `every` and one token before the end.
-    /// The last one lets a retry of the same prompt rerun a single token.
+    /// The last one lets a retry of the same prompt rerun a single token,
+    /// which goes through `step`.
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
         self.save(false);
         if tokens.is_empty() {
@@ -179,9 +180,11 @@ impl<M: Model + Restore> Model for Cached<M> {
         if start == last {
             self.save(true);
         }
-        let logits = self.model.prefill(&tokens[done..]);
-        self.tokens.extend_from_slice(&tokens[done..]);
-        logits
+        // One token is left. A decode step runs it in a few ms, where a
+        // prefill call has a fixed cost of about half a second on the GPU.
+        let token = tokens[done];
+        self.tokens.push(token);
+        self.model.step(token)
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
