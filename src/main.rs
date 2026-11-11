@@ -223,11 +223,12 @@ struct GpuServed {
     prefill: saetta::prefill::Prefill<'static>,
 }
 
-/// Inputs shorter than this run as decode steps. A prefill pass has a fixed
-/// cost of 0.5 to 1.5 s (track D measured 1.79 s for 17 tokens), while a
-/// decode step takes about 16 ms. Tool results are often this short.
+/// Inputs shorter than this run as decode steps. In a 14k-token qh session
+/// a prefill pass took 1.3 to 2.2 s plus 5.7 ms per token (61 tokens in
+/// 2.19 s, 390 in 3.55 s), and a decode step about 12 ms, so they cross near
+/// 250 tokens. Tool results are mostly shorter.
 #[cfg(target_os = "macos")]
-const SHORT_PREFILL: usize = 48;
+const SHORT_PREFILL: usize = 256;
 
 /// Tokens per prefill dispatch.
 #[cfg(target_os = "macos")]
