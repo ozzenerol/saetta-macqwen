@@ -89,7 +89,13 @@ pub fn bench(tokens: usize, chunk: usize) -> Result<(), Box<dyn std::error::Erro
     let gpu = Gpu::new()?;
     let (heads, kv, dim) = (16usize, 2usize, 256usize);
     let capacity = tokens.next_multiple_of(64) + 64;
-    let h = |n: usize| View::new(gpu.buffer_from(&vec![half::f16::from_f32(0.01); n]));
+    // Spread values, so the scores and P look like a real layer's.
+    let h = |n: usize| {
+        let v: Vec<half::f16> = (0..n)
+            .map(|i| half::f16::from_f32(((i * 7919 % 1999) as f32 / 1000.0 - 1.0) * 2.0))
+            .collect();
+        View::new(gpu.buffer_from(&v))
+    };
     let (q, k, v) = (h(chunk * heads * dim), h(capacity * kv * dim), h(capacity * kv * dim));
     let g = View::new(gpu.buffer_from(&vec![0.5f32; chunk * heads * 2 * dim]));
     let out = View::new(gpu.buffer(chunk * heads * dim * 4));
