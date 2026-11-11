@@ -12,6 +12,7 @@ pub const MAX_ROWS: usize = 8;
 mod mac {
     use super::MAX_ROWS;
     use crate::gpu::Gpu;
+    use crate::kv_quant::{KvBits, QuantRows};
     use crate::moe::{Experts, Router};
     use crate::plan::Plan;
     use crate::qmv::{GpuQuant, View};
@@ -311,27 +312,27 @@ mod mac {
         capacity: u32,
         scale: f32,
         rows: u32,
-        chunks: u32,
+        splits: u32,
     }
 
-    /// Must match DEC_CHUNK and DEC_DIM in kernels/attention.metal.
-    const CHUNK: usize = 128;
+    /// Must match DEC_DIM in kernels/attention.metal.
     const DIM: usize = 256;
 
     /// Decode attention for `m` rows (`attention_partial_rows`, then
-    /// `attention_reduce` per row), with the per-row partial results of
-    /// up to `rows` rows. Layers that run one after the other share it.
+    /// `attention_reduce_rows`), with the per-row partial results of up to
+    /// `rows` rows: `rows * splits * heads` KB, 8 MB for 4 rows and 128
+    /// splits. Layers that run one after the other share it.
     pub struct AttentionRows {
         heads: usize,
         kv_heads: usize,
         capacity: usize,
         rows: usize,
+        splits: usize,
         part_o: View,
         part_ml: View,
     }
 
     impl AttentionRows {
-        /// About `rows * capacity / 128 * heads` KB.
         pub fn new(
             gpu: &Gpu,
             heads: usize,
@@ -339,14 +340,15 @@ mod mac {
             capacity: usize,
             rows: usize,
         ) -> AttentionRows {
-            let chunks = capacity.div_ceil(CHUNK);
+            let splits = crate::attention::splits(capacity);
             AttentionRows {
                 heads,
                 kv_heads,
                 capacity,
                 rows,
-                part_o: View::new(gpu.buffer(rows * chunks * heads * DIM * 4)),
-                part_ml: View::new(gpu.buffer(rows * chunks * heads * 2 * 4)),
+                splits,
+                part_o: View::new(gpu.buffer(rows * splits * heads * DIM * 4)),
+                part_ml: View::new(gpu.buffer(rows * splits * heads * 2 * 4)),
             }
         }
 
@@ -365,21 +367,91 @@ mod mac {
             out: &View,
             params: &[View],
         ) {
+            // The half kernel does not read the scales and biases.
+            let cache = [keys, values, keys, keys, keys, keys];
+            self.record_with(
+                plan,
+                "attention_partial_rows",
+                m,
+                q,
+                cache,
+                q_and_gate,
+                out,
+                params,
+            );
+        }
+
+        /// As `record`, over a quantized cache (src/kv_quant.rs).
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_quant(
+            &self,
+            plan: &mut Plan,
+            m: usize,
+            q: &View,
+            keys: &QuantRows,
+            values: &QuantRows,
+            q_and_gate: &View,
+            out: &View,
+            params: &[View],
+        ) {
+            let kernel = match keys.bits {
+                KvBits::Eight => "attention_partial_rows_q8",
+                KvBits::Four => "attention_partial_rows_q4",
+                KvBits::Half => unreachable!("a half cache goes through record"),
+            };
+            let w = |b: &metal::Buffer| View::new(b.clone());
+            let views = [
+                w(&keys.data),
+                w(&values.data),
+                w(&keys.scales),
+                w(&keys.biases),
+                w(&values.scales),
+                w(&values.biases),
+            ];
+            let cache = views.each_ref();
+            self.record_with(plan, kernel, m, q, cache, q_and_gate, out, params);
+        }
+
+        /// `cache` is key data, value data, key scales, key biases, value
+        /// scales and value biases, as the kernel binds them.
+        #[allow(clippy::too_many_arguments)]
+        fn record_with(
+            &self,
+            plan: &mut Plan,
+            kernel: &str,
+            m: usize,
+            q: &View,
+            cache: [&View; 6],
+            q_and_gate: &View,
+            out: &View,
+            params: &[View],
+        ) {
             assert!(m <= self.rows && params.len() >= m);
-            let chunks = self.capacity.div_ceil(CHUNK);
-            let scale = 1.0 / (DIM as f32).sqrt();
             let p = plan.constant(&[RowsAttentionParams {
                 heads: self.heads as u32,
                 kv_heads: self.kv_heads as u32,
                 capacity: self.capacity as u32,
-                scale,
+                scale: 1.0 / (DIM as f32).sqrt(),
                 rows: m as u32,
-                chunks: chunks as u32,
+                splits: self.splits as u32,
             }]);
+            let [kd, vd, ks, kz, vs, vz] = cache;
             plan.op(
-                "attention_partial_rows",
-                &[q, keys, values, &self.part_o, &self.part_ml, &p, &params[0]],
-                MTLSize::new(chunks as u64, self.kv_heads as u64, 1),
+                kernel,
+                &[
+                    q,
+                    kd,
+                    vd,
+                    ks,
+                    kz,
+                    vs,
+                    vz,
+                    &self.part_o,
+                    &self.part_ml,
+                    &p,
+                    &params[0],
+                ],
+                MTLSize::new(self.splits as u64, self.kv_heads as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
             plan.op(
