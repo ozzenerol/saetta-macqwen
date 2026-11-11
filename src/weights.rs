@@ -175,6 +175,23 @@ impl Weights {
         Ok(weights)
     }
 
+    /// Maps one safetensors file that has no index.
+    pub fn open_file(path: &Path) -> Result<Weights, Box<dyn Error>> {
+        let dir = path.parent().ok_or("file has no parent dir")?;
+        let name = path
+            .file_name()
+            .ok_or("no file name")?
+            .to_string_lossy()
+            .into_owned();
+        let mut weights = Weights {
+            shard_names: Vec::new(),
+            shards: Vec::new(),
+            entries: HashMap::new(),
+        };
+        weights.add_shard(dir, name)?;
+        Ok(weights)
+    }
+
     fn add_shard(&mut self, dir: &Path, name: String) -> Result<(), Box<dyn Error>> {
         let path = dir.join(&name);
         let file = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;

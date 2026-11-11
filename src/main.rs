@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta serve <model dir> [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         ["gpu-check"] => saetta::gpu::check(),
         ["info", dir] => report(info(Path::new(dir))),
         ["convert", src, out] => report(convert(Path::new(src), Path::new(out))),
+        ["convert-mtp", file, dir] => report(convert_mtp(Path::new(file), Path::new(dir))),
         ["serve", dir] => report(serve(Path::new(dir), 8090)),
         ["serve", dir, "--port", port] => match port.parse() {
             Ok(port) => report(serve(Path::new(dir), port)),
@@ -61,6 +62,17 @@ fn convert(src: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
     );
     let checked = saetta::convert::verify(src, out)?;
     println!("checked {checked} tensors: same bytes as the source, all aligned");
+    Ok(())
+}
+
+fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
+    let n = saetta::convert::convert_mtp(file, dir)?;
+    println!(
+        "wrote {n} MTP tensors to {}",
+        dir.join(saetta::convert::MTP_FILE).display()
+    );
+    let err = saetta::convert::verify_mtp(file, dir)?;
+    println!("checked: norms exact, all aligned, largest relative RMS error of a matrix {err:.4}");
     Ok(())
 }
 
