@@ -41,15 +41,15 @@ struct QmmLoader {
     bool w_ok;
     uint xr, xc, wr, wc;
 
-    uint4 xv[BM / 32];
+    half4 xv[BM / 16];
     uint packed[BITS];
     float scale;
     float bias;
 
     void load(uint k0) {
         if (x_ok) {
-            device const uint4 *p = (device const uint4 *)(xrow + k0 + xc);
-            for (uint i = 0; i < BM / 32; i++) {
+            device const half4 *p = (device const half4 *)(xrow + k0 + xc);
+            for (uint i = 0; i < BM / 16; i++) {
                 xv[i] = p[i];
             }
         }
@@ -64,9 +64,9 @@ struct QmmLoader {
     }
 
     void store(threadgroup QmmStage<BM, BN> &s) {
-        threadgroup uint4 *xd = (threadgroup uint4 *)(s.x + xr * QMM_LD + xc);
-        for (uint i = 0; i < BM / 32; i++) {
-            xd[i] = x_ok ? xv[i] : uint4(0);
+        threadgroup half4 *xd = (threadgroup half4 *)(s.x + xr * QMM_LD + xc);
+        for (uint i = 0; i < BM / 16; i++) {
+            xd[i] = x_ok ? xv[i] : half4(0);
         }
         threadgroup half4 *wd = (threadgroup half4 *)(s.w + wr * QMM_LD + wc);
 #pragma clang loop unroll(full)
@@ -79,9 +79,10 @@ struct QmmLoader {
     }
 };
 
-// BM x BN tile, 4 simdgroups of 32 x 32 (2 x 2 for 64 x 64, 1 x 4 for
-// 32 x 128). DB: double buffered.
-template <uint BITS, uint BM, uint BN, bool DB>
+// BM x BN tile, 4 simdgroups of TM x TN (2 x 2 of 32 x 32 for 64 x 64,
+// 1 x 4 of 32 x 32 for 32 x 128, 1 x 4 of 16 x 32 for 16 x 128).
+// DB: double buffered.
+template <uint BITS, uint BM, uint BN, uint TM, uint TN, bool DB>
 kernel void qmm2(device const uint *words [[buffer(0)]],
                  device const ushort *scales [[buffer(1)]],
                  device const ushort *biases [[buffer(2)]],
@@ -95,7 +96,8 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
                  uint tid [[thread_index_in_threadgroup]],
                  uint simd [[simdgroup_index_in_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint WN = BN / 32;
+    constexpr uint WN = BN / TN;
+    constexpr uint FM = TM / 8, FN = TN / 8;
     threadgroup QmmStage<BM, BN> stage[DB ? 2 : 1];
     threadgroup float edge[4][64];
 
@@ -135,11 +137,11 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
     ld.srow = scales + wrow * (s.k / 64);
     ld.brow = biases + wrow * (s.k / 64);
 
-    uint sm = (simd / WN) * 32;
-    uint sn = (simd % WN) * 32;
-    simdgroup_float8x8 acc[4][4];
-    for (uint i = 0; i < 4; i++) {
-        for (uint j = 0; j < 4; j++) {
+    uint sm = (simd / WN) * TM;
+    uint sn = (simd % WN) * TN;
+    simdgroup_float8x8 acc[FM][FN];
+    for (uint i = 0; i < FM; i++) {
+        for (uint j = 0; j < FN; j++) {
             acc[i][j] = simdgroup_float8x8(0);
         }
     }
@@ -164,14 +166,16 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
         threadgroup const QmmStage<BM, BN> &st = stage[cur];
 #pragma clang loop unroll(full)
         for (uint kk = 0; kk < QMM_BK; kk += 8) {
-            simdgroup_half8x8 a[4];
-            simdgroup_half8x8 b[4];
-            for (uint i = 0; i < 4; i++) {
+            simdgroup_half8x8 a[FM];
+            simdgroup_half8x8 b[FN];
+            for (uint i = 0; i < FM; i++) {
                 simdgroup_load(a[i], st.x + (sm + 8 * i) * QMM_LD + kk, QMM_LD);
-                simdgroup_load(b[i], st.w + (sn + 8 * i) * QMM_LD + kk, QMM_LD, ulong2(0, 0), true);
             }
-            for (uint i = 0; i < 4; i++) {
-                for (uint j = 0; j < 4; j++) {
+            for (uint j = 0; j < FN; j++) {
+                simdgroup_load(b[j], st.w + (sn + 8 * j) * QMM_LD + kk, QMM_LD, ulong2(0, 0), true);
+            }
+            for (uint i = 0; i < FM; i++) {
+                for (uint j = 0; j < FN; j++) {
                     simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
                 }
             }
@@ -187,8 +191,8 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
 
     device float *y0 = y + ulong(first) * s.n + n0;
     if (count == BM && n0 + BN <= s.n) {
-        for (uint i = 0; i < 4; i++) {
-            for (uint j = 0; j < 4; j++) {
+        for (uint i = 0; i < FM; i++) {
+            for (uint j = 0; j < FN; j++) {
                 simdgroup_store(acc[i][j], y0 + ulong(sm + 8 * i) * s.n + sn + 8 * j, s.n);
             }
         }
@@ -198,8 +202,8 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
     // writes row l / 4, columns 2 (l % 4) and + 1.
     threadgroup float *e = edge[simd];
     uint er = lane / 4, ec = (lane % 4) * 2;
-    for (uint i = 0; i < 4; i++) {
-        for (uint j = 0; j < 4; j++) {
+    for (uint i = 0; i < FM; i++) {
+        for (uint j = 0; j < FN; j++) {
             simdgroup_store(acc[i][j], e, 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);
             uint row = sm + 8 * i + er;
@@ -216,13 +220,15 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
     }
 }
 
-#define QMM2(name, bits, bm, bn, db) \
-    template [[host_name(name)]] kernel decltype(qmm2<bits, bm, bn, db>) qmm2<bits, bm, bn, db>;
-QMM2("qmm2_5bit", 5, 64, 64, false)
-QMM2("qmm2_8bit", 8, 64, 64, false)
-QMM2("qmm2_db_5bit", 5, 64, 64, true)
-QMM2("qmm2_db_8bit", 8, 64, 64, true)
-QMM2("qmm2_32_5bit", 5, 32, 128, false)
-QMM2("qmm2_32_8bit", 8, 32, 128, false)
-QMM2("qmm2_32_db_5bit", 5, 32, 128, true)
-QMM2("qmm2_32_db_8bit", 8, 32, 128, true)
+#define QMM2(name, bits, bm, bn, tm, tn, db) \
+    template [[host_name(name)]] kernel decltype(qmm2<bits, bm, bn, tm, tn, db>) qmm2<bits, bm, bn, tm, tn, db>;
+QMM2("qmm2_5bit", 5, 64, 64, 32, 32, false)
+QMM2("qmm2_8bit", 8, 64, 64, 32, 32, false)
+QMM2("qmm2_db_5bit", 5, 64, 64, 32, 32, true)
+QMM2("qmm2_db_8bit", 8, 64, 64, 32, 32, true)
+QMM2("qmm2_32_5bit", 5, 32, 128, 32, 32, false)
+QMM2("qmm2_32_8bit", 8, 32, 128, 32, 32, false)
+QMM2("qmm2_32_db_5bit", 5, 32, 128, 32, 32, true)
+QMM2("qmm2_32_db_8bit", 8, 32, 128, 32, 32, true)
+QMM2("qmm2_16_5bit", 5, 16, 128, 16, 32, false)
+QMM2("qmm2_16_8bit", 8, 16, 128, 16, 32, false)
