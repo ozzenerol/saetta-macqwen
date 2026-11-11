@@ -78,20 +78,20 @@ inline void load_half_tile(thread simdgroup_float8x8 &m, device const half *src,
     m.thread_elements()[1] = float(h.thread_elements()[1]);
 }
 
-// The end of both partial kernels: m and l of head `simd`, and the 8 x 32
-// output slice o of this simdgroup.
-inline void write_partial(device float *part_o, device float *part_ml, constant DecodeParams &p,
-                          uint split, uint kv, uint simd, uint lane, float m, float l,
-                          thread simdgroup_float8x8 *o) {
+// The end of both partial kernels: m and l of head `simd`. The 8 x 32
+// output slice of the simdgroup goes to partial_out(...) + 8 i, tile i.
+inline void write_ml(device float *part_ml, constant DecodeParams &p, uint split, uint kv,
+                     uint simd, uint lane, float m, float l) {
     if (lane == 0) {
         uint i = split * p.heads + kv * DEC_GROUP + simd;
         part_ml[2 * i] = m;
         part_ml[2 * i + 1] = l;
     }
-    device float *out = part_o + (split * p.heads + kv * DEC_GROUP) * DEC_DIM + 32 * simd;
-    for (uint i = 0; i < 4; i++) {
-        simdgroup_store(o[i], out + 8 * i, DEC_DIM);
-    }
+}
+
+inline device float *partial_out(device float *part_o, constant DecodeParams &p, uint split,
+                                 uint kv, uint simd) {
+    return part_o + (split * p.heads + kv * DEC_GROUP) * DEC_DIM + 32 * simd;
 }
 
 // Scores as S^T = K Q^T in 8x8 tiles, so key rows load as they lie in the
@@ -169,7 +169,11 @@ kernel void attention_partial_mma(device const float *q [[buffer(0)]],
         // The next chunk's scores overwrite sc and alpha.
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    write_partial(part_o, part_ml, p, tg.x, kv, simd, lane, m, l, o);
+    write_ml(part_ml, p, tg.x, kv, simd, lane, m, l);
+    device float *out = partial_out(part_o, p, tg.x, kv, simd);
+    for (uint i = 0; i < 4; i++) {
+        simdgroup_store(o[i], out + 8 * i, DEC_DIM);
+    }
 }
 
 // attention_partial_mma over an 8- or 4-bit cache (kernels/kv_quant.metal
@@ -278,7 +282,11 @@ kernel void attention_partial_mma_q(device const float *q [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    write_partial(part_o, part_ml, p, tg.x, kv, simd, lane, m, l, o);
+    write_ml(part_ml, p, tg.x, kv, simd, lane, m, l);
+    device float *out = partial_out(part_o, p, tg.x, kv, simd);
+    for (uint i = 0; i < 4; i++) {
+        simdgroup_store(o[i], out + 8 * i, DEC_DIM);
+    }
 }
 
 template [[host_name("attention_partial_mma_q8")]] kernel decltype(attention_partial_mma_q<8>) attention_partial_mma_q<8>;
