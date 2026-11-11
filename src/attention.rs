@@ -16,6 +16,9 @@ mod mac {
     const GROUP: usize = 8;
     const DIM: usize = 256;
 
+    /// Threadgroups per kv head, unless SAETTA_DEC_SPLITS says otherwise.
+    const SPLITS: usize = 128;
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct DecodeParams {
@@ -23,19 +26,30 @@ mod mac {
         kv_heads: u32,
         capacity: u32,
         scale: f32,
+        splits: u32,
     }
 
-    /// The scratch for the per-chunk partial results of one cache size.
+    /// Threadgroups per kv head for a cache of `capacity` tokens: SPLITS or
+    /// SAETTA_DEC_SPLITS, at most one per chunk.
+    pub fn splits(capacity: usize) -> usize {
+        let wanted = std::env::var("SAETTA_DEC_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(SPLITS);
+        wanted.min(capacity.div_ceil(CHUNK)).max(1)
+    }
+
+    /// The scratch for the partial results, one per split and q head
+    /// (`splits * heads` KB, 2 MB with 128 splits, whatever the capacity).
     /// Layers that run one after the other can share it.
     pub struct DecodeAttention {
         heads: usize,
         kv_heads: usize,
         capacity: usize,
+        splits: usize,
         part_o: Buffer,
         part_ml: Buffer,
-        /// attention_partial or attention_partial_mma; over a quantized
-        /// cache, the _q8 or _q4 variant of it.
-        pub kernel: &'static str,
     }
 
     impl DecodeAttention {
@@ -46,6 +60,17 @@ mod mac {
             head_dim: usize,
             capacity: usize,
         ) -> DecodeAttention {
+            DecodeAttention::with_splits(gpu, heads, kv_heads, head_dim, capacity, splits(capacity))
+        }
+
+        pub fn with_splits(
+            gpu: &Gpu,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            capacity: usize,
+            splits: usize,
+        ) -> DecodeAttention {
             assert_eq!(
                 head_dim, DIM,
                 "decode attention is written for head dim 256"
@@ -55,14 +80,18 @@ mod mac {
                 kv_heads * GROUP,
                 "decode attention needs 8 q heads per kv head"
             );
-            let chunks = capacity.div_ceil(CHUNK);
+            assert!(
+                capacity.is_multiple_of(CHUNK),
+                "the cache holds whole chunks"
+            );
+            let splits = splits.clamp(1, capacity.div_ceil(CHUNK));
             DecodeAttention {
                 heads,
                 kv_heads,
                 capacity,
-                part_o: gpu.buffer(chunks * heads * DIM * 4),
-                part_ml: gpu.buffer(chunks * heads * 2 * 4),
-                kernel: "attention_partial_mma",
+                splits,
+                part_o: gpu.buffer(splits * heads * DIM * 4),
+                part_ml: gpu.buffer(splits * heads * 2 * 4),
             }
         }
 
@@ -83,7 +112,7 @@ mod mac {
             let params = plan.params.clone();
             let (o, ml) = self.parts();
             plan.op(
-                self.kernel,
+                "attention_partial_mma",
                 &[q, keys, values, &o, &ml, &p, &params],
                 self.grid(),
                 MTLSize::new(256, 1, 1),
@@ -101,13 +130,10 @@ mod mac {
             q_and_gate: &View,
             out: &View,
         ) {
-            let mma = self.kernel == "attention_partial_mma";
-            let kernel = match (keys.bits, mma) {
-                (KvBits::Eight, true) => "attention_partial_mma_q8",
-                (KvBits::Four, true) => "attention_partial_mma_q4",
-                (KvBits::Eight, false) => "attention_partial_q8",
-                (KvBits::Four, false) => "attention_partial_q4",
-                (KvBits::Half, _) => unreachable!("a half cache goes through record"),
+            let kernel = match keys.bits {
+                KvBits::Eight => "attention_partial_mma_q8",
+                KvBits::Four => "attention_partial_mma_q4",
+                KvBits::Half => unreachable!("a half cache goes through record"),
             };
             let p = self.params(plan);
             let params = plan.params.clone();
@@ -140,6 +166,7 @@ mod mac {
                 kv_heads: self.kv_heads as u32,
                 capacity: self.capacity as u32,
                 scale: 1.0 / (DIM as f32).sqrt(),
+                splits: self.splits as u32,
             }])
         }
 
@@ -151,11 +178,7 @@ mod mac {
         }
 
         fn grid(&self) -> MTLSize {
-            MTLSize::new(
-                self.capacity.div_ceil(CHUNK) as u64,
-                self.kv_heads as u64,
-                1,
-            )
+            MTLSize::new(self.splits as u64, self.kv_heads as u64, 1)
         }
 
         fn record_reduce(&self, plan: &mut Plan, p: &View, q_and_gate: &View, out: &View) {
@@ -192,19 +215,18 @@ mod mac {
         let q = View::new(gpu.buffer_from(&vec![0.01f32; heads * DIM]));
         let qg = View::new(gpu.buffer_from(&vec![0.5f32; heads * 2 * DIM]));
         let out = View::new(gpu.buffer(heads * DIM * 4));
-        let mut att = DecodeAttention::new(&gpu, heads, kv, DIM, capacity);
         println!(
             "attention for one token, {layers} layers, 16 q / 2 kv heads of 256, half cache; median of {runs} runs after 1 warm-up:"
         );
-        for kernel in ["attention_partial", "attention_partial_mma"] {
-            att.kernel = kernel;
+        for splits in [32, 64, 128, 256, capacity / CHUNK] {
+            let att = DecodeAttention::with_splits(&gpu, heads, kv, DIM, capacity, splits);
             let mut plan = Plan::new(&gpu);
             for (k, v) in &caches {
                 att.record(&mut plan, &q, k, v, &qg, &out);
             }
             let built = plan.build();
             let reduce = plan.build_where(|k| k == "attention_reduce", true);
-            println!("  {kernel}:");
+            println!("  {splits} splits per kv head:");
             for &len in lengths {
                 plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
                 let mut t: Vec<f64> = (0..=runs)
