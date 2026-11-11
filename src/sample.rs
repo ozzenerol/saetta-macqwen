@@ -48,7 +48,7 @@ impl Sampler {
     }
 
     /// The tokens that survive top_k and top_p, best first.
-    fn candidates(&self, logits: &[f32], p: &Params) -> Vec<(u32, f32)> {
+    pub fn candidates(&self, logits: &[f32], p: &Params) -> Vec<(u32, f32)> {
         let best = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut c: Vec<(u32, f32)> = logits
             .iter()
@@ -80,7 +80,7 @@ impl Sampler {
     }
 
     /// splitmix64, top 24 bits as a float in [0, 1).
-    fn next_f32(&mut self) -> f32 {
+    pub fn next_f32(&mut self) -> f32 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
