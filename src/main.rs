@@ -425,10 +425,15 @@ impl server::Model for GpuServed {
             Some(d) => d
                 .spec
                 .speculate(&mut self.model, &self.prefill, pending, decide),
-            None => {
-                let logits = self.model.forward(pending);
-                (Vec::new(), decide.pick(&logits))
-            }
+            None => match decide.sampling() {
+                Some((p, sampler)) if saetta::sample_gpu::supports(&p) => {
+                    (Vec::new(), self.model.run_sampled(pending, &p, sampler))
+                }
+                _ => {
+                    let logits = self.model.forward(pending);
+                    (Vec::new(), decide.pick(&logits))
+                }
+            },
         }
     }
 

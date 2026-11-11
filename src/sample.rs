@@ -79,6 +79,11 @@ impl Sampler {
         c
     }
 
+    /// The splitmix64 state; `Sampler::new(state)` goes on from here.
+    pub fn state(&self) -> u64 {
+        self.state
+    }
+
     /// splitmix64, top 24 bits as a float in [0, 1).
     pub fn next_f32(&mut self) -> f32 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
