@@ -10,7 +10,7 @@ mod mac {
     use crate::qmv::View;
     use metal::{Buffer, MTLSize};
 
-    /// Must match ATT_CHUNK, ATT_GROUP and ATT_DIM in the kernel.
+    /// Must match DEC_CHUNK, DEC_GROUP and DEC_DIM in the kernel.
     const CHUNK: usize = 128;
     const GROUP: usize = 8;
     const DIM: usize = 256;
@@ -182,6 +182,41 @@ mod mac {
                 bytes / new / 1e9,
                 old * 1e3,
                 old / new
+            );
+        }
+        Ok(())
+    }
+
+    /// Times whole decode tokens of the real model at each context length.
+    /// The cache holds whatever is in it; the work per token only depends on
+    /// the length.
+    pub fn bench_decode(
+        dir: &std::path::Path,
+        lengths: &[usize],
+        runs: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = crate::config::Config::load(dir)?;
+        let weights = crate::weights::Weights::open(dir)?;
+        let gpu = Gpu::new()?;
+        let capacity = lengths.iter().max().unwrap() + 1;
+        let mut model =
+            crate::gpu_model::GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity)?;
+        println!("decode, whole model, logits read back; median of {runs} tokens after 1 warm-up:");
+        for &len in lengths {
+            let mut t: Vec<f64> = (0..=runs)
+                .map(|_| {
+                    model.set_position(len - 1);
+                    let start = std::time::Instant::now();
+                    model.forward(220);
+                    start.elapsed().as_secs_f64()
+                })
+                .skip(1)
+                .collect();
+            t.sort_by(f64::total_cmp);
+            println!(
+                "  {len:>6} tokens of context: {:.2} ms/token ({:.1} tok/s)",
+                t[runs / 2] * 1e3,
+                1.0 / t[runs / 2]
             );
         }
         Ok(())

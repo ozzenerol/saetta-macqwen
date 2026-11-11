@@ -11,9 +11,9 @@
 // kv_store writes. Head dim 256 and 8 q heads per kv head are fixed here;
 // src/attention.rs checks them.
 
-constant uint ATT_CHUNK = 128;
-constant uint ATT_GROUP = 8;
-constant uint ATT_DIM = 256;
+constant uint DEC_CHUNK = 128;
+constant uint DEC_GROUP = 8;
+constant uint DEC_DIM = 256;
 
 struct DecodeParams {
     uint heads;
@@ -33,20 +33,20 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
                               uint tid [[thread_index_in_threadgroup]],
                               uint simd [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float sc[ATT_GROUP][ATT_CHUNK];
+    threadgroup float sc[DEC_GROUP][DEC_CHUNK];
     uint len = min(tp.kv_len, p.capacity);
-    uint start = tg.x * ATT_CHUNK;
+    uint start = tg.x * DEC_CHUNK;
     if (start >= len) {
         return;
     }
-    uint n = min(ATT_CHUNK, len - start);
+    uint n = min(DEC_CHUNK, len - start);
     uint kv = tg.y;
-    uint stride = p.kv_heads * ATT_DIM;
+    uint stride = p.kv_heads * DEC_DIM;
 
     // Lane l holds dims 8l..8l+7 of each of the 8 queries, pre-scaled.
-    float qv[ATT_GROUP][8];
-    for (uint g = 0; g < ATT_GROUP; g++) {
-        device const float4 *q4 = (device const float4 *)(q + (kv * ATT_GROUP + g) * ATT_DIM + lane * 8);
+    float qv[DEC_GROUP][8];
+    for (uint g = 0; g < DEC_GROUP; g++) {
+        device const float4 *q4 = (device const float4 *)(q + (kv * DEC_GROUP + g) * DEC_DIM + lane * 8);
         float4 a = q4[0] * p.scale, b = q4[1] * p.scale;
         qv[g][0] = a.x; qv[g][1] = a.y; qv[g][2] = a.z; qv[g][3] = a.w;
         qv[g][4] = b.x; qv[g][5] = b.y; qv[g][6] = b.z; qv[g][7] = b.w;
@@ -55,9 +55,9 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
     // Scores: simdgroup s takes tokens s, s + 8, ...
     for (uint t = simd; t < n; t += 8) {
         device const float4 *k4 =
-            (device const float4 *)(keys + (start + t) * stride + kv * ATT_DIM + lane * 8);
+            (device const float4 *)(keys + (start + t) * stride + kv * DEC_DIM + lane * 8);
         float4 a = k4[0], b = k4[1];
-        for (uint g = 0; g < ATT_GROUP; g++) {
+        for (uint g = 0; g < DEC_GROUP; g++) {
             float d = qv[g][0] * a.x + qv[g][1] * a.y + qv[g][2] * a.z + qv[g][3] * a.w +
                       qv[g][4] * b.x + qv[g][5] * b.y + qv[g][6] * b.z + qv[g][7] * b.w;
             d = simd_sum(d);
@@ -84,7 +84,7 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
         }
         l = simd_sum(l);
         if (lane == 0) {
-            uint i = tg.x * p.heads + kv * ATT_GROUP + g;
+            uint i = tg.x * p.heads + kv * DEC_GROUP + g;
             part_ml[2 * i] = m;
             part_ml[2 * i + 1] = l;
         }
@@ -92,16 +92,16 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Weighted values: thread tid owns dim tid for all 8 heads.
-    float acc[ATT_GROUP] = {0};
-    device const float *v = values + start * stride + kv * ATT_DIM + tid;
+    float acc[DEC_GROUP] = {0};
+    device const float *v = values + start * stride + kv * DEC_DIM + tid;
     for (uint t = 0; t < n; t++) {
         float x = v[t * stride];
-        for (uint g = 0; g < ATT_GROUP; g++) {
+        for (uint g = 0; g < DEC_GROUP; g++) {
             acc[g] += sc[g][t] * x;
         }
     }
-    for (uint g = 0; g < ATT_GROUP; g++) {
-        part_o[(tg.x * p.heads + kv * ATT_GROUP + g) * ATT_DIM + tid] = acc[g];
+    for (uint g = 0; g < DEC_GROUP; g++) {
+        part_o[(tg.x * p.heads + kv * DEC_GROUP + g) * DEC_DIM + tid] = acc[g];
     }
 }
 
@@ -114,7 +114,7 @@ kernel void attention_reduce(device const float *part_o [[buffer(0)]],
                              uint h [[threadgroup_position_in_grid]],
                              uint d [[thread_index_in_threadgroup]]) {
     uint len = min(tp.kv_len, p.capacity);
-    uint chunks = (len + ATT_CHUNK - 1) / ATT_CHUNK;
+    uint chunks = (len + DEC_CHUNK - 1) / DEC_CHUNK;
     float m = -INFINITY;
     for (uint c = 0; c < chunks; c++) {
         m = max(m, part_ml[2 * (c * p.heads + h)]);
@@ -124,7 +124,7 @@ kernel void attention_reduce(device const float *part_o [[buffer(0)]],
         uint i = c * p.heads + h;
         float w = exp(part_ml[2 * i] - m);
         l += w * part_ml[2 * i + 1];
-        acc += w * part_o[i * ATT_DIM + d];
+        acc += w * part_o[i * DEC_DIM + d];
     }
-    out[h * ATT_DIM + d] = acc / l * sigmoid(q_and_gate[h * 2 * ATT_DIM + ATT_DIM + d]);
+    out[h * DEC_DIM + d] = acc / l * sigmoid(q_and_gate[h * 2 * DEC_DIM + DEC_DIM + d]);
 }
