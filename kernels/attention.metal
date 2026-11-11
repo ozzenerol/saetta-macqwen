@@ -120,6 +120,111 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
     }
 }
 
+// attention_partial with simdgroup matrices, same buffers and output. The
+// scores are computed as S^T = K Q^T in 8x8 tiles, so key rows load as they
+// lie in the cache; the values as O = P V. Rows past kv_len in the last chunk
+// get weight 0. The chunk must lie inside the cache (capacity is a multiple
+// of DEC_CHUNK).
+inline void load_half_tile(thread simdgroup_float8x8 &m, device const half *src, uint stride) {
+    simdgroup_half8x8 h;
+    simdgroup_load(h, src, stride);
+    m.thread_elements()[0] = float(h.thread_elements()[0]);
+    m.thread_elements()[1] = float(h.thread_elements()[1]);
+}
+
+kernel void attention_partial_mma(device const float *q [[buffer(0)]],
+                                  device const half *keys [[buffer(1)]],
+                                  device const half *values [[buffer(2)]],
+                                  device float *part_o [[buffer(3)]],
+                                  device float *part_ml [[buffer(4)]],
+                                  constant DecodeParams &p [[buffer(5)]],
+                                  constant TokenParams &tp [[buffer(6)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint simd [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[DEC_GROUP * DEC_DIM];
+    threadgroup float sc[DEC_GROUP][DEC_CHUNK];
+    uint len = min(tp.kv_len, p.capacity);
+    uint start = tg.x * DEC_CHUNK;
+    if (start >= len) {
+        return;
+    }
+    uint n = min(DEC_CHUNK, len - start);
+    uint kv = tg.y;
+    uint stride = p.kv_heads * DEC_DIM;
+
+    for (uint i = tid; i < DEC_GROUP * DEC_DIM; i += 256) {
+        qs[i] = q[kv * DEC_GROUP * DEC_DIM + i] * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scores: simdgroup s takes tokens 16s .. 16s + 15, two tiles of 8.
+    {
+        device const half *k = keys + (start + 16 * simd) * stride + kv * DEC_DIM;
+        simdgroup_float8x8 s0 = simdgroup_float8x8(0), s1 = simdgroup_float8x8(0);
+        for (uint d = 0; d < DEC_DIM; d += 8) {
+            simdgroup_float8x8 qt, k0, k1;
+            simdgroup_load(qt, qs + d, DEC_DIM, ulong2(0, 0), true);
+            load_half_tile(k0, k + d, stride);
+            load_half_tile(k1, k + 8 * stride + d, stride);
+            simdgroup_multiply_accumulate(s0, k0, qt, s0);
+            simdgroup_multiply_accumulate(s1, k1, qt, s1);
+        }
+        simdgroup_store(s0, &sc[0][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
+        simdgroup_store(s1, &sc[0][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Softmax pieces: simdgroup g takes query head g.
+    {
+        uint g = simd;
+        float m = -INFINITY;
+        for (uint t = lane; t < n; t += 32) {
+            m = max(m, sc[g][t]);
+        }
+        m = simd_max(m);
+        float l = 0;
+        for (uint t = lane; t < DEC_CHUNK; t += 32) {
+            float e = t < n ? exp(sc[g][t] - m) : 0;
+            sc[g][t] = e;
+            l += e;
+        }
+        l = simd_sum(l);
+        if (lane == 0) {
+            uint i = tg.x * p.heads + kv * DEC_GROUP + g;
+            part_ml[2 * i] = m;
+            part_ml[2 * i + 1] = l;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Values: simdgroup s takes dims 32s .. 32s + 31, four tiles of 8.
+    {
+        device const half *v = values + start * stride + kv * DEC_DIM + 32 * simd;
+        simdgroup_float8x8 o0 = simdgroup_float8x8(0), o1 = simdgroup_float8x8(0);
+        simdgroup_float8x8 o2 = simdgroup_float8x8(0), o3 = simdgroup_float8x8(0);
+        for (uint t = 0; t < DEC_CHUNK; t += 8) {
+            simdgroup_float8x8 pt, v0, v1, v2, v3;
+            simdgroup_load(pt, &sc[0][t], DEC_CHUNK);
+            device const half *vt = v + t * stride;
+            load_half_tile(v0, vt, stride);
+            load_half_tile(v1, vt + 8, stride);
+            load_half_tile(v2, vt + 16, stride);
+            load_half_tile(v3, vt + 24, stride);
+            simdgroup_multiply_accumulate(o0, pt, v0, o0);
+            simdgroup_multiply_accumulate(o1, pt, v1, o1);
+            simdgroup_multiply_accumulate(o2, pt, v2, o2);
+            simdgroup_multiply_accumulate(o3, pt, v3, o3);
+        }
+        device float *o = part_o + (tg.x * p.heads + kv * DEC_GROUP) * DEC_DIM + 32 * simd;
+        simdgroup_store(o0, o, DEC_DIM);
+        simdgroup_store(o1, o + 8, DEC_DIM);
+        simdgroup_store(o2, o + 16, DEC_DIM);
+        simdgroup_store(o3, o + 24, DEC_DIM);
+    }
+}
+
 kernel void attention_reduce(device const float *part_o [[buffer(0)]],
                              device const float *part_ml [[buffer(1)]],
                              device const float *q_and_gate [[buffer(2)]],
