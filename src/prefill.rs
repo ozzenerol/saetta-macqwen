@@ -121,19 +121,20 @@ mod mac {
         gather: u32,
     }
 
-    /// `split` picks the kernel that splits x into two halves, for close
-    /// to f32 results.
-    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
-        let name = match w.bits {
-            5 => "qmm_5bit",
-            8 => "qmm_8bit",
-            b => panic!("no qmm kernel for {b} bits"),
-        };
-        gpu.pipeline(&if split {
-            format!("{name}_split")
+    /// The kernel for more than FEW_MAX rows: with `split`, qmm_<bits>bit_split
+    /// (x split into two halves, close to f32), else qmm_dq_<bits>bit (w
+    /// dequantized to half, as MLX).
+    fn qmm_name(w: &GpuQuant, split: bool) -> String {
+        assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
+        if split {
+            format!("qmm_{}bit_split", w.bits)
         } else {
-            name.to_string()
-        })
+            format!("qmm_dq_{}bit", w.bits)
+        }
+    }
+
+    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
+        gpu.pipeline(&qmm_name(w, split))
     }
 
     /// y = x W^T for `m` rows of x.
@@ -146,6 +147,19 @@ mod mac {
         m: usize,
         split: bool,
     ) {
+        qmm_with(gpu, enc, w, x, y, m, &qmm_name(w, split));
+    }
+
+    /// qmm with the named large-m kernel.
+    fn qmm_with(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        y: &View,
+        m: usize,
+        kernel: &str,
+    ) {
         assert_eq!(w.experts, 1);
         let shape = MmShape {
             m: m as u32,
@@ -156,7 +170,7 @@ mod mac {
         if m <= FEW_MAX {
             enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
         } else {
-            enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
         }
         set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y, x, x, x]);
@@ -436,7 +450,8 @@ mod mac {
         chunk: usize,
         scratch: Scratch,
         /// Use the split qmm kernels and f32 attention: within f32 rounding
-        /// of decode. With false, half inputs: faster, about 1e-3 off.
+        /// of decode. With false, w and x in half, as MLX: the matmuls are
+        /// about 6 times faster, 1e-3 off. serve runs with false.
         pub exact: bool,
         /// Largest |x| seen at each of `RANGES`, when tracked.
         ranges: Option<Buffer>,
@@ -1218,9 +1233,9 @@ mod mac {
         (0..n).map(|i| ((i * 7919 + 13) % 150_000) as u32).collect()
     }
 
-    /// SAETTA_FAST=1 picks the half-input prefill kernels.
-    pub fn fast_from_env() -> bool {
-        std::env::var("SAETTA_FAST").is_ok_and(|v| v == "1")
+    /// SAETTA_EXACT=1 picks the exact prefill kernels over the fast ones.
+    pub fn exact_from_env() -> bool {
+        std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1")
     }
 
     /// Layer states for prefill without a `GpuModel`, for tests and
@@ -1317,12 +1332,17 @@ mod mac {
             let w = GpuQuant::new(&gpu, &weights.quantized(module, &cfg.quantization)?);
             let x = View::new(gpu.buffer_from(&vec![0.01f32; m * w.cols]));
             let y = View::new(gpu.buffer(m * w.rows * 4));
-            for split in [false, true] {
+            let b = w.bits;
+            for name in [
+                format!("qmm_dq_{b}bit"),
+                format!("qmm_{b}bit"),
+                format!("qmm_{b}bit_split"),
+            ] {
                 let mut times: Vec<f64> = (0..=runs)
                     .map(|_| {
                         gpu.run(|enc| {
                             for _ in 0..5 {
-                                qmm(&gpu, enc, &w, &x, &y, m, split);
+                                qmm_with(&gpu, enc, &w, &x, &y, m, &name);
                             }
                         })
                         .as_secs_f64()
@@ -1333,7 +1353,7 @@ mod mac {
                 times.sort_by(f64::total_cmp);
                 let flops = 2.0 * (m * w.rows * w.cols) as f64;
                 println!(
-                    "qmm {}x{} {}-bit, m {m}, split {split}: median {:.2} ms, {:.1} TFLOP/s ({runs} runs)",
+                    "{name} {}x{} {}-bit, m {m}: median {:.2} ms, {:.1} TFLOP/s ({runs} runs)",
                     w.rows,
                     w.cols,
                     w.bits,
@@ -1678,7 +1698,7 @@ mod mac {
                 .iter()
                 .map(|w| u32::from_le_bytes(*w))
                 .collect();
-            let exact = !fast_from_env();
+            let exact = exact_from_env();
             let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
             let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024, capacity).unwrap();
             prefill.exact = exact;
