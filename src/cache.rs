@@ -22,6 +22,14 @@ const KEEP_ON_THE_WAY: usize = 4;
 /// Snapshots at the end of a first message that eviction keeps.
 pub const MAX_ANCHORS: usize = 2;
 
+/// Plain snapshots kept inside the newest one: the history of a conversation
+/// whose prompt only grows, as with qh. A going back that far is rare (an
+/// undo, an edited message), so past this number the history is thinned.
+const CHAIN_KEEP: usize = 5;
+/// The newest snapshots of a history that thinning never drops: an undo
+/// usually goes back one or two turns.
+const CHAIN_RECENT: usize = 2;
+
 /// KV rows a backup holds at most: 16384 rows of the 35B model are 335 MB
 /// in f32, taken only as far as rows are copied.
 pub const BACKUP_ROWS: usize = 16384;
@@ -130,6 +138,7 @@ impl<S> Snapshots<S> {
                 .unwrap();
             oldest.anchored = false;
         }
+        self.thin_history(tokens);
         while self.items.len() > self.limit {
             let oldest = self
                 .items
@@ -142,6 +151,55 @@ impl<S> Snapshots<S> {
                 Some(i) => self.items.remove(i),
                 None => break,
             };
+        }
+    }
+
+    /// Keeps at most CHAIN_KEEP plain snapshots whose tokens start `tokens`.
+    /// The CHAIN_RECENT longest stay; of the others, the one whose
+    /// neighbours are closest goes first, since going back there instead
+    /// costs the fewest tokens. So the older history stays spread out.
+    fn thin_history(&mut self, tokens: &[u32]) {
+        loop {
+            let mut history: Vec<usize> = (0..self.items.len())
+                .filter(|&i| {
+                    let s = &self.items[i];
+                    !s.pinned
+                        && !s.anchored
+                        && s.tokens.len() < tokens.len()
+                        && tokens.starts_with(&s.tokens)
+                })
+                .collect();
+            if history.len() <= CHAIN_KEEP {
+                return;
+            }
+            history.sort_by_key(|&i| self.items[i].tokens.len());
+            history.truncate(history.len() - CHAIN_RECENT);
+            // The tokens a request going back to the dropped point would
+            // run again: from the snapshot below it to the one above.
+            let len = |i: usize| self.items[i].tokens.len();
+            let merged = |i: usize| {
+                let s = &self.items[i].tokens;
+                let below = self
+                    .items
+                    .iter()
+                    .filter(|o| o.tokens.len() < s.len() && s.starts_with(&o.tokens))
+                    .map(|o| o.tokens.len())
+                    .max()
+                    .unwrap_or(0);
+                let above = self
+                    .items
+                    .iter()
+                    .filter(|o| o.tokens.len() > s.len() && o.tokens.starts_with(s))
+                    .map(|o| o.tokens.len())
+                    .min()
+                    .unwrap_or(tokens.len());
+                above - below
+            };
+            let drop = history
+                .into_iter()
+                .min_by_key(|&i| (merged(i), len(i)))
+                .unwrap();
+            self.items.remove(drop);
         }
     }
 
@@ -666,6 +724,49 @@ mod tests {
             request(&mut c, &prompt);
         }
         assert!(c.backup.is_none() && c.model().backup.1.is_empty());
+    }
+
+    /// A conversation whose prompt only grows keeps the two newest states
+    /// inside the last one and a spread-out few of the older ones.
+    #[test]
+    fn history_of_a_growing_prompt_is_thinned() {
+        let mut s: Snapshots<()> = Snapshots::new(16);
+        let all = tokens(400, 0);
+        for len in [10, 20, 30, 100, 110, 120, 130] {
+            s.insert(&all[..len], || (), false, false);
+        }
+        s.insert(&all[..140], || (), true, false);
+        assert_eq!(s.lengths(), vec![20, 30, 100, 120, 130, 140]);
+    }
+
+    /// qh's pattern: every request is the last prompt, its answer and a tool
+    /// result. With a small limit each one still starts from the last state.
+    #[test]
+    fn growing_session_reuses_every_turn() {
+        let mut c = Cached::new(Toy::keeping(), 6, 16);
+        let mut prompt = tokens(50, 0);
+        let mut answered = Vec::new();
+        for turn in 0..30u32 {
+            let (logits, keep) = request(&mut c, &prompt);
+            assert_eq!(logits, fresh(&prompt));
+            if turn > 0 {
+                assert_eq!(keep, prompt.len() - 8, "turn {turn}");
+            }
+            for t in 0..5 {
+                c.step(1000 + turn * 10 + t);
+            }
+            prompt = c.tokens.clone();
+            answered.push(prompt.clone());
+            prompt.extend(tokens(8, 2000 + turn));
+            assert!(c.snapshots().len() <= 6);
+        }
+        // An undo of the last turn: the answer before it with a new message.
+        let mut undo = answered[answered.len() - 2].clone();
+        let held = undo.len();
+        undo.extend(tokens(8, 9000));
+        let (logits, keep) = request(&mut c, &undo);
+        assert_eq!(logits, fresh(&undo));
+        assert_eq!(keep, held);
     }
 
     /// Without kept rows, another branch is never used.
