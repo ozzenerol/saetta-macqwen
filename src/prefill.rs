@@ -299,11 +299,16 @@ mod mac {
         std::env::var("SAETTA_ROUTER_FAST").is_ok_and(|v| v == "1")
     }
 
-    /// SAETTA_DELTA=1 runs the DeltaNet conv and delta rule on conv_rows and
-    /// delta_rows instead of conv_rows2 and delta_prep plus delta_rows2, to
-    /// compare.
-    fn old_delta() -> bool {
-        std::env::var("SAETTA_DELTA").is_ok_and(|v| v == "1")
+    /// SAETTA_CONV=1 runs the DeltaNet conv on conv_rows, one thread per
+    /// channel, instead of conv_rows2 and conv_state, to compare.
+    fn old_conv() -> bool {
+        std::env::var("SAETTA_CONV").is_ok_and(|v| v == "1")
+    }
+
+    /// SAETTA_DELTA2=1 runs the delta rule on delta_prep and delta_rows2
+    /// instead of delta_rows: measured slower so far.
+    fn delta2() -> bool {
+        std::env::var("SAETTA_DELTA2").is_ok_and(|v| v == "1")
     }
 
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
@@ -1211,7 +1216,7 @@ mod mac {
                 };
                 params(enc, 4, &p);
                 set_views(enc, 5, &[&whole(conv_snaps)]);
-                if old_delta() {
+                if old_conv() {
                     enc.dispatch_threads(
                         MTLSize::new(channels as u64, 1, 1),
                         MTLSize::new(256, 1, 1),
@@ -1243,7 +1248,7 @@ mod mac {
                 eps: c.eps,
                 snapshots: snaps.is_some() as u32,
             };
-            if old_delta() {
+            if !delta2() {
                 enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows"));
                 set_views(
                     enc,
