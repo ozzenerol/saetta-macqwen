@@ -168,13 +168,13 @@ kernel void attention_fa(device const half *q [[buffer(0)]],
 template [[host_name("attention_fa4")]] kernel decltype(attention_fa<4>) attention_fa<4>;
 template [[host_name("attention_fa8")]] kernel decltype(attention_fa<8>) attention_fa<8>;
 
-// attention_fx<TQ, RT, DS>: attention_fa with more work per loaded
+// attention_fx<TQ, RT, DS, PF>: attention_fa with more work per loaded
 // fragment or fewer registers. A threadgroup takes TQ tokens of one kv head;
 // a simdgroup owns RT of those tokens (RT row blocks of 8 heads) and a
 // 256 / DS slice of the head dims. Each K and V fragment it loads from
-// threadgroup memory feeds RT products. With DS = 2 the two simdgroups of a
-// token pair add their partial scores through threadgroup memory, and each
-// keeps half of O and Q in registers. PF: each thread loads its part of
+// threadgroup memory feeds RT products. With DS > 1 the DS simdgroups of a
+// token group add their partial scores through threadgroup memory, and each
+// keeps 1 / DS of O and Q in registers. PF: each thread loads its part of
 // the next K/V block into registers while the block before is computed, and
 // stores it to threadgroup memory after, so the device latency is hidden.
 template <uint TQ, uint RT, uint DS, bool PF>
@@ -285,22 +285,26 @@ kernel void attention_fx(device const half *q [[buffer(0)]],
             }
         }
         if (DS > 1) {
+            // Add the partial scores of the other DS - 1 slices of these tokens.
             threadgroup float *mine = xs + simd * RT * NF * 64;
-            threadgroup float *other = xs + (simd ^ 1) * RT * NF * 64;
             for (uint r = 0; r < RT; r++) {
                 for (uint f = 0; f < NF; f++) {
                     simdgroup_store(sf[r][f], mine + (r * NF + f) * 64, 8);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint r = 0; r < RT; r++) {
-                for (uint f = 0; f < NF; f++) {
-                    simdgroup_float8x8 t;
-                    simdgroup_load(t, other + (r * NF + f) * 64, 8);
-                    thread auto &a = sf[r][f].thread_elements();
-                    thread auto &bb = t.thread_elements();
-                    a[0] += bb[0];
-                    a[1] += bb[1];
+            for (uint k = 1; k < DS; k++) {
+                uint other_simd = simd - part + (part + k) % DS;
+                threadgroup float *other = xs + other_simd * RT * NF * 64;
+                for (uint r = 0; r < RT; r++) {
+                    for (uint f = 0; f < NF; f++) {
+                        simdgroup_float8x8 t;
+                        simdgroup_load(t, other + (r * NF + f) * 64, 8);
+                        thread auto &a = sf[r][f].thread_elements();
+                        thread auto &bb = t.thread_elements();
+                        a[0] += bb[0];
+                        a[1] += bb[1];
+                    }
                 }
             }
         }
@@ -386,3 +390,5 @@ FX("attention_fx_8_2_1", 8, 2, 1, false)
 FX("attention_fx_8_1_2_p", 8, 1, 2, true)
 FX("attention_fx_8_2_2_p", 8, 2, 2, true)
 FX("attention_fx_8_1_1_p", 8, 1, 1, true)
+FX("attention_fx_4_4_4", 4, 4, 4, false)
+FX("attention_fx_4_4_4_p", 4, 4, 4, true)

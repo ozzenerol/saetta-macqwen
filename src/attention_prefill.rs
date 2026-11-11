@@ -17,7 +17,7 @@ pub struct FlashParams {
 /// attention_fx_T_R_D takes T tokens per threadgroup, R per simdgroup, and
 /// splits the head dims over D simdgroups; a _p suffix prefetches the next
 /// key block into registers.
-pub const KERNELS: [&str; 10] = [
+pub const KERNELS: [&str; 12] = [
     "attention_fa8",
     "attention_fa4",
     "attention_fx_4_1_2",
@@ -28,6 +28,8 @@ pub const KERNELS: [&str; 10] = [
     "attention_fx_8_1_2_p",
     "attention_fx_8_2_2_p",
     "attention_fx_8_1_1_p",
+    "attention_fx_4_4_4",
+    "attention_fx_4_4_4_p",
 ];
 /// The one prefill uses.
 pub const DEFAULT: &str = "attention_fa8";
