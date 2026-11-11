@@ -1,51 +1,27 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0d0f1f"/>
-      <stop offset="1" stop-color="#1a1238"/>
-    </linearGradient>
-    <linearGradient id="die" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#2a2350"/>
-      <stop offset="1" stop-color="#171331"/>
-    </linearGradient>
-    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#fff6a8"/>
-      <stop offset="0.45" stop-color="#ffd23f"/>
-      <stop offset="1" stop-color="#ff9f1c"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.55"/>
-      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
-    </radialGradient>
-    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="9"/>
-    </filter>
+    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff6a8"/><stop offset="0.45" stop-color="#ffd23f"/><stop offset="1" stop-color="#ff9f1c"/></linearGradient>
+    <linearGradient id="d-body" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff5a4e"/><stop offset="0.6" stop-color="#d7261e"/><stop offset="1" stop-color="#9e1712"/></linearGradient>
+    <linearGradient id="d-sky" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1b1036"/><stop offset="1" stop-color="#2d1450"/></linearGradient>
   </defs>
-
-  <rect width="1280" height="400" rx="36" fill="url(#bg)"/>
-
-  <!-- chip -->
-  <g transform="translate(200 200)">
-    <circle r="170" fill="url(#glow)"/>
-    <g stroke="#7c6bd6" stroke-width="7" stroke-linecap="round">
-      <path d="M-66 -112v-26M-22 -112v-26M22 -112v-26M66 -112v-26"/>
-      <path d="M-66 112v26M-22 112v26M22 112v26M66 112v26"/>
-      <path d="M-112 -66h-26M-112 -22h-26M-112 22h-26M-112 66h-26"/>
-      <path d="M112 -66h26M112 -22h26M112 22h26M112 66h26"/>
-    </g>
-    <rect x="-112" y="-112" width="224" height="224" rx="30" fill="url(#die)" stroke="#8b7cf0" stroke-width="5"/>
-    <rect x="-84" y="-84" width="168" height="168" rx="18" fill="none" stroke="#4b3f8f" stroke-width="3"/>
-    <!-- bolt -->
-    <path d="M18 -132 L-58 14 L-6 14 L-30 132 L62 -24 L8 -24 Z" fill="#ffd23f" filter="url(#soft)" opacity="0.8"/>
-    <path d="M18 -132 L-58 14 L-6 14 L-30 132 L62 -24 L8 -24 Z" fill="url(#bolt)" stroke="#fff3b0" stroke-width="3" stroke-linejoin="round"/>
-  </g>
-
-  <!-- wordmark -->
   <g font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
-    <text x="410" y="215" font-size="132" font-weight="700" fill="#f4f1ff" letter-spacing="2">saetta</text>
-    <text x="414" y="282" font-size="44" font-weight="400" letter-spacing="10">
-      <tspan fill="#9aa0c8">mac</tspan><tspan fill="#a78bfa" font-weight="700">qwen</tspan>
-    </text>
-    <text x="416" y="330" font-size="22" fill="#6f7299" letter-spacing="3">Qwen3.6 on Apple Silicon, in Rust and Metal</text>
+      <rect width="1280" height="400" rx="36" fill="url(#d-sky)"/>
+      <g stroke="#ffd23f" stroke-linecap="round" opacity="0.85">
+        <path d="M40 196h120" stroke-width="8"/><path d="M70 236h110" stroke-width="6"/><path d="M30 276h150" stroke-width="8"/>
+      </g>
+      <g transform="translate(150 110)">
+        <path d="M20 190 C20 150 40 128 90 120 L170 112 C200 70 250 52 320 52 L390 54 C430 56 452 80 470 112 L520 120 C548 126 560 146 560 172 L560 192 C560 204 552 210 540 210 L40 210 C28 210 20 202 20 190 Z" fill="url(#d-body)" stroke="#5c0d0a" stroke-width="4"/>
+        <path d="M190 112 C214 80 252 66 312 66 L380 68 C410 70 428 88 440 112 Z" fill="#2a3550" stroke="#5c0d0a" stroke-width="3"/>
+        <path d="M300 68 L292 112" stroke="#5c0d0a" stroke-width="4"/>
+        <path d="M18 128 L8 92 L62 92 L74 122" fill="#c1201a" stroke="#5c0d0a" stroke-width="3"/>
+        <path d="M262 124 L214 174 L246 174 L222 206 L298 154 L262 154 L290 124 Z" fill="url(#bolt)" stroke="#a86a00" stroke-width="2"/>
+        <circle cx="360" cy="160" r="30" fill="#fff" stroke="#5c0d0a" stroke-width="3"/>
+        <text x="360" y="172" font-size="32" font-weight="700" fill="#d7261e" text-anchor="middle">36</text>
+        <g><circle cx="128" cy="210" r="44" fill="#161616"/><circle cx="128" cy="210" r="22" fill="#ffd23f"/><circle cx="128" cy="210" r="8" fill="#161616"/></g>
+        <g><circle cx="456" cy="210" r="44" fill="#161616"/><circle cx="456" cy="210" r="22" fill="#ffd23f"/><circle cx="456" cy="210" r="8" fill="#161616"/></g>
+      </g>
+      <text x="760" y="205" font-size="110" font-weight="700" fill="#ffffff" transform="translate(760 205) skewX(-10) translate(-760 -205)">saetta</text>
+      <text x="766" y="270" font-size="42" letter-spacing="10"><tspan fill="#c9c4e8">mac</tspan><tspan fill="#ffd23f" font-weight="700">qwen</tspan></text>
+      <text x="768" y="318" font-size="20" fill="#9b93c4" letter-spacing="3">Qwen3.6 on Apple Silicon</text>
   </g>
 </svg>
