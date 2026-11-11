@@ -174,8 +174,10 @@ template [[host_name("attention_fa8")]] kernel decltype(attention_fa<8>) attenti
 // 256 / DS slice of the head dims. Each K and V fragment it loads from
 // threadgroup memory feeds RT products. With DS = 2 the two simdgroups of a
 // token pair add their partial scores through threadgroup memory, and each
-// keeps half of O and Q in registers.
-template <uint TQ, uint RT, uint DS>
+// keeps half of O and Q in registers. PF: each thread loads its part of
+// the next K/V block into registers while the block before is computed, and
+// stores it to threadgroup memory after, so the device latency is hidden.
+template <uint TQ, uint RT, uint DS, bool PF>
 kernel void attention_fx(device const half *q [[buffer(0)]],
                          device const half *keys [[buffer(1)]],
                          device const half *values [[buffer(2)]],
@@ -223,17 +225,44 @@ kernel void attention_fx(device const half *q [[buffer(0)]],
     device const half *kbase = keys + kv * FA_DIM;
     device const half *vbase = values + kv * FA_DIM;
     constexpr uint CHUNKS = FA_BK * FA_DIM / 8;
+    constexpr uint PER = CHUNKS / THREADS;
+    static_assert(CHUNKS % THREADS == 0, "a block splits evenly over the threads");
+    uint4 kr[PF ? PER : 1], vr[PF ? PER : 1];
+    if (PF) {
+        for (uint i = 0; i < PER; i++) {
+            uint idx = tid + i * THREADS;
+            ulong src = ulong(idx / 32) * stride;
+            kr[i] = ((device const uint4 *)(kbase + src))[idx % 32];
+            vr[i] = ((device const uint4 *)(vbase + src))[idx % 32];
+        }
+    }
 
     for (uint b = 0; b < blocks; b++) {
         uint j0 = b * FA_BK;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < CHUNKS; i += THREADS) {
-            uint key = i / 32, c = i % 32;
-            ulong src = ulong(j0 + key) * stride;
-            ((threadgroup uint4 *)(kt + key * FA_LD))[c] = ((device const uint4 *)(kbase + src))[c];
-            ((threadgroup uint4 *)(vt + key * FA_LD))[c] = ((device const uint4 *)(vbase + src))[c];
+        if (PF) {
+            for (uint i = 0; i < PER; i++) {
+                uint idx = tid + i * THREADS;
+                ((threadgroup uint4 *)(kt + (idx / 32) * FA_LD))[idx % 32] = kr[i];
+                ((threadgroup uint4 *)(vt + (idx / 32) * FA_LD))[idx % 32] = vr[i];
+            }
+        } else {
+            for (uint i = tid; i < CHUNKS; i += THREADS) {
+                uint key = i / 32, c = i % 32;
+                ulong src = ulong(j0 + key) * stride;
+                ((threadgroup uint4 *)(kt + key * FA_LD))[c] = ((device const uint4 *)(kbase + src))[c];
+                ((threadgroup uint4 *)(vt + key * FA_LD))[c] = ((device const uint4 *)(vbase + src))[c];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (PF && b + 1 < blocks) {
+            for (uint i = 0; i < PER; i++) {
+                uint idx = tid + i * THREADS;
+                ulong src = ulong(j0 + FA_BK + idx / 32) * stride;
+                kr[i] = ((device const uint4 *)(kbase + src))[idx % 32];
+                vr[i] = ((device const uint4 *)(vbase + src))[idx % 32];
+            }
+        }
         // A block past all of this simdgroup's tokens: skip the compute but
         // not the barrier of the DS > 1 exchange.
         bool active = j0 <= limit[RT - 1];
@@ -347,10 +376,13 @@ kernel void attention_fx(device const half *q [[buffer(0)]],
     }
 }
 
-#define FX(name, tq, rt, ds) \
-    template [[host_name(name)]] kernel decltype(attention_fx<tq, rt, ds>) attention_fx<tq, rt, ds>;
-FX("attention_fx_4_1_2", 4, 1, 2)
-FX("attention_fx_8_1_2", 8, 1, 2)
-FX("attention_fx_8_2_2", 8, 2, 2)
-FX("attention_fx_4_2_2", 4, 2, 2)
-FX("attention_fx_8_2_1", 8, 2, 1)
+#define FX(name, tq, rt, ds, pf) \
+    template [[host_name(name)]] kernel decltype(attention_fx<tq, rt, ds, pf>) attention_fx<tq, rt, ds, pf>;
+FX("attention_fx_4_1_2", 4, 1, 2, false)
+FX("attention_fx_8_1_2", 8, 1, 2, false)
+FX("attention_fx_8_2_2", 8, 2, 2, false)
+FX("attention_fx_4_2_2", 4, 2, 2, false)
+FX("attention_fx_8_2_1", 8, 2, 1, false)
+FX("attention_fx_8_1_2_p", 8, 1, 2, true)
+FX("attention_fx_8_2_2_p", 8, 2, 2, true)
+FX("attention_fx_8_1_1_p", 8, 1, 1, true)

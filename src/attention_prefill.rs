@@ -15,8 +15,9 @@ pub struct FlashParams {
 
 /// The kernels: attention_faN takes N tokens of one kv head per threadgroup.
 /// attention_fx_T_R_D takes T tokens per threadgroup, R per simdgroup, and
-/// splits the head dims over D simdgroups.
-pub const KERNELS: [&str; 7] = [
+/// splits the head dims over D simdgroups; a _p suffix prefetches the next
+/// key block into registers.
+pub const KERNELS: [&str; 10] = [
     "attention_fa8",
     "attention_fa4",
     "attention_fx_4_1_2",
@@ -24,6 +25,9 @@ pub const KERNELS: [&str; 7] = [
     "attention_fx_8_2_2",
     "attention_fx_4_2_2",
     "attention_fx_8_2_1",
+    "attention_fx_8_1_2_p",
+    "attention_fx_8_2_2_p",
+    "attention_fx_8_1_1_p",
 ];
 /// The one prefill uses.
 pub const DEFAULT: &str = "attention_fa8";
@@ -69,7 +73,11 @@ mod mac {
                 .unwrap_or_else(|_| panic!("no prefill attention kernel {kernel}"));
             (n, n)
         } else if let Some(rest) = kernel.strip_prefix("attention_fx_") {
-            let v: Vec<u64> = rest.split('_').filter_map(|x| x.parse().ok()).collect();
+            let v: Vec<u64> = rest
+                .split('_')
+                .take(3)
+                .filter_map(|x| x.parse().ok())
+                .collect();
             assert_eq!(v.len(), 3, "no prefill attention kernel {kernel}");
             (v[0], v[0] / v[1] * v[2])
         } else {
