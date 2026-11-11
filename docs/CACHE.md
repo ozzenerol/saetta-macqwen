@@ -40,3 +40,17 @@ A snapshot is one 65.9 MB buffer from a pool of 17, made when the server starts 
 
 - Restoring a snapshot and running the same tokens gives the same logits as never having left (bit-equal on the GPU, same kernels).
 - A qh session of 10 tool steps reads each prompt token once, shown by `cached_tokens` in the usage.
+
+## KV cache formats
+
+The KV cache of each attention layer is allocated once for the whole context (`serve --context N`, default 262144). A page of it takes memory only when a token is written there, and it is not given back while the server runs.
+
+Bytes per token over the 10 attention layers, keys and values of 2 heads of 256:
+
+- half (`--kv-bits 16`, the default): 20 KB, 5.2 GB at 262144 tokens
+- 8 bits (`--kv-bits 8`): 10.9 KB, 2.8 GB
+- 4 bits (`--kv-bits 4`): 5.8 KB, 1.5 GB
+
+The 8- and 4-bit formats are MLX's: groups of 64 values with a half scale and bias, x = s * q + z (`src/kv_quant.rs`, `kernels/kv_quant.metal`). The rounding error is about step / sqrt(12) of a group: 5.5e-3 of the values' RMS at 8 bits, 9e-2 at 4 bits, against 2.4e-4 for half. Prefill reads a quantized cache through a half copy of the tokens so far; decode over it waits for its attention kernels, so `serve` takes only 16 for now.
+
+When a short request writes over the rows of a longer conversation, those rows (at most `BACKUP_ROWS` = 16384 of them, every buffer of the cache) are copied aside first and put back when the long conversation returns.
