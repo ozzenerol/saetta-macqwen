@@ -259,13 +259,12 @@ mod mac {
         y: &View,
         g: &Grouped,
         gather_x: bool,
-        variant: crate::qmm::Variant,
     ) {
         assert_eq!(crate::qmm::FEW, FEW);
         crate::qmm::encode_gather(
             enc,
             gpu,
-            variant,
+            crate::qmm::DEFAULT,
             w,
             x_half,
             y,
@@ -287,60 +286,6 @@ mod mac {
         params(enc, 5, &shape);
         set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
         groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
-    }
-
-    /// The experts' gate and up projections fused, with silu: SAETTA_GU=0
-    /// runs them as two qmm2 dispatches and silu_mul_rows instead, to
-    /// compare.
-    fn fused_gate_up() -> bool {
-        std::env::var("SAETTA_GU").map_or(true, |v| v != "0")
-    }
-
-    /// eg = silu(x W_gate^T) * (x W_up^T) on the tiles of `g`, in f32 and in
-    /// half (`eg_half`), from `x` and its half `x_half`. Tiles of up to 32
-    /// rows go to qmm_gate_up; those of FEW rows or fewer to qmm_few, with
-    /// `eu` holding their up projection, then silu_mul_tiles.
-    #[allow(clippy::too_many_arguments)]
-    fn gate_up_grouped(
-        gpu: &Gpu,
-        enc: &ComputeCommandEncoderRef,
-        e: &Experts,
-        x: &View,
-        x_half: &View,
-        eg: &View,
-        eu: &View,
-        eg_half: &View,
-        g: &Grouped,
-    ) {
-        let n = e.size();
-        assert!(n.is_multiple_of(64) && e.gate.bits == e.up.bits);
-        let shape = MmShape {
-            m: 0,
-            n: n as u32,
-            k: e.gate.cols as u32,
-            gather: 1,
-        };
-        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("qmm_gate_up_{}bit", e.gate.bits)));
-        set_quant(enc, 0, &e.gate);
-        set_quant(enc, 3, &e.up);
-        set_views(enc, 6, &[x_half, eg, eg_half]);
-        params(enc, 9, &shape);
-        set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
-        groups(enc, (n / 64, g.max_tiles), 128);
-
-        for (w, y) in [(&e.gate, eg), (&e.up, eu)] {
-            enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
-            set_quant(enc, 0, w);
-            set_views(enc, 3, &[x, y]);
-            params(enc, 5, &MmShape { gather: 1, ..shape });
-            set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
-            groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
-        }
-        enc.set_compute_pipeline_state(&gpu.pipeline("silu_mul_tiles"));
-        set_views(enc, 0, &[eg, eu, eg_half]);
-        params(enc, 3, &(n as u32));
-        set_views(enc, 4, &[g.tiles, g.tile_count]);
-        groups(enc, (g.max_tiles, 1), 256);
     }
 
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
@@ -458,7 +403,7 @@ mod mac {
             let narrow = (d.v_heads * d.v_dim).max(a.heads * a.head_dim);
             let pairs = chunk * cfg.num_experts_per_tok;
             let size = cfg.moe_intermediate_size;
-            let max_tiles = pairs.div_ceil(crate::qmm::SMALL.rows) + cfg.num_experts;
+            let max_tiles = pairs.div_ceil(TILE.min(crate::qmm::tile_rows())) + cfg.num_experts;
             Scratch {
                 normed: f(chunk * h),
                 wide: f(chunk * wide),
@@ -1440,14 +1385,12 @@ mod mac {
                 qmm(gpu, enc, &layer.shared[2], &sg, &sd, t, self.exact);
             }
 
-            // Fast mode runs the experts on qmm2 with its tile size: SMALL
-            // for chunks of up to 512 tokens, about 16 rows per expert.
-            let variant = if t <= 512 {
-                crate::qmm::SMALL
+            // Fast mode runs the experts on qmm2, with its tile size.
+            let tile_rows = if self.exact {
+                TILE
             } else {
-                crate::qmm::DEFAULT
+                crate::qmm::tile_rows()
             };
-            let tile_rows = if self.exact { TILE } else { variant.rows };
             let [ids, weights, order, rows, tiles, tile_count] = [
                 &s.ids,
                 &s.expert_weights,
@@ -1493,46 +1436,13 @@ mod mac {
                 if self.exact {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
                     qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
-                } else if fused_gate_up() {
-                    to_half(gpu, enc, normed, &normed_half, t * h);
-                    gate_up_grouped(
-                        gpu,
-                        enc,
-                        e,
-                        normed,
-                        &normed_half,
-                        &eg,
-                        &eu,
-                        &expert_half,
-                        &g,
-                    );
                 } else {
                     to_half(gpu, enc, normed, &normed_half, t * h);
-                    qmm2_grouped(
-                        gpu,
-                        enc,
-                        &e.gate,
-                        normed,
-                        &normed_half,
-                        &eg,
-                        &g,
-                        true,
-                        variant,
-                    );
-                    qmm2_grouped(
-                        gpu,
-                        enc,
-                        &e.up,
-                        normed,
-                        &normed_half,
-                        &eu,
-                        &g,
-                        true,
-                        variant,
-                    );
+                    qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
+                    qmm2_grouped(gpu, enc, &e.up, normed, &normed_half, &eu, &g, true);
                 }
             }
-            if self.on("experts silu") && (self.exact || !fused_gate_up()) {
+            if self.on("experts silu") {
                 dispatch_1d(
                     enc,
                     &silu_mul,
@@ -1545,20 +1455,8 @@ mod mac {
                 if self.exact {
                     qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, true);
                 } else {
-                    if !fused_gate_up() {
-                        to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
-                    }
-                    qmm2_grouped(
-                        gpu,
-                        enc,
-                        &e.down,
-                        &eg,
-                        &expert_half,
-                        &eo,
-                        &g,
-                        false,
-                        variant,
-                    );
+                    to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    qmm2_grouped(gpu, enc, &e.down, &eg, &expert_half, &eo, &g, false);
                 }
             }
 
