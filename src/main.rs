@@ -170,8 +170,12 @@ fn serve_gpu(
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
     let layers = model.deltanet_states();
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
+    let mut prefill =
+        saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, GPU_CONTEXT)?;
+    prefill.exact = exact_prefill();
     let served = GpuServed {
         model,
+        prefill,
         pool,
         last_blit: RefCell::new(None),
     };
@@ -189,6 +193,18 @@ struct GpuServed {
     /// The last snapshot copy, which may still run. The CPU must wait for it
     /// before it writes the states, as `reset` does.
     last_blit: RefCell<Option<metal::CommandBuffer>>,
+    prefill: saetta::prefill::Prefill<'static>,
+}
+
+/// Tokens per prefill dispatch.
+#[cfg(target_os = "macos")]
+const PREFILL_CHUNK: usize = 1024;
+
+/// SAETTA_EXACT=1 picks the prefill kernels that stay within f32 rounding
+/// of decode, at about half the speed.
+#[cfg(target_os = "macos")]
+fn exact_prefill() -> bool {
+    std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1")
 }
 
 // The server uses the model from one thread at a time, behind its engine
@@ -207,14 +223,14 @@ impl server::Model for GpuServed {
             tokens.len(),
             m.capacity()
         );
-        let start = Instant::now();
-        let Some((&last, rest)) = tokens.split_last() else {
+        if tokens.is_empty() {
             return Vec::new();
-        };
-        for &t in rest {
-            m.run(t);
         }
-        let logits = m.forward(last);
+        let start = Instant::now();
+        let pos = m.position();
+        let states: Vec<_> = m.states().collect();
+        let logits = self.prefill.run(m.gpu(), tokens, pos, &states);
+        m.set_position(pos + tokens.len());
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
             "prefill {} tokens in {secs:.2} s ({:.1} ms/token)",
@@ -384,7 +400,13 @@ fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(target_os = "macos")]
 fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
     match (tokens.parse(), chunk.parse()) {
-        (Ok(t), Ok(c)) => report(saetta::prefill::bench(Path::new(dir), t, c, 3)),
+        (Ok(t), Ok(c)) => report(saetta::prefill::bench(
+            Path::new(dir),
+            t,
+            c,
+            3,
+            exact_prefill(),
+        )),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE

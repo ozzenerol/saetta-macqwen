@@ -15,10 +15,12 @@ mod mac {
     use crate::cpu::model::{attention_config, deltanet_config};
     use crate::gpu::{Gpu, contents, dispatch_1d};
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache, Norm};
+    use crate::gpu_model::State;
     use crate::moe::Experts;
-    use crate::qmv::{GpuQuant, View, set_views};
+    use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+    use std::cell::Cell;
     use std::time::Instant;
 
     const PREFIX: &str = "language_model.model";
@@ -47,6 +49,66 @@ mod mac {
             MTLSize::new(grid.0 as u64, grid.1 as u64, 1),
             MTLSize::new(threads as u64, 1, 1),
         );
+    }
+
+    /// Binds `views` at consecutive buffer indices from `first`.
+    fn set_views(enc: &ComputeCommandEncoderRef, first: u64, views: &[&View]) {
+        for (i, v) in views.iter().enumerate() {
+            enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
+        }
+    }
+
+    /// Binds the words, scales and biases of `w` at `first` to `first + 2`.
+    fn set_quant(enc: &ComputeCommandEncoderRef, first: u64, w: &GpuQuant) {
+        set_views(enc, first, &[&w.words, &w.scales, &w.biases]);
+    }
+
+    /// Must match NormParams in kernels/layers.metal.
+    #[repr(C)]
+    struct NormParams {
+        dim: u32,
+        in_stride: u32,
+        out_stride: u32,
+        eps: f32,
+        scale: f32,
+        weighted: u32,
+        gated: u32,
+    }
+
+    /// `out = rms_norm(x)` as `n` says, like `Norm::record`.
+    fn norm(gpu: &Gpu, enc: &ComputeCommandEncoderRef, n: &Norm, x: &View, out: &View) {
+        enc.set_compute_pipeline_state(&gpu.pipeline("rms_norm"));
+        set_views(
+            enc,
+            0,
+            &[x, n.weight.unwrap_or(x), n.gate.unwrap_or(x), out],
+        );
+        let p = NormParams {
+            dim: n.dim as u32,
+            in_stride: n.in_stride as u32,
+            out_stride: n.out_stride as u32,
+            eps: n.eps,
+            scale: n.scale,
+            weighted: n.weight.is_some() as u32,
+            gated: n.gate.is_some() as u32,
+        };
+        params(enc, 4, &p);
+        let threads = n.dim.next_multiple_of(32).min(256);
+        groups(enc, (n.rows, 1), threads);
+    }
+
+    /// y = W x for one vector, with qmv.metal (8 rows per threadgroup).
+    fn qmv(gpu: &Gpu, enc: &ComputeCommandEncoderRef, w: &GpuQuant, x: &View, y: &View) {
+        let name = match w.bits {
+            5 => "qmv_5bit",
+            8 => "qmv_8bit",
+            b => panic!("no qmv kernel for {b} bits"),
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(name));
+        set_quant(enc, 0, w);
+        set_views(enc, 3, &[x, y]);
+        params(enc, 5, &[w.rows as u32, w.cols as u32]);
+        groups(enc, (w.rows.div_ceil(8), 1), 64);
     }
 
     #[repr(C)]
@@ -84,7 +146,7 @@ mod mac {
     ) {
         assert_eq!(w.experts, 1);
         enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
-        w.set_buffers(enc, 0);
+        set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y, x, x, x]);
         let shape = MmShape {
             m: m as u32,
@@ -118,7 +180,7 @@ mod mac {
         split: bool,
     ) {
         enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
-        w.set_buffers(enc, 0);
+        set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y]);
         let shape = MmShape {
             m: 0,
@@ -171,31 +233,13 @@ mod mac {
         shared_gate: GpuQuant<'a>,
     }
 
-    /// What a layer keeps between tokens, on the GPU.
-    pub enum State {
-        Linear(GpuDeltaNetState),
-        Full(KvState),
-    }
-
-    /// The KV cache, and the half copy of it that fast prefill reads.
-    pub struct KvState {
-        pub cache: GpuKvCache,
-        half_keys: Buffer,
-        half_values: Buffer,
-        /// Tokens copied to the half buffers.
-        half_len: usize,
-    }
-
-    impl KvState {
-        fn new(gpu: &Gpu, cfg: &AttentionConfig, capacity: usize) -> KvState {
-            let size = capacity * cfg.kv_heads * cfg.head_dim * 2;
-            KvState {
-                cache: GpuKvCache::new(gpu, cfg, capacity),
-                half_keys: gpu.buffer(size),
-                half_values: gpu.buffer(size),
-                half_len: 0,
-            }
-        }
+    /// A half copy of one KV cache, which fast prefill reads.
+    struct HalfKv {
+        keys: Buffer,
+        values: Buffer,
+        /// Tokens copied so far. Decode adds tokens to the f32 cache only,
+        /// so the next prefill copies the rest first.
+        len: Cell<usize>,
     }
 
     /// Encodes y[i] = half(x[i]) for i < n.
@@ -364,6 +408,8 @@ mod mac {
         pub exact: bool,
         /// Largest |x| seen at each of `RANGES`, when tracked.
         ranges: Option<Buffer>,
+        /// One per attention layer, in layer order.
+        half_kv: Vec<HalfKv>,
     }
 
     /// The inputs whose range `track_ranges` records: half tops out at 65504.
@@ -376,12 +422,14 @@ mod mac {
     ];
 
     impl<'a> Prefill<'a> {
-        /// `chunk` is the number of tokens per dispatch.
+        /// `chunk` is the number of tokens per dispatch, `capacity` that
+        /// of the KV caches it will fill.
         pub fn new(
             gpu: &Gpu,
             cfg: &'a Config,
             weights: &'a Weights,
             chunk: usize,
+            capacity: usize,
         ) -> Result<Prefill<'a>, String> {
             let attention = attention_config(cfg);
             let deltanet = deltanet_config(cfg);
@@ -446,7 +494,18 @@ mod mac {
                 });
             }
             let chunk = chunk.next_multiple_of(TILE);
+            let half_size = capacity * attention.kv_heads * attention.head_dim * 2;
+            let half_kv = layers
+                .iter()
+                .filter(|l| matches!(l.mixer, Mixer::Full(_)))
+                .map(|_| HalfKv {
+                    keys: gpu.buffer(half_size),
+                    values: gpu.buffer(half_size),
+                    len: Cell::new(0),
+                })
+                .collect();
             Ok(Prefill {
+                half_kv,
                 cfg,
                 attention,
                 deltanet,
@@ -490,115 +549,138 @@ mod mac {
             enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
         }
 
-        /// Empty states with room for `capacity` tokens in the KV caches.
-        pub fn new_states(&self, gpu: &Gpu, capacity: usize) -> Vec<State> {
-            let capacity = capacity.next_multiple_of(KEY_BLOCK);
-            self.cfg
-                .layer_types
-                .iter()
-                .map(|kind| match kind {
-                    LayerType::LinearAttention => {
-                        State::Linear(GpuDeltaNetState::new(gpu, &self.deltanet))
-                    }
-                    LayerType::FullAttention => {
-                        State::Full(KvState::new(gpu, &self.attention, capacity))
-                    }
-                })
-                .collect()
-        }
-
-        /// Feeds `tokens` after what `states` already hold and returns the
-        /// logits of the last token.
-        pub fn run(&self, gpu: &Gpu, tokens: &[u32], states: &mut [State]) -> Vec<f32> {
-            let x = self.embed(gpu, tokens);
-            for (l, state) in states.iter_mut().enumerate() {
-                self.layer(gpu, l, &x, tokens.len(), state);
-            }
-            self.logits(gpu, &x, tokens.len())
+        /// Feeds `tokens` at positions `pos ..` into `states`, which hold
+        /// the tokens before, and returns the logits of the last token. One
+        /// command buffer runs the whole prompt.
+        pub fn run(&self, gpu: &Gpu, tokens: &[u32], pos: usize, states: &[State]) -> Vec<f32> {
+            let n = tokens.len();
+            assert!(n > 0);
+            let x = gpu.buffer(n * self.cfg.hidden_size * 4);
+            let ids = gpu.buffer_from(tokens);
+            let logits = gpu.buffer(self.lm_head.rows * 4);
+            gpu.run(|enc| {
+                self.encode_embed(gpu, enc, &ids, &x, n);
+                for (l, state) in states.iter().enumerate() {
+                    self.encode_layer(gpu, enc, l, &x, n, pos, state);
+                }
+                self.encode_logits(gpu, enc, &x, n, &logits);
+            });
+            contents::<f32>(&logits, self.lm_head.rows).to_vec()
         }
 
         /// The hidden states `[tokens, hidden]` after the embedding.
         pub fn embed(&self, gpu: &Gpu, tokens: &[u32]) -> Buffer {
-            let h = self.cfg.hidden_size;
-            let x = gpu.buffer(tokens.len() * h * 4);
+            let x = gpu.buffer(tokens.len() * self.cfg.hidden_size * 4);
             let ids = gpu.buffer_from(tokens);
+            gpu.run(|enc| self.encode_embed(gpu, enc, &ids, &x, tokens.len()));
+            x
+        }
+
+        fn encode_embed(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            ids: &Buffer,
+            x: &Buffer,
+            n: usize,
+        ) {
+            let h = self.cfg.hidden_size;
             let name = match self.embed.bits {
                 5 => "embed_rows_5bit",
                 8 => "embed_rows_8bit",
                 b => panic!("no embed kernel for {b} bits"),
             };
-            gpu.run(|enc| {
-                enc.set_compute_pipeline_state(&gpu.pipeline(name));
-                self.embed.set_buffers(enc, 0);
-                set_views(enc, 3, &[&whole(&ids), &whole(&x)]);
-                params(enc, 5, &EmbedParams { cols: h as u32 });
-                enc.dispatch_threads(
-                    MTLSize::new(h as u64, tokens.len() as u64, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-            });
-            x
+            enc.set_compute_pipeline_state(&gpu.pipeline(name));
+            set_quant(enc, 0, &self.embed);
+            set_views(enc, 3, &[&whole(ids), &whole(x)]);
+            params(enc, 5, &EmbedParams { cols: h as u32 });
+            enc.dispatch_threads(MTLSize::new(h as u64, n as u64, 1), MTLSize::new(256, 1, 1));
         }
 
         /// Runs layer `l` over the `n` hidden states in `x`, in place, in
-        /// one command buffer.
-        pub fn layer(&self, gpu: &Gpu, l: usize, x: &Buffer, n: usize, state: &mut State) {
-            let pos = match state {
-                State::Full(kv) => {
-                    assert!(
-                        kv.cache.len + n.next_multiple_of(KEY_BLOCK) <= kv.cache.capacity,
-                        "KV cache is full"
-                    );
-                    kv.cache.len
-                }
-                State::Linear(_) => 0,
-            };
-            gpu.run(|enc| {
-                if let (State::Full(kv), false) = (&*state, self.exact) {
-                    // Tokens added by decode since the last prefill.
-                    let size = self.attention.kv_heads * self.attention.head_dim;
-                    for (f32s, halves) in [
-                        (&kv.cache.keys, &kv.half_keys),
-                        (&kv.cache.values, &kv.half_values),
-                    ] {
-                        to_half(
-                            gpu,
-                            enc,
-                            &at(f32s, kv.half_len * size),
-                            &at_half(halves, kv.half_len * size),
-                            (pos - kv.half_len) * size,
-                        );
+        /// one command buffer. The first is at position `pos`.
+        pub fn layer(&self, gpu: &Gpu, l: usize, x: &Buffer, n: usize, pos: usize, state: &State) {
+            gpu.run(|enc| self.encode_layer(gpu, enc, l, x, n, pos, state));
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_layer(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            l: usize,
+            x: &Buffer,
+            n: usize,
+            pos: usize,
+            state: &State,
+        ) {
+            let half = match state {
+                State::Full(cache) => {
+                    assert!(pos + n <= cache.capacity, "KV cache is full");
+                    // attention_rows reads keys in blocks of KEY_BLOCK.
+                    assert!(cache.capacity.is_multiple_of(KEY_BLOCK));
+                    let half = &self.half_kv[self.attention_index(l)];
+                    // A reset or a truncation may have moved back.
+                    half.len.set(half.len.get().min(pos));
+                    if !self.exact {
+                        let size = self.attention.kv_heads * self.attention.head_dim;
+                        let done = half.len.get();
+                        for (f32s, halves) in
+                            [(&cache.keys, &half.keys), (&cache.values, &half.values)]
+                        {
+                            to_half(
+                                gpu,
+                                enc,
+                                &at(f32s, done * size),
+                                &at_half(halves, done * size),
+                                (pos - done) * size,
+                            );
+                        }
+                        half.len.set(pos + n);
                     }
+                    Some(half)
                 }
-                for start in (0..n).step_by(self.chunk) {
-                    let t = self.chunk.min(n - start);
-                    self.encode_chunk(gpu, enc, l, x, start, t, pos + start, state);
-                }
-            });
-            if let State::Full(kv) = state {
-                kv.cache.len += n;
-                if !self.exact {
-                    kv.half_len = kv.cache.len;
-                }
+                State::Linear(_) => None,
+            };
+            for start in (0..n).step_by(self.chunk) {
+                let t = self.chunk.min(n - start);
+                self.encode_chunk(gpu, enc, l, x, start, t, pos + start, state, half);
             }
+        }
+
+        /// Which attention layer `l` is.
+        fn attention_index(&self, l: usize) -> usize {
+            self.layers[..l]
+                .iter()
+                .filter(|l| matches!(l.mixer, Mixer::Full(_)))
+                .count()
         }
 
         /// The logits of the last of the `n` hidden states in `x`.
         pub fn logits(&self, gpu: &Gpu, x: &Buffer, n: usize) -> Vec<f32> {
-            let h = self.cfg.hidden_size;
-            let last = gpu.buffer(h * 4);
             let logits = gpu.buffer(self.lm_head.rows * 4);
-            gpu.run(|enc| {
-                Norm::rows(1, h, self.cfg.rms_norm_eps, &self.norm).encode(
-                    gpu,
-                    enc,
-                    &at(x, (n - 1) * h),
-                    &whole(&last),
-                );
-                self.lm_head
-                    .encode(gpu, enc, &whole(&last), &whole(&logits));
-            });
+            gpu.run(|enc| self.encode_logits(gpu, enc, x, n, &logits));
             contents::<f32>(&logits, self.lm_head.rows).to_vec()
+        }
+
+        fn encode_logits(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            n: usize,
+            logits: &Buffer,
+        ) {
+            let h = self.cfg.hidden_size;
+            let last = whole(&self.scratch.normed);
+            norm(
+                gpu,
+                enc,
+                &Norm::rows(1, h, self.cfg.rms_norm_eps, &self.norm),
+                &at(x, (n - 1) * h),
+                &last,
+            );
+            qmv(gpu, enc, &self.lm_head, &last, &whole(logits));
         }
 
         /// Tokens `start .. start + t` of `x` through layer `l`; the first of
@@ -614,6 +696,7 @@ mod mac {
             t: usize,
             pos: usize,
             state: &State,
+            half: Option<&HalfKv>,
         ) {
             let layer = &self.layers[l];
             let s = &self.scratch;
@@ -623,15 +706,29 @@ mod mac {
             let normed = whole(&s.normed);
             let mixer_out = whole(&s.mixer_out);
 
-            Norm::rows(t, h, eps, &layer.input_norm).encode(gpu, enc, &xt, &normed);
+            norm(
+                gpu,
+                enc,
+                &Norm::rows(t, h, eps, &layer.input_norm),
+                &xt,
+                &normed,
+            );
             self.record(gpu, enc, 0, &normed, t * h);
             match (&layer.mixer, state) {
                 (Mixer::Linear(w), State::Linear(st)) => {
                     self.encode_deltanet(gpu, enc, w, st, &normed, &mixer_out, t)
                 }
-                (Mixer::Full(w), State::Full(kv)) => {
-                    self.encode_attention(gpu, enc, w, kv, &normed, &mixer_out, t, pos)
-                }
+                (Mixer::Full(w), State::Full(cache)) => self.encode_attention(
+                    gpu,
+                    enc,
+                    w,
+                    cache,
+                    half.unwrap(),
+                    &normed,
+                    &mixer_out,
+                    t,
+                    pos,
+                ),
                 _ => panic!("layer {l}: state does not match the layer type"),
             }
             dispatch_1d(
@@ -640,7 +737,13 @@ mod mac {
                 &[(&xt.buffer, xt.offset), (&s.mixer_out, 0)],
                 t * h,
             );
-            Norm::rows(t, h, eps, &layer.post_norm).encode(gpu, enc, &xt, &normed);
+            norm(
+                gpu,
+                enc,
+                &Norm::rows(t, h, eps, &layer.post_norm),
+                &xt,
+                &normed,
+            );
             self.encode_moe(gpu, enc, layer, &normed, &xt, t);
         }
 
@@ -702,7 +805,7 @@ mod mac {
 
             let mut gated = Norm::rows(t * c.v_heads, c.v_dim, c.eps, &w.norm);
             gated.gate = Some(&z);
-            gated.encode(gpu, enc, &y, &y);
+            norm(gpu, enc, &gated, &y, &y);
             self.record(gpu, enc, 1, &y, t * c.v_heads * c.v_dim);
             qmm(gpu, enc, &w.out, &y, out, t, self.exact);
         }
@@ -713,7 +816,8 @@ mod mac {
             gpu: &Gpu,
             enc: &ComputeCommandEncoderRef,
             w: &AttentionWeights,
-            kv: &KvState,
+            cache: &GpuKvCache,
+            half: &HalfKv,
             x: &View,
             out: &View,
             t: usize,
@@ -723,7 +827,6 @@ mod mac {
             let s = &self.scratch;
             let d = c.head_dim;
             let kv_size = c.kv_heads * d;
-            let cache = &kv.cache;
             let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
             let (keys, values) = (
                 at(&cache.keys, pos * kv_size),
@@ -733,10 +836,16 @@ mod mac {
             qmm(gpu, enc, &w.k, x, &keys, t, self.exact);
             qmm(gpu, enc, &w.v, x, &values, t, self.exact);
 
-            let mut norm = Norm::rows(t * c.heads, d, c.eps, &w.q_norm);
-            norm.in_stride = 2 * d;
-            norm.encode(gpu, enc, &q_and_gate, &q);
-            Norm::rows(t * c.kv_heads, d, c.eps, &w.k_norm).encode(gpu, enc, &keys, &keys);
+            let mut q_norm = Norm::rows(t * c.heads, d, c.eps, &w.q_norm);
+            q_norm.in_stride = 2 * d;
+            norm(gpu, enc, &q_norm, &q_and_gate, &q);
+            norm(
+                gpu,
+                enc,
+                &Norm::rows(t * c.kv_heads, d, c.eps, &w.k_norm),
+                &keys,
+                &keys,
+            );
             for (view, heads) in [(&q, c.heads), (&keys, c.kv_heads)] {
                 enc.set_compute_pipeline_state(&gpu.pipeline("rope_rows"));
                 set_views(enc, 0, &[view]);
@@ -762,17 +871,13 @@ mod mac {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
                 let (hk, hv) = (
-                    at_half(&kv.half_keys, pos * kv_size),
-                    at_half(&kv.half_values, pos * kv_size),
+                    at_half(&half.keys, pos * kv_size),
+                    at_half(&half.values, pos * kv_size),
                 );
                 to_half(gpu, enc, &keys, &hk, t * kv_size);
                 to_half(gpu, enc, &values, &hv, t * kv_size);
                 enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows_half"));
-                set_views(
-                    enc,
-                    0,
-                    &[&q_half, &whole(&kv.half_keys), &whole(&kv.half_values)],
-                );
+                set_views(enc, 0, &[&q_half, &whole(&half.keys), &whole(&half.values)]);
             }
             set_views(enc, 3, &[&q_and_gate, &y]);
             let p = AttentionParams {
@@ -897,6 +1002,37 @@ mod mac {
         (0..n).map(|i| ((i * 7919 + 13) % 150_000) as u32).collect()
     }
 
+    /// Layer states for prefill without a `GpuModel`, for tests and
+    /// benchmarks.
+    pub enum OwnedState {
+        Linear(GpuDeltaNetState),
+        Full(GpuKvCache),
+    }
+
+    impl OwnedState {
+        pub fn new_all(gpu: &Gpu, cfg: &Config, capacity: usize) -> Vec<OwnedState> {
+            let capacity = capacity.next_multiple_of(KEY_BLOCK);
+            cfg.layer_types
+                .iter()
+                .map(|kind| match kind {
+                    LayerType::LinearAttention => {
+                        OwnedState::Linear(GpuDeltaNetState::new(gpu, &deltanet_config(cfg)))
+                    }
+                    LayerType::FullAttention => {
+                        OwnedState::Full(GpuKvCache::new(gpu, &attention_config(cfg), capacity))
+                    }
+                })
+                .collect()
+        }
+
+        pub fn state(&self) -> State<'_> {
+            match self {
+                OwnedState::Linear(s) => State::Linear(s),
+                OwnedState::Full(c) => State::Full(c),
+            }
+        }
+    }
+
     /// Prefills `tokens` tokens `runs` times, after one warm-up run, and
     /// prints the best and median tokens per second.
     pub fn bench(
@@ -904,24 +1040,34 @@ mod mac {
         tokens: usize,
         chunk: usize,
         runs: usize,
+        exact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Config::load(dir)?;
         let weights = Weights::open(dir)?;
         let gpu = Gpu::new()?;
-        let prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
+        let capacity = tokens.next_multiple_of(KEY_BLOCK);
+        let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk, capacity)?;
+        prefill.exact = exact;
         let prompt = test_tokens(tokens);
+        let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+        let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
         let mut times: Vec<f64> = (0..=runs)
             .map(|_| {
-                let mut states = prefill.new_states(&gpu, tokens);
+                for s in &owned {
+                    if let OwnedState::Linear(d) = s {
+                        zero(&d.conv);
+                        zero(&d.recurrent);
+                    }
+                }
                 let start = Instant::now();
-                prefill.run(&gpu, &prompt, &mut states);
+                prefill.run(&gpu, &prompt, 0, &states);
                 start.elapsed().as_secs_f64()
             })
             .skip(1)
             .collect();
         times.sort_by(f64::total_cmp);
         println!(
-            "prefill {tokens} tokens, chunk {}, {runs} runs: best {:.2} s ({:.0} tokens/s), median {:.2} s ({:.0} tokens/s)",
+            "prefill {tokens} tokens, chunk {}, exact {exact}, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
             prefill.chunk,
             times[0],
             tokens as f64 / times[0],
@@ -931,6 +1077,10 @@ mod mac {
         Ok(())
     }
 
+    fn zero(buffer: &Buffer) {
+        unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, buffer.length() as usize) };
+    }
+
     #[cfg(test)]
     mod tests {
         //! Prefill against the CPU model fed one token at a time:
@@ -938,8 +1088,9 @@ mod mac {
 
         use super::*;
         use crate::cpu::matrix::Matrix;
-        use crate::cpu::model::{LayerState, Model};
+        use crate::cpu::model::{LayerState, Model, argmax};
         use crate::cpu::ops::rms_norm;
+        use crate::gpu_model::GpuModel;
         use std::path::PathBuf;
 
         const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
@@ -1015,14 +1166,15 @@ mod mac {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
-            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 20).unwrap();
-            prefill.exact = exact;
             let tokens = test_tokens(45);
+            let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 20, capacity).unwrap();
+            prefill.exact = exact;
             let parts = [&tokens[..29], &tokens[29..]];
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
-            let mut gpu_states = prefill.new_states(&gpu, tokens.len());
+            let gpu_states = OwnedState::new_all(&gpu, &cfg, capacity);
             let mut cpu_x: Vec<Vec<Vec<f32>>> = parts
                 .iter()
                 .map(|p| p.iter().map(|&t| model.embed(t)).collect())
@@ -1030,16 +1182,19 @@ mod mac {
             let gpu_x: Vec<Buffer> = parts.iter().map(|p| prefill.embed(&gpu, p)).collect();
             for l in 0..cfg.num_layers() {
                 let mut err = 0.0f32;
+                let mut pos = 0;
                 for (i, part) in parts.iter().enumerate() {
                     for x in cpu_x[i].iter_mut() {
                         *x = model.layer(l).step(x, &mut cpu_states[l]).unwrap().hidden;
                     }
-                    prefill.layer(&gpu, l, &gpu_x[i], part.len(), &mut gpu_states[l]);
+                    let state = gpu_states[l].state();
+                    prefill.layer(&gpu, l, &gpu_x[i], part.len(), pos, &state);
+                    pos += part.len();
                     let got = contents::<f32>(&gpu_x[i], part.len() * h);
                     err = err.max(rel_rms(got, &cpu_x[i].concat()));
                 }
                 let state = match (&cpu_states[l], &gpu_states[l]) {
-                    (LayerState::Linear(c), State::Linear(g)) => {
+                    (LayerState::Linear(c), OwnedState::Linear(g)) => {
                         let conv = rel_rms(contents::<f32>(&g.conv, c.conv.len()), &c.conv);
                         let rec = rel_rms(
                             contents::<f32>(&g.recurrent, c.recurrent.len()),
@@ -1047,9 +1202,7 @@ mod mac {
                         );
                         conv.max(rec)
                     }
-                    (LayerState::Full(c), State::Full(kv)) => {
-                        let g = &kv.cache;
-                        assert_eq!(c.len(), g.len);
+                    (LayerState::Full(c), OwnedState::Full(g)) => {
                         let n = c.keys().len();
                         let k = rel_rms(contents::<f32>(&g.keys, n), c.keys());
                         let v = rel_rms(contents::<f32>(&g.values, n), c.values());
@@ -1077,10 +1230,55 @@ mod mac {
             let err = rel_rms(&got, &want);
             println!("logits: rel rms {err:.2e}");
             assert!(err < logits_bound);
-            assert_eq!(
-                crate::cpu::model::argmax(&got),
-                crate::cpu::model::argmax(&want)
-            );
+            assert_eq!(argmax(&got), argmax(&want));
+        }
+
+        /// Prefill into a GpuModel's states, then decode with it: the logits
+        /// match a GpuModel fed every token one at a time. Covers prefill
+        /// after decode tokens too (the half KV copy catching up).
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn decode_after_prefill_matches_gpu_model() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let capacity = 64;
+            let n = cfg.num_layers();
+            let mut by_token = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
+            let mut with_prefill = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
+            let prefill = Prefill::new(&gpu, &cfg, &weights, 64, capacity).unwrap();
+            let tokens = test_tokens(50);
+            // prefill 30, decode 5, prefill 10, decode 5
+            let plan = [(30, true), (5, false), (10, true), (5, false)];
+            let mut at = 0;
+            for (count, use_prefill) in plan {
+                let part = &tokens[at..at + count];
+                let mut want = Vec::new();
+                for &t in part {
+                    want = by_token.forward(t);
+                }
+                let got = if use_prefill {
+                    let states: Vec<State> = with_prefill.states().collect();
+                    let logits = prefill.run(&gpu, part, at, &states);
+                    with_prefill.set_position(at + count);
+                    logits
+                } else {
+                    let mut logits = Vec::new();
+                    for &t in part {
+                        logits = with_prefill.forward(t);
+                    }
+                    logits
+                };
+                at += count;
+                let err = rel_rms(&got, &want);
+                println!(
+                    "{} {count} tokens to {at}: logits rel rms {err:.2e}, argmax {} vs {}",
+                    if use_prefill { "prefill" } else { "decode" },
+                    argmax(&got),
+                    argmax(&want)
+                );
+                assert!(err < 1e-2);
+                assert_eq!(argmax(&got), argmax(&want));
+            }
         }
 
         fn read_f32(path: &std::path::Path) -> Vec<f32> {
@@ -1119,89 +1317,31 @@ mod mac {
                 .iter()
                 .map(|w| u32::from_le_bytes(*w))
                 .collect();
-            let exact = std::env::var("SAETTA_EXACT").is_ok();
-            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
+            let exact = std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1");
+            let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024, capacity).unwrap();
             prefill.exact = exact;
             prefill.track_ranges(&gpu);
-            let mut states = prefill.new_states(&gpu, tokens.len());
+            let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+            let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
             let mut done = 0;
             for end in [1024, 4096, 8192, 16384, 32768] {
                 let start = Instant::now();
-                let logits = prefill.run(&gpu, &tokens[done..end], &mut states);
+                let logits = prefill.run(&gpu, &tokens[done..end], done, &states);
                 let secs = start.elapsed().as_secs_f64();
                 let want = read_f32(&eval.join(format!("f32_logits_{}.bin", end - 1)));
                 let k = kl(&want, &logits);
                 println!(
                     "exact {exact}, tokens {done}..{end} in {secs:.1} s: KL vs MLX f32 at {} {k:.2e}, argmax {} vs {}",
                     end - 1,
-                    crate::cpu::model::argmax(&logits),
-                    crate::cpu::model::argmax(&want),
+                    argmax(&logits),
+                    argmax(&want),
                 );
                 done = end;
             }
             for (name, v) in RANGES.iter().zip(prefill.ranges()) {
                 println!("max |x| {name}: {v}");
             }
-        }
-
-        #[test]
-        #[ignore = "profiling"]
-        fn profile_parts() {
-            let (cfg, weights) = open();
-            let gpu = Gpu::new().unwrap();
-            let p = Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
-            let t = 1024;
-            let tokens = test_tokens(t);
-            let x = p.embed(&gpu, &tokens);
-            let mut states = p.new_states(&gpu, t);
-            for l in [0usize, 3] {
-                for _ in 0..3 {
-                    let mut st = p.new_states(&gpu, t).remove(l);
-                    let s = Instant::now();
-                    p.layer(&gpu, l, &x, t, &mut st);
-                    println!("layer {l}: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
-                }
-            }
-            let layer = &p.layers[0];
-            let s = &p.scratch;
-            let normed = whole(&s.normed);
-            let time = |name: &str, f: &dyn Fn(&ComputeCommandEncoderRef)| {
-                gpu.run(f);
-                let d = gpu.run(f);
-                println!("{name}: {:.2} ms", d.as_secs_f64() * 1e3);
-            };
-            if let (Mixer::Linear(w), State::Linear(st)) = (&layer.mixer, &states[0]) {
-                time("qkv qmm", &|enc| {
-                    qmm(&gpu, enc, &w.qkv, &normed, &whole(&s.wide), t, false)
-                });
-                time("deltanet all", &|enc| {
-                    p.encode_deltanet(&gpu, enc, w, st, &normed, &whole(&s.mixer_out), t)
-                });
-            }
-            if let (Mixer::Full(w), State::Full(c)) = (&p.layers[3].mixer, &mut states[3]) {
-                c.cache.len = 0;
-                time("attention all", &|enc| {
-                    p.encode_attention(&gpu, enc, w, c, &normed, &whole(&s.mixer_out), t, 0)
-                });
-                time("q qmm", &|enc| {
-                    qmm(&gpu, enc, &w.q, &normed, &whole(&s.wide), t, false)
-                });
-            }
-            let xt = at(&x, 0);
-            time("moe all", &|enc| {
-                p.encode_moe(&gpu, enc, layer, &normed, &xt, t)
-            });
-            time("shared gate qmm", &|enc| {
-                qmm(
-                    &gpu,
-                    enc,
-                    &layer.shared[0],
-                    &normed,
-                    &whole(&s.shared_g),
-                    t,
-                    false,
-                )
-            });
         }
     }
 }
