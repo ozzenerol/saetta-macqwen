@@ -563,7 +563,8 @@ mod mac {
         chunk: usize,
         scratch: Scratch,
         /// Use the split qmm kernels and f32 attention: within f32 rounding
-        /// of decode. With false, half inputs: faster, about 1e-3 off.
+        /// of decode. With false, w and x in half, as MLX: the matmuls are
+        /// about 6 times faster, 1e-3 off. serve runs with false.
         pub exact: bool,
         /// Largest |x| seen at each of `RANGES`, when tracked.
         ranges: Option<Buffer>,
@@ -1579,9 +1580,9 @@ mod mac {
         (0..n).map(|i| ((i * 7919 + 13) % 150_000) as u32).collect()
     }
 
-    /// SAETTA_FAST=1 picks the half-input prefill kernels.
-    pub fn fast_from_env() -> bool {
-        std::env::var("SAETTA_FAST").is_ok_and(|v| v == "1")
+    /// SAETTA_EXACT=1 picks the exact prefill kernels over the fast ones.
+    pub fn exact_from_env() -> bool {
+        std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1")
     }
 
     /// Layer states for prefill without a `GpuModel`, for tests and
@@ -2082,7 +2083,7 @@ mod mac {
                 .iter()
                 .map(|w| u32::from_le_bytes(*w))
                 .collect();
-            let exact = !fast_from_env();
+            let exact = exact_from_env();
             let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
             let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024, capacity).unwrap();
             prefill.exact = exact;
