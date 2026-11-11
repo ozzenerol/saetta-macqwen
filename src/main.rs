@@ -56,6 +56,8 @@ fn main() -> ExitCode {
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
         #[cfg(target_os = "macos")]
+        ["bench-qmm2", dir] => report(saetta::qmm::bench(Path::new(dir), &[512, 2048], 10)),
+        #[cfg(target_os = "macos")]
         ["bench-qmm", dir, rows] => match rows.parse() {
             Ok(m) => report(saetta::prefill::bench_qmm(Path::new(dir), m, 10)),
             Err(_) => {
