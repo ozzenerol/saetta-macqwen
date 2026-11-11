@@ -771,6 +771,16 @@ impl Restore for GpuServed {
     fn discard_rows(&mut self) {
         self.rows.clear();
     }
+
+    /// Shrinks the KV caches after a long conversation, once no snapshot
+    /// needs its rows.
+    fn release_rows(&mut self, need: usize) -> usize {
+        let held = self.model.shrink(need);
+        if let Some(d) = &mut self.drafting {
+            d.spec.mtp.shrink(held);
+        }
+        held
+    }
 }
 
 struct CpuModel<'a> {

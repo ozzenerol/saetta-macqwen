@@ -56,6 +56,11 @@ pub trait Restore {
     fn restore_rows(&mut self) {}
     /// Frees the rows of the last `backup_rows`.
     fn discard_rows(&mut self) {}
+    /// Called with `keeps_rows` when no row from `need` on is used any more;
+    /// the model may free them. Returns the rows it holds then.
+    fn release_rows(&mut self, _need: usize) -> usize {
+        usize::MAX
+    }
 }
 
 /// Saved states, each with the tokens it holds.
@@ -295,6 +300,17 @@ impl<M: Model + Restore> Cached<M> {
         self.rows[at..end].copy_from_slice(tokens);
     }
 
+    /// Lets the model free the KV rows that nothing can use: past the
+    /// prompt being run, the longest snapshot and the backup. A long
+    /// conversation's rows stay while one of its snapshots does.
+    fn release_rows(&mut self, prompt: usize) {
+        let snapshots = self.snapshots.tokens().map(<[u32]>::len).max().unwrap_or(0);
+        let backup = self.backup.as_ref().map_or(0, |b| b.from + b.rows.len());
+        let need = prompt.max(self.tokens.len()).max(snapshots).max(backup) + DRAFT_ROWS;
+        let held = self.model.release_rows(need);
+        self.rows.truncate(held);
+    }
+
     /// How far `prompt` matches the rows with the backup put back.
     fn common_with_backup(&self, prompt: &[u32]) -> usize {
         let Some(b) = &self.backup else {
@@ -494,6 +510,9 @@ impl<M: Model + Restore> Model for Cached<M> {
                 self.model.discard_rows();
             }
         }
+        if keeps {
+            self.release_rows(prompt.len());
+        }
         keep
     }
 
@@ -575,6 +594,8 @@ mod tests {
         keeps: bool,
         rows: Vec<u32>,
         backup: (usize, Vec<u32>),
+        /// The `need` of each `release_rows`.
+        released: Vec<usize>,
     }
 
     impl Toy {
@@ -648,6 +669,12 @@ mod tests {
         }
         fn discard_rows(&mut self) {
             self.backup = (0, Vec::new());
+        }
+        /// Drops the rows, so a later use of them shows in the logits.
+        fn release_rows(&mut self, need: usize) -> usize {
+            self.rows.truncate(need);
+            self.released.push(need);
+            need
         }
     }
 
@@ -767,6 +794,28 @@ mod tests {
         let (logits, keep) = request(&mut c, &undo);
         assert_eq!(logits, fresh(&undo));
         assert_eq!(keep, held);
+    }
+
+    /// After a long conversation, the KV rows past a short one are freed
+    /// once the long one's snapshots are gone, and not before.
+    #[test]
+    fn rows_are_released_when_no_snapshot_needs_them() {
+        let mut c = Cached::new(Toy::keeping(), 4, 16);
+        let long = tokens(300, 0);
+        request(&mut c, &long);
+        let mut prompt = tokens(20, 5);
+        request(&mut c, &prompt);
+        assert!(*c.model().released.last().unwrap() >= 300);
+        for turn in 0..12 {
+            c.step(4000 + turn);
+            prompt = c.tokens.clone();
+            prompt.extend(tokens(6, 5000 + turn));
+            let (logits, _) = request(&mut c, &prompt);
+            assert_eq!(logits, fresh(&prompt));
+        }
+        let last = *c.model().released.last().unwrap();
+        assert!(last < 300, "need {last}");
+        assert!(c.model().rows.len() <= last);
     }
 
     /// Without kept rows, another branch is never used.
