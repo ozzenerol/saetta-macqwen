@@ -1,6 +1,7 @@
 //! Full attention layer for one token, as `Qwen3NextAttention` in MLX.
 
-use super::ops::{dot, matvec, rms_norm, rope, sigmoid, softmax};
+use super::matrix::Matrix;
+use super::ops::{dot, rms_norm, rope, sigmoid, softmax};
 
 pub struct AttentionConfig {
     pub heads: usize,
@@ -13,14 +14,14 @@ pub struct AttentionConfig {
     pub eps: f32,
 }
 
-/// Dense f32 weights, row-major `[out, in]` as in the checkpoint.
+/// Projection matrices are `[out, in]` as in the checkpoint.
 pub struct AttentionWeights<'a> {
     /// `[heads * head_dim * 2, hidden]`. For each head the first `head_dim`
     /// rows are the query and the next `head_dim` rows are the output gate.
-    pub q_proj: &'a [f32],
-    pub k_proj: &'a [f32],
-    pub v_proj: &'a [f32],
-    pub o_proj: &'a [f32],
+    pub q_proj: Matrix<'a>,
+    pub k_proj: Matrix<'a>,
+    pub v_proj: Matrix<'a>,
+    pub o_proj: Matrix<'a>,
     pub q_norm: &'a [f32],
     pub k_norm: &'a [f32],
 }
@@ -65,15 +66,15 @@ pub fn attention(
     let d = cfg.head_dim;
     let pos = cache.len;
 
-    let q_and_gate = matvec(w.q_proj, x);
+    let q_and_gate = w.q_proj.matvec(x);
     let mut q = Vec::with_capacity(cfg.heads * d);
     let mut gate = Vec::with_capacity(cfg.heads * d);
     for head in q_and_gate.chunks_exact(2 * d) {
         q.extend_from_slice(&head[..d]);
         gate.extend_from_slice(&head[d..]);
     }
-    let mut k = matvec(w.k_proj, x);
-    let v = matvec(w.v_proj, x);
+    let mut k = w.k_proj.matvec(x);
+    let v = w.v_proj.matvec(x);
 
     for head in q.chunks_exact_mut(d) {
         rms_norm(head, w.q_norm, cfg.eps);
@@ -98,7 +99,7 @@ pub fn attention(
     for (o, g) in out.iter_mut().zip(&gate) {
         *o *= sigmoid(*g);
     }
-    matvec(w.o_proj, &out)
+    w.o_proj.matvec(&out)
 }
 
 /// Softmax attention of one query head over all cached tokens of kv head `kv`.
@@ -150,10 +151,10 @@ mod tests {
         );
         let (qn, kn) = (f.vec("q_norm"), f.vec("k_norm"));
         let w = AttentionWeights {
-            q_proj: &q,
-            k_proj: &k,
-            v_proj: &v,
-            o_proj: &o,
+            q_proj: Matrix::Dense(&q),
+            k_proj: Matrix::Dense(&k),
+            v_proj: Matrix::Dense(&v),
+            o_proj: Matrix::Dense(&o),
             q_norm: &qn,
             k_norm: &kn,
         };

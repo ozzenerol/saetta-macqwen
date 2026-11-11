@@ -1,13 +1,14 @@
-//! The decoder layers on the CPU with real weights. Each quantized matrix is
-//! dequantized to f32 when a layer is loaded; the experts are dequantized per
-//! token, only the ones the router picks.
+//! The whole model on the CPU with real weights. The big matrices stay
+//! quantized and are multiplied from the packed words (`Matrix::Quant`);
+//! norms and the other small vectors are copied to f32 when the model loads.
 
 use half::bf16;
 
 use super::attention::{AttentionConfig, AttentionWeights, KvCache, attention};
 use super::deltanet::{DeltaNetConfig, DeltaNetState, DeltaNetWeights, deltanet};
-use super::moe::{Mlp, mix, mlp, route};
-use super::ops::{matvec, rms_norm};
+use super::matrix::Matrix;
+use super::moe::{Mlp, expert, mix, mlp, route};
+use super::ops::rms_norm;
 use crate::config::{Config, LayerType};
 use crate::quant;
 use crate::weights::{QuantTensor, Weights};
@@ -22,22 +23,35 @@ pub enum LayerState {
 
 pub struct Model<'a> {
     cfg: &'a Config,
-    weights: &'a Weights,
+    embed: QuantTensor<'a>,
+    layers: Vec<Layer<'a>>,
+    norm: Vec<f32>,
+    lm_head: Matrix<'a>,
 }
 
 impl<'a> Model<'a> {
-    pub fn new(cfg: &'a Config, weights: &'a Weights) -> Model<'a> {
-        assert!(cfg.attn_output_gate, "only the gated attention is written");
-        Model { cfg, weights }
+    pub fn new(cfg: &'a Config, weights: &'a Weights) -> Result<Model<'a>, String> {
+        if !cfg.attn_output_gate || cfg.tie_word_embeddings {
+            return Err("only the gated attention and an untied lm_head are written".into());
+        }
+        let quantized = |m: &str| weights.quantized(m, &cfg.quantization);
+        Ok(Model {
+            cfg,
+            embed: quantized(&format!("{PREFIX}.embed_tokens"))?,
+            layers: (0..cfg.num_layers())
+                .map(|i| Layer::load(cfg, weights, i))
+                .collect::<Result<_, _>>()?,
+            norm: weights.tensor(&format!("{PREFIX}.norm.weight"))?.to_f32(),
+            lm_head: Matrix::quant(quantized("language_model.lm_head")?),
+        })
     }
 
-    pub fn embed(&self, token: u32) -> Result<Vec<f32>, String> {
-        let q = self.quantized(&format!("{PREFIX}.embed_tokens"))?;
-        Ok(dequantize_rows(&q, token as usize, 1))
+    pub fn embed(&self, token: u32) -> Vec<f32> {
+        dequantize_rows(&self.embed, token as usize, 1)
     }
 
-    pub fn layer(&self, index: usize) -> Result<Layer<'a>, String> {
-        Layer::load(self.cfg, self.weights, index)
+    pub fn layer(&self, index: usize) -> &Layer<'a> {
+        &self.layers[index]
     }
 
     pub fn new_state(&self, index: usize) -> LayerState {
@@ -49,27 +63,86 @@ impl<'a> Model<'a> {
         }
     }
 
-    fn quantized(&self, module: &str) -> Result<QuantTensor<'a>, String> {
-        self.weights.quantized(module, &self.cfg.quantization)
+    /// A fresh state for every layer.
+    pub fn new_states(&self) -> Vec<LayerState> {
+        (0..self.layers.len()).map(|i| self.new_state(i)).collect()
+    }
+
+    /// Runs one token through all layers and returns the logits.
+    pub fn forward(&self, token: u32, states: &mut [LayerState]) -> Result<Vec<f32>, String> {
+        let mut x = self.embed(token);
+        for (layer, state) in self.layers.iter().zip(states) {
+            x = layer.step(&x, state)?.hidden;
+        }
+        rms_norm(&mut x, &self.norm, self.cfg.rms_norm_eps);
+        Ok(self.lm_head.matvec(&x))
+    }
+
+    /// Greedy decoding: feeds `prompt`, then picks the most likely token
+    /// `count` times. Calls `on_token` with each new token and its logits.
+    pub fn generate(
+        &self,
+        prompt: &[u32],
+        count: usize,
+        mut on_token: impl FnMut(u32, &[f32]),
+    ) -> Result<Vec<u32>, String> {
+        let mut states = self.new_states();
+        let mut logits = Vec::new();
+        for &t in prompt {
+            logits = self.forward(t, &mut states)?;
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let next = argmax(&logits);
+            on_token(next, &logits);
+            out.push(next);
+            if i + 1 < count {
+                logits = self.forward(next, &mut states)?;
+            }
+        }
+        Ok(out)
     }
 }
 
-enum Mixer {
-    Linear(DeltaNetConfig, Vec<Vec<f32>>),
-    Full(AttentionConfig, Vec<Vec<f32>>),
+pub fn argmax(x: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, v) in x.iter().enumerate() {
+        if *v > x[best] {
+            best = i;
+        }
+    }
+    best as u32
 }
 
-/// One decoder layer with its dense weights in memory.
+enum Mixer<'a> {
+    Linear {
+        cfg: DeltaNetConfig,
+        /// in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
+        matrices: Box<[Matrix<'a>; 5]>,
+        /// conv1d, A_log, dt_bias, norm
+        vectors: [Vec<f32>; 4],
+    },
+    Full {
+        cfg: AttentionConfig,
+        /// q_proj, k_proj, v_proj, o_proj
+        matrices: Box<[Matrix<'a>; 4]>,
+        /// q_norm, k_norm
+        vectors: [Vec<f32>; 2],
+    },
+}
+
+/// One decoder layer.
 pub struct Layer<'a> {
     cfg: &'a Config,
-    weights: &'a Weights,
     prefix: String,
     input_norm: Vec<f32>,
     post_norm: Vec<f32>,
-    mixer: Mixer,
-    router: Vec<f32>,
-    shared_expert: [Vec<f32>; 3],
-    shared_expert_gate: Vec<f32>,
+    mixer: Mixer<'a>,
+    router: Matrix<'a>,
+    /// All experts stacked, `[experts, out, in]`.
+    experts: Mlp<'a>,
+    shared_expert: Mlp<'a>,
+    shared_expert_gate: Matrix<'a>,
 }
 
 /// What one layer step returns: the hidden state and the router choice.
@@ -82,55 +155,63 @@ pub struct LayerOutput {
 impl<'a> Layer<'a> {
     fn load(cfg: &'a Config, weights: &'a Weights, index: usize) -> Result<Layer<'a>, String> {
         let prefix = format!("{PREFIX}.layers.{index}");
-        let matrix = |name: &str| -> Result<Vec<f32>, String> {
-            let q = weights.quantized(&format!("{prefix}.{name}"), &cfg.quantization)?;
-            Ok(dequantize_rows(&q, 0, q.out_features()))
+        let matrix = |name: &str| -> Result<Matrix<'a>, String> {
+            let module = format!("{prefix}.{name}");
+            Ok(Matrix::quant(
+                weights.quantized(&module, &cfg.quantization)?,
+            ))
         };
         let vector = |name: &str| -> Result<Vec<f32>, String> {
             Ok(weights.tensor(&format!("{prefix}.{name}"))?.to_f32())
         };
+        let mlp = |name: &str| -> Result<Mlp<'a>, String> {
+            Ok(Mlp {
+                gate_proj: matrix(&format!("{name}.gate_proj"))?,
+                up_proj: matrix(&format!("{name}.up_proj"))?,
+                down_proj: matrix(&format!("{name}.down_proj"))?,
+            })
+        };
 
         let mixer = match cfg.layer_types[index] {
-            LayerType::LinearAttention => {
-                let names = [
-                    "in_proj_qkv",
-                    "in_proj_z",
-                    "in_proj_b",
-                    "in_proj_a",
-                    "out_proj",
-                ];
-                let mut t = names
-                    .iter()
-                    .map(|n| matrix(&format!("linear_attn.{n}")))
-                    .collect::<Result<Vec<_>, _>>()?;
-                for n in ["conv1d.weight", "A_log", "dt_bias", "norm.weight"] {
-                    t.push(vector(&format!("linear_attn.{n}"))?);
-                }
-                Mixer::Linear(deltanet_config(cfg), t)
-            }
-            LayerType::FullAttention => {
-                let mut t = ["q_proj", "k_proj", "v_proj", "o_proj"]
-                    .iter()
-                    .map(|n| matrix(&format!("self_attn.{n}")))
-                    .collect::<Result<Vec<_>, _>>()?;
-                t.push(vector("self_attn.q_norm.weight")?);
-                t.push(vector("self_attn.k_norm.weight")?);
-                Mixer::Full(attention_config(cfg), t)
-            }
+            LayerType::LinearAttention => Mixer::Linear {
+                cfg: deltanet_config(cfg),
+                matrices: Box::new([
+                    matrix("linear_attn.in_proj_qkv")?,
+                    matrix("linear_attn.in_proj_z")?,
+                    matrix("linear_attn.in_proj_b")?,
+                    matrix("linear_attn.in_proj_a")?,
+                    matrix("linear_attn.out_proj")?,
+                ]),
+                vectors: [
+                    vector("linear_attn.conv1d.weight")?,
+                    vector("linear_attn.A_log")?,
+                    vector("linear_attn.dt_bias")?,
+                    vector("linear_attn.norm.weight")?,
+                ],
+            },
+            LayerType::FullAttention => Mixer::Full {
+                cfg: attention_config(cfg),
+                matrices: Box::new([
+                    matrix("self_attn.q_proj")?,
+                    matrix("self_attn.k_proj")?,
+                    matrix("self_attn.v_proj")?,
+                    matrix("self_attn.o_proj")?,
+                ]),
+                vectors: [
+                    vector("self_attn.q_norm.weight")?,
+                    vector("self_attn.k_norm.weight")?,
+                ],
+            },
         };
 
         Ok(Layer {
             cfg,
-            weights,
             input_norm: vector("input_layernorm.weight")?,
             post_norm: vector("post_attention_layernorm.weight")?,
             mixer,
             router: matrix("mlp.gate")?,
-            shared_expert: [
-                matrix("mlp.shared_expert.gate_proj")?,
-                matrix("mlp.shared_expert.up_proj")?,
-                matrix("mlp.shared_expert.down_proj")?,
-            ],
+            experts: mlp("mlp.switch_mlp")?,
+            shared_expert: mlp("mlp.shared_expert")?,
             shared_expert_gate: matrix("mlp.shared_expert_gate")?,
             prefix,
         })
@@ -142,30 +223,44 @@ impl<'a> Layer<'a> {
         let mut normed = x.to_vec();
         rms_norm(&mut normed, &self.input_norm, eps);
         let mixed = match (&self.mixer, state) {
-            (Mixer::Linear(c, t), LayerState::Linear(s)) => {
+            (
+                Mixer::Linear {
+                    cfg,
+                    matrices: m,
+                    vectors: v,
+                },
+                LayerState::Linear(s),
+            ) => {
                 let w = DeltaNetWeights {
-                    in_proj_qkv: &t[0],
-                    in_proj_z: &t[1],
-                    in_proj_b: &t[2],
-                    in_proj_a: &t[3],
-                    out_proj: &t[4],
-                    conv1d: &t[5],
-                    a_log: &t[6],
-                    dt_bias: &t[7],
-                    norm: &t[8],
+                    in_proj_qkv: m[0],
+                    in_proj_z: m[1],
+                    in_proj_b: m[2],
+                    in_proj_a: m[3],
+                    out_proj: m[4],
+                    conv1d: &v[0],
+                    a_log: &v[1],
+                    dt_bias: &v[2],
+                    norm: &v[3],
                 };
-                deltanet(c, &w, &normed, s)
+                deltanet(cfg, &w, &normed, s)
             }
-            (Mixer::Full(c, t), LayerState::Full(cache)) => {
+            (
+                Mixer::Full {
+                    cfg,
+                    matrices: m,
+                    vectors: v,
+                },
+                LayerState::Full(cache),
+            ) => {
                 let w = AttentionWeights {
-                    q_proj: &t[0],
-                    k_proj: &t[1],
-                    v_proj: &t[2],
-                    o_proj: &t[3],
-                    q_norm: &t[4],
-                    k_norm: &t[5],
+                    q_proj: m[0],
+                    k_proj: m[1],
+                    v_proj: m[2],
+                    o_proj: m[3],
+                    q_norm: &v[0],
+                    k_norm: &v[1],
                 };
-                attention(c, &w, &normed, cache)
+                attention(cfg, &w, &normed, cache)
             }
             _ => {
                 return Err(format!(
@@ -179,63 +274,15 @@ impl<'a> Layer<'a> {
         let mut m = h.clone();
         rms_norm(&mut m, &self.post_norm, eps);
         let experts = route(&self.router, &m, self.cfg.num_experts_per_tok);
-        let [gate_proj, up_proj, down_proj] = &self.shared_expert;
-        let shared = mlp(
-            &Mlp {
-                gate_proj,
-                up_proj,
-                down_proj,
-            },
-            &m,
-        );
-        let shared_logit = matvec(&self.shared_expert_gate, &m)[0];
-
-        let mut error = None;
         let moe = mix(
             &experts,
-            |e| match self.expert(e) {
-                Ok(w) => mlp(&w.as_mlp(), &m),
-                Err(err) => {
-                    error = Some(err);
-                    vec![0.0; m.len()]
-                }
-            },
-            &shared,
-            shared_logit,
+            |e| mlp(&expert(&self.experts, e, self.cfg.num_experts), &m),
+            &mlp(&self.shared_expert, &m),
+            self.shared_expert_gate.matvec(&m)[0],
         );
-        if let Some(err) = error {
-            return Err(err);
-        }
 
         let hidden = h.iter().zip(&moe).map(|(a, b)| a + b).collect();
         Ok(LayerOutput { hidden, experts })
-    }
-
-    /// Dequantizes the three matrices of expert `e` from `switch_mlp`.
-    fn expert(&self, e: usize) -> Result<Expert, String> {
-        let get = |name: &str| -> Result<Vec<f32>, String> {
-            let module = format!("{}.mlp.switch_mlp.{name}", self.prefix);
-            let q = self.weights.quantized(&module, &self.cfg.quantization)?;
-            let rows = q.out_features();
-            Ok(dequantize_rows(&q, e * rows, rows))
-        };
-        Ok(Expert(
-            get("gate_proj")?,
-            get("up_proj")?,
-            get("down_proj")?,
-        ))
-    }
-}
-
-struct Expert(Vec<f32>, Vec<f32>, Vec<f32>);
-
-impl Expert {
-    fn as_mlp(&self) -> Mlp<'_> {
-        Mlp {
-            gate_proj: &self.0,
-            up_proj: &self.1,
-            down_proj: &self.2,
-        }
     }
 }
 
@@ -262,8 +309,7 @@ fn attention_config(cfg: &Config) -> AttentionConfig {
 }
 
 /// Dequantizes `count` rows starting at row `first`, counting rows over all
-/// leading dimensions (for stacked experts, expert `e` starts at `e * out`).
-/// Reads only the bytes of those rows, so it works on unaligned tensors too.
+/// leading dimensions. Reads only the bytes of those rows.
 fn dequantize_rows(q: &QuantTensor, first: usize, count: usize) -> Vec<f32> {
     let cols = q.in_features();
     let row_words = quant::words_per_row(cols, q.params.bits);
@@ -436,20 +482,20 @@ mod golden {
         let model_dir = home().join(MODEL_DIR);
         let cfg = Config::load(Path::new(&model_dir)).unwrap();
         let weights = Weights::open(&model_dir).unwrap();
-        let model = Model::new(&cfg, &weights);
+        let model = Model::new(&cfg, &weights).unwrap();
         let g = Golden::open(b.dir);
         let tokens = g.u32("tokens");
         let hidden = cfg.hidden_size;
         let top_k = cfg.num_experts_per_tok;
 
-        let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| model.embed(t).unwrap()).collect();
+        let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| model.embed(t)).collect();
         let err = rel_rms(&xs.concat(), &g.f32("embed"));
         println!("embed: rel rms {err:.2e}");
         assert!(err < b.embed, "embed rel rms {err}");
 
         let mut states = Vec::new();
         for (l, bound) in b.hidden.iter().enumerate() {
-            let layer = model.layer(l).unwrap();
+            let layer = model.layer(l);
             let mut state = model.new_state(l);
             let (want_ids, want_w) = (
                 g.u32(&format!("layer{l}_experts")),
@@ -494,5 +540,127 @@ mod golden {
         let values = rel_rms(kv.values(), &g.f32("layer3_values"));
         println!("layer 3 keys: rel rms {keys:.2e}, values: {values:.2e}");
         assert!(keys < b.kv && values < b.kv);
+    }
+
+    /// Our log-softmax of the logits at `ids`.
+    fn logprobs(logits: &[f32], ids: &[u64]) -> Vec<f32> {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|v| (v - max).exp()).sum();
+        ids.iter()
+            .map(|&i| logits[i as usize] - max - sum.ln())
+            .collect()
+    }
+
+    /// Our logits match MLX float32 to about 1.5e-6 at every position, so
+    /// the gap to the server is the server's bf16. Its logprobs differ from
+    /// ours by up to 0.354 (token 13); above `LOGPROB_FLOOR` only, as bf16 is
+    /// too coarse far down the tail.
+    const LOGPROB_TOLERANCE: f32 = 0.5;
+    const LOGPROB_FLOOR: f32 = -6.0;
+    /// A different token than the server's is fine only where the server's
+    /// top two are closer than this.
+    const NEAR_TIE: f32 = 0.1;
+    /// Relative RMS bound of our logits against MLX in float32
+    /// (`tools/golden_logits.py`).
+    const F32_LOGITS: f32 = 1e-5;
+
+    /// All 40 layers and the logits, with the server's greedy tokens
+    /// (`tools/greedy_ref.py`) fed back in so every position is compared even
+    /// after a near tie. The logits must match MLX float32 and pick the same
+    /// token; against the bf16 server, only near ties may differ. Then
+    /// `generate` must give the server's tokens up to the first near tie.
+    #[test]
+    #[ignore = "needs the model and golden data on the Mac"]
+    fn greedy_matches_server() {
+        let model_dir = home().join(MODEL_DIR);
+        let cfg = Config::load(Path::new(&model_dir)).unwrap();
+        let weights = Weights::open(&model_dir).unwrap();
+        let model = Model::new(&cfg, &weights).unwrap();
+        let g = Golden::open(BF16.dir);
+        let prompt = g.u32("tokens");
+        let text = std::fs::read_to_string(g.dir.join("greedy.json")).unwrap();
+        let reference: Value = serde_json::from_str(&text).unwrap();
+        let ids = |v: &Value| -> Vec<u64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap())
+                .collect()
+        };
+        let floats = |v: &Value| -> Vec<f32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let want = ids(&reference["tokens"]);
+        assert_eq!(reference["prompt_tokens"], prompt.len());
+
+        let mut states = model.new_states();
+        let mut logits = Vec::new();
+        for &t in &prompt {
+            logits = model.forward(t, &mut states).unwrap();
+        }
+        let f32_golden = Golden::open(F32.dir);
+        let f32_logits = std::fs::read(f32_golden.dir.join("greedy_logits.bin")).unwrap();
+        let f32_logits: Vec<f32> = f32_logits
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let vocab = cfg.vocab_size;
+        assert_eq!(f32_logits.len(), want.len() * vocab);
+
+        let mut first_tie = want.len();
+        let mut elapsed = std::time::Duration::ZERO;
+        for (i, &theirs) in want.iter().enumerate() {
+            let top_ids = ids(&reference["top_ids"][i]);
+            let server = floats(&reference["top_logprobs"][i]);
+            let mine = logprobs(&logits, &top_ids);
+            let diff = mine
+                .iter()
+                .zip(&server)
+                .filter(|(_, s)| **s > LOGPROB_FLOOR)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            let ours = argmax(&logits);
+            let mlx_f32 = &f32_logits[i * vocab..(i + 1) * vocab];
+            let f32_err = rel_rms(&logits, mlx_f32);
+            println!(
+                "token {i}: ours {ours}, server {theirs}, logprob diff {diff:.3}, rel rms vs MLX f32 {f32_err:.2e}"
+            );
+            assert_eq!(
+                ours,
+                argmax(mlx_f32),
+                "token {i}: argmax differs from MLX f32"
+            );
+            assert!(
+                f32_err < F32_LOGITS,
+                "token {i}: logits differ from MLX f32 by {f32_err}"
+            );
+            assert!(
+                diff < LOGPROB_TOLERANCE,
+                "token {i}: logprobs differ by {diff}"
+            );
+            if ours as u64 != theirs {
+                let gap = server[0] - server[1];
+                assert!(
+                    gap < NEAR_TIE,
+                    "token {i}: got {ours}, want {theirs} (server top-2 gap {gap})"
+                );
+                println!("token {i}: near tie (gap {gap})");
+                first_tie = first_tie.min(i);
+            }
+            let start = std::time::Instant::now();
+            logits = model.forward(theirs as u32, &mut states).unwrap();
+            elapsed += start.elapsed();
+        }
+        println!("{:.2?} per token on the CPU", elapsed / want.len() as u32);
+
+        let got = model.generate(&prompt, first_tie, |_, _| {}).unwrap();
+        let got: Vec<u64> = got.iter().map(|&t| t as u64).collect();
+        assert_eq!(got, want[..first_tie]);
     }
 }
