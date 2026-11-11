@@ -3,4 +3,5 @@ pub mod convert;
 pub mod cpu;
 pub mod gpu;
 pub mod quant;
+pub mod tokenizer;
 pub mod weights;
