@@ -322,6 +322,16 @@ mod mac {
             }
             times.sort();
             println!("step: best {:.2?}, median {:.2?}", times[0], times[10]);
+
+            let mut times = Vec::new();
+            for _ in 0..20 {
+                let own = g.output().clone();
+                let start = std::time::Instant::now();
+                g.record(&own, token);
+                times.push(start.elapsed());
+            }
+            times.sort();
+            println!("record: best {:.2?}, median {:.2?}", times[0], times[10]);
         }
     }
 }
