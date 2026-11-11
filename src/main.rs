@@ -398,10 +398,7 @@ fn serve_gpu(
     let ServeFlags { draft, memory, .. } = flags;
     let served = load_gpu(config, weights, draft, memory)?;
     let snapshots = served.snapshots;
-    let model = anchored(
-        Cached::new(served, snapshots, SNAPSHOT_EVERY),
-        &tokenizer,
-    );
+    let model = anchored(Cached::new(served, snapshots, SNAPSHOT_EVERY), &tokenizer);
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
     let drafts = if draft > 0 {
         format!(", MTP drafts {draft} per round")
