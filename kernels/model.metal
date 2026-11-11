@@ -134,3 +134,45 @@ kernel void moe_mix(device float *x [[buffer(0)]],
         x[i] += sigmoid(shared_logit[0]) * shared[i] + routed[i];
     }
 }
+
+// out[0] = the index of the largest of x[0..n], the lowest index on ties,
+// as cpu::model::argmax. One threadgroup of up to 1024 threads.
+kernel void argmax(device const float *x [[buffer(0)]],
+                   device uint *out [[buffer(1)]],
+                   constant uint &n [[buffer(2)]],
+                   uint t [[thread_position_in_threadgroup]],
+                   uint threads [[threads_per_threadgroup]],
+                   uint simd [[simdgroup_index_in_threadgroup]],
+                   uint lane [[thread_index_in_simdgroup]],
+                   uint simds [[simdgroups_per_threadgroup]]) {
+    threadgroup float best_v[32];
+    threadgroup uint best_i[32];
+    // Each thread walks its indices in order, so it keeps the first maximum.
+    float v = -INFINITY;
+    uint index = 0xffffffffu;
+    for (uint i = t; i < n; i += threads) {
+        float y = x[i];
+        if (y > v) {
+            v = y;
+            index = i;
+        }
+    }
+    float sv = simd_max(v);
+    uint si = simd_min(v == sv ? index : 0xffffffffu);
+    if (lane == 0) {
+        best_v[simd] = sv;
+        best_i[simd] = si;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        float bv = best_v[0];
+        uint bi = best_i[0];
+        for (uint i = 1; i < simds; i++) {
+            if (best_v[i] > bv || (best_v[i] == bv && best_i[i] < bi)) {
+                bv = best_v[i];
+                bi = best_i[i];
+            }
+        }
+        out[0] = bi;
+    }
+}

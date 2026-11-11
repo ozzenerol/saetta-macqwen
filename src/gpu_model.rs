@@ -25,15 +25,15 @@ mod mac {
     /// Threads per threadgroup of the element-wise kernels.
     const GROUP: usize = 256;
 
-    fn view(gpu: &Gpu, floats: usize) -> View {
+    pub(crate) fn view(gpu: &Gpu, floats: usize) -> View {
         View::new(gpu.buffer(floats * 4))
     }
 
-    fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
+    pub(crate) fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
 
-    fn matrix<'a>(
+    pub(crate) fn matrix<'a>(
         gpu: &Gpu,
         weights: &'a Weights,
         cfg: &Config,
@@ -46,7 +46,13 @@ mod mac {
     }
 
     /// An element-wise op over `n` values; `n` goes in as the last buffer.
-    fn elementwise(plan: &mut Plan, kernel: &str, buffers: &[&View], n: usize, parallel: bool) {
+    pub(crate) fn elementwise(
+        plan: &mut Plan,
+        kernel: &str,
+        buffers: &[&View],
+        n: usize,
+        parallel: bool,
+    ) {
         let len = plan.constant(&[n as u32]);
         let mut all = buffers.to_vec();
         all.push(&len);
@@ -94,6 +100,41 @@ mod mac {
         shared: View,
         experts_h: View,
         routed: View,
+    }
+
+    /// The scratch buffers of one layer step, shared by all layers.
+    pub(crate) struct Scratch {
+        normed: View,
+        mixed: View,
+        moe: MoeScratch,
+    }
+
+    impl Scratch {
+        pub(crate) fn new(gpu: &Gpu, cfg: &Config) -> Scratch {
+            let hidden = cfg.hidden_size;
+            let shared_size = cfg.shared_expert_intermediate_size;
+            let router = view(gpu, cfg.num_experts + 1);
+            Scratch {
+                normed: view(gpu, hidden),
+                mixed: view(gpu, hidden),
+                moe: MoeScratch {
+                    normed: view(gpu, hidden),
+                    router: router.clone(),
+                    ids: view(gpu, cfg.num_experts_per_tok),
+                    weights: view(gpu, cfg.num_experts_per_tok),
+                    shared_logit: View {
+                        buffer: router.buffer,
+                        offset: (cfg.num_experts * 4) as u64,
+                    },
+                    shared_gate: view(gpu, shared_size),
+                    shared_up: view(gpu, shared_size),
+                    shared_h: view(gpu, shared_size),
+                    shared: view(gpu, hidden),
+                    experts_h: view(gpu, cfg.num_experts_per_tok * cfg.moe_intermediate_size),
+                    routed: view(gpu, hidden),
+                },
+            }
+        }
     }
 
     struct GpuMoe<'a> {
@@ -177,10 +218,97 @@ mod mac {
         Full(GpuAttention<'a>, GpuKvCache),
     }
 
-    struct GpuLayer<'a> {
+    pub(crate) struct GpuLayer<'a> {
         input_norm: View,
         mixer: Mixer<'a>,
         moe: GpuMoe<'a>,
+    }
+
+    impl<'a> GpuLayer<'a> {
+        /// The layer under `prefix`, such as `language_model.model.layers.3`.
+        /// An attention layer gets a cache of `capacity` tokens.
+        pub(crate) fn load(
+            gpu: &Gpu,
+            cfg: &Config,
+            weights: &'a Weights,
+            prefix: &str,
+            kind: LayerType,
+            capacity: usize,
+        ) -> Result<GpuLayer<'a>, String> {
+            let mixer = match kind {
+                LayerType::LinearAttention => {
+                    let m = GpuDeltaNet::load(gpu, cfg, weights, prefix)?;
+                    let state = GpuDeltaNetState::new(gpu, &m.cfg);
+                    Mixer::Linear(m, state)
+                }
+                LayerType::FullAttention => {
+                    let m = GpuAttention::load(gpu, cfg, weights, prefix)?;
+                    let cache = GpuKvCache::new(gpu, &m.cfg, capacity);
+                    Mixer::Full(m, cache)
+                }
+            };
+            Ok(GpuLayer {
+                input_norm: vector(gpu, weights, &format!("{prefix}.input_layernorm.weight"))?,
+                mixer,
+                moe: GpuMoe::load(gpu, cfg, weights, prefix)?,
+            })
+        }
+
+        /// `x += mixer(norm(x))`, then `x += moe(norm(x))`.
+        pub(crate) fn record(&self, plan: &mut Plan, cfg: &Config, x: &View, s: &Scratch) {
+            Norm::rows(1, cfg.hidden_size, cfg.rms_norm_eps, &self.input_norm)
+                .record(plan, x, &s.normed, false);
+            match &self.mixer {
+                Mixer::Linear(m, state) => m.record(plan, &s.normed, &s.mixed, state),
+                Mixer::Full(m, cache) => m.record(plan, &s.normed, &s.mixed, cache),
+            }
+            elementwise(plan, "add_into", &[x, &s.mixed], cfg.hidden_size, false);
+            self.moe.record(plan, cfg, x, &s.moe);
+        }
+
+        /// Clears a DeltaNet state; an attention cache needs no clearing.
+        pub(crate) fn reset(&self) {
+            if let Mixer::Linear(_, state) = &self.mixer {
+                zero(&state.conv);
+                zero(&state.recurrent);
+            }
+        }
+    }
+
+    /// The 5-bit embedding table, checked for the kernel.
+    pub(crate) fn load_embed<'a>(
+        gpu: &Gpu,
+        cfg: &Config,
+        weights: &'a Weights,
+    ) -> Result<GpuQuant<'a>, String> {
+        let embed = matrix(gpu, weights, cfg, &format!("{PREFIX}.embed_tokens"))?;
+        if embed.bits != 5 {
+            return Err(format!(
+                "embedding is {}-bit, the kernel is 5-bit",
+                embed.bits
+            ));
+        }
+        Ok(embed)
+    }
+
+    /// `x = embed[params.token]`.
+    pub(crate) fn record_embed(plan: &mut Plan, embed: &GpuQuant, x: &View) {
+        let cols = embed.cols;
+        let shape = plan.constant(&[cols as u32]);
+        let params = plan.params.clone();
+        plan.op(
+            "embed_5bit",
+            &[
+                &embed.words,
+                &embed.scales,
+                &embed.biases,
+                &params,
+                x,
+                &shape,
+            ],
+            MTLSize::new(cols.div_ceil(GROUP) as u64, 1, 1),
+            MTLSize::new(GROUP as u64, 1, 1),
+        );
     }
 
     /// What a token reads back: the logits, and the hidden state before the
@@ -192,6 +320,7 @@ mod mac {
         plan: Plan<'a>,
         built: Built,
         hidden: View,
+        final_hidden: View,
         logits: View,
         capacity: usize,
         position: usize,
@@ -208,92 +337,34 @@ mod mac {
             capacity: usize,
         ) -> Result<GpuModel<'a>, String> {
             assert!(layers <= cfg.num_layers());
-            let embed = matrix(gpu, weights, cfg, &format!("{PREFIX}.embed_tokens"))?;
-            if embed.bits != 5 {
-                return Err(format!(
-                    "embedding is {}-bit, the kernel is 5-bit",
-                    embed.bits
-                ));
-            }
-            let mut loaded = Vec::with_capacity(layers);
-            for l in 0..layers {
-                let prefix = format!("{PREFIX}.layers.{l}");
-                let mixer = match cfg.layer_types[l] {
-                    LayerType::LinearAttention => {
-                        let m = GpuDeltaNet::load(gpu, cfg, weights, &prefix)?;
-                        let state = GpuDeltaNetState::new(gpu, &m.cfg);
-                        Mixer::Linear(m, state)
-                    }
-                    LayerType::FullAttention => {
-                        let m = GpuAttention::load(gpu, cfg, weights, &prefix)?;
-                        let cache = GpuKvCache::new(gpu, &m.cfg, capacity);
-                        Mixer::Full(m, cache)
-                    }
-                };
-                loaded.push(GpuLayer {
-                    input_norm: vector(gpu, weights, &format!("{prefix}.input_layernorm.weight"))?,
-                    mixer,
-                    moe: GpuMoe::load(gpu, cfg, weights, &prefix)?,
-                });
-            }
+            let embed = load_embed(gpu, cfg, weights)?;
+            let loaded = (0..layers)
+                .map(|l| {
+                    let prefix = format!("{PREFIX}.layers.{l}");
+                    GpuLayer::load(gpu, cfg, weights, &prefix, cfg.layer_types[l], capacity)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let final_norm = vector(gpu, weights, &format!("{PREFIX}.norm.weight"))?;
             let lm_head = matrix(gpu, weights, cfg, "language_model.lm_head")?;
 
             let hidden = cfg.hidden_size;
-            let experts = &loaded.first().map(|l| &l.moe.experts);
-            let expert_size = experts.map_or(cfg.moe_intermediate_size, |e| e.size());
-            let shared_size = cfg.shared_expert_intermediate_size;
-            let router = view(gpu, cfg.num_experts + 1);
-            let s = MoeScratch {
-                normed: view(gpu, hidden),
-                router: router.clone(),
-                ids: view(gpu, cfg.num_experts_per_tok),
-                weights: view(gpu, cfg.num_experts_per_tok),
-                shared_logit: View {
-                    buffer: router.buffer,
-                    offset: (cfg.num_experts * 4) as u64,
-                },
-                shared_gate: view(gpu, shared_size),
-                shared_up: view(gpu, shared_size),
-                shared_h: view(gpu, shared_size),
-                shared: view(gpu, hidden),
-                experts_h: view(gpu, cfg.num_experts_per_tok * expert_size),
-                routed: view(gpu, hidden),
-            };
+            let scratch = Scratch::new(gpu, cfg);
             let x = view(gpu, hidden);
-            let normed = view(gpu, hidden);
-            let mixed = view(gpu, hidden);
+            let final_hidden = view(gpu, hidden);
             let logits = view(gpu, lm_head.rows);
 
             let mut plan = Plan::new(gpu);
-            let embed_shape = plan.constant(&[hidden as u32]);
-            let params = plan.params.clone();
-            plan.op(
-                "embed_5bit",
-                &[
-                    &embed.words,
-                    &embed.scales,
-                    &embed.biases,
-                    &params,
-                    &x,
-                    &embed_shape,
-                ],
-                MTLSize::new(hidden.div_ceil(GROUP) as u64, 1, 1),
-                MTLSize::new(GROUP as u64, 1, 1),
-            );
+            record_embed(&mut plan, &embed, &x);
             for layer in &loaded {
-                Norm::rows(1, hidden, cfg.rms_norm_eps, &layer.input_norm)
-                    .record(&mut plan, &x, &normed, false);
-                match &layer.mixer {
-                    Mixer::Linear(m, state) => m.record(&mut plan, &normed, &mixed, state),
-                    Mixer::Full(m, cache) => m.record(&mut plan, &normed, &mixed, cache),
-                }
-                elementwise(&mut plan, "add_into", &[&x, &mixed], hidden, false);
-                layer.moe.record(&mut plan, cfg, &x, &s);
+                layer.record(&mut plan, cfg, &x, &scratch);
             }
-            Norm::rows(1, hidden, cfg.rms_norm_eps, &final_norm)
-                .record(&mut plan, &x, &normed, false);
-            lm_head.record(&mut plan, &normed, &logits, false);
+            Norm::rows(1, hidden, cfg.rms_norm_eps, &final_norm).record(
+                &mut plan,
+                &x,
+                &final_hidden,
+                false,
+            );
+            lm_head.record(&mut plan, &final_hidden, &logits, false);
             let built = plan.build();
 
             Ok(GpuModel {
@@ -303,6 +374,7 @@ mod mac {
                 plan,
                 built,
                 hidden: x,
+                final_hidden,
                 logits,
                 capacity,
                 position: 0,
@@ -358,6 +430,12 @@ mod mac {
             self.position += 1;
         }
 
+        /// The hidden state after the final norm, which the MTP layer takes.
+        /// It holds the last token's until the next run.
+        pub fn final_hidden(&self) -> &View {
+            &self.final_hidden
+        }
+
         /// The hidden state after the last layer, before the final norm.
         pub fn hidden(&self) -> Vec<f32> {
             contents::<f32>(&self.hidden.buffer, self.cfg.hidden_size).to_vec()
@@ -366,12 +444,7 @@ mod mac {
         /// Clears the DeltaNet states and the position. The attention caches
         /// are only read up to the position, so they need no clearing.
         pub fn reset(&mut self) {
-            for layer in &self.layers {
-                if let Mixer::Linear(_, state) = &layer.mixer {
-                    zero(&state.conv);
-                    zero(&state.recurrent);
-                }
-            }
+            self.layers.iter().for_each(GpuLayer::reset);
             self.position = 0;
         }
 

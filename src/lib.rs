@@ -7,6 +7,7 @@ pub mod gpu;
 pub mod gpu_cache;
 pub mod gpu_layers;
 pub mod gpu_model;
+pub mod gpu_mtp;
 pub mod moe;
 pub mod mtp;
 pub mod plan;
