@@ -95,7 +95,15 @@ mod mac {
             );
             plan.op(
                 "sample_final",
-                &[&self.cand_v, &self.cand_i, &self.part, &self.params, &self.rng, &self.ring, &tp],
+                &[
+                    &self.cand_v,
+                    &self.cand_i,
+                    &self.part,
+                    &self.params,
+                    &self.rng,
+                    &self.ring,
+                    &tp,
+                ],
                 MTLSize::new(1, 1, 1),
                 MTLSize::new(1024, 1, 1),
             );
