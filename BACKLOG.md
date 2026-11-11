@@ -32,7 +32,11 @@
 - B6 Long-context decode: split-K attention, ms/token at 1k to 32k; profile of the short token.
 - C8 Decode token profile and fusion of the small ops (DeltaNet step, norms, residuals).
 
-Goal (user, 2026-11-11): faster than MLX in every case of tools/bench.py: decode and time to first token, short and long prompt.
+Goal (user, 2026-11-11): faster than MLX in every case of tools/bench.py: decode and time to first token, short and long prompt. Final goal: the full 262,144-token context.
+
+## Track L: 262k context
+
+- L1 Context up to 262,144 tokens: f16 KV cache (40 KB per token in f32, 20 KB in f16, so 5.2 GB at 262k), KV buffers that grow in steps instead of one 32k allocation, `--context` on serve, prefill chunks that stay within memory, decode attention measured at 64k, 128k and 262k, and the eval at 128k and 262k.
 
 ## Track D: prompt cache
 
