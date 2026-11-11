@@ -8,9 +8,13 @@
 // ---------------------------------------------------------------------------
 // Quantized matrix times matrix: y[m, n] = sum over k of x[m, k] * W[n, k].
 // A threadgroup of 4 simdgroups computes a 64 x 64 tile of y; each simdgroup
-// computes 32 x 32 of it with 8 x 8 simdgroup matrices. Per step of 32 along
-// k, the x tile is copied and the W tile dequantized to f32 in threadgroup
-// memory.
+// computes 32 x 32 of it with 8 x 8 simdgroup matrices. f32 matrix MACs are
+// about 4 times slower than half ones on the M3 Max, so the products run in
+// half with f32 sums: the integer q of each weight is exact in half, and per
+// group of 64 the f32 sum of q * x is scaled and the bias added in f32:
+//   sum(w * x) = scale * sum(q * x) + bias * sum(x).
+// x is rounded to half (SPLIT 1), or split into a half and the half of its
+// rest (SPLIT 2) for close to f32 results at twice the MACs.
 //
 // In gather mode the tile rows come from `tiles` (expert, first row, rows),
 // made by moe_group, so one dispatch runs every expert on its own tokens.
@@ -19,9 +23,9 @@
 
 constant uint MM_BM = 64;
 constant uint MM_BN = 64;
-constant uint MM_BK = 32;
-// Row stride of the x and W tiles; the padding avoids bank conflicts.
-constant uint MM_LD = MM_BK + 4;
+constant uint MM_BK = 64;  // one quantization group per step
+// Row stride of the tiles in halves; the padding avoids bank conflicts.
+constant uint MM_LD = MM_BK + 8;
 
 struct MmShape {
     uint m;
@@ -30,21 +34,23 @@ struct MmShape {
     uint gather;
 };
 
-// Dequantizes values OFF .. OFF + 15 of the 32 whose BITS packed words
-// start at wk. OFF is a template argument so `packed` stays in registers.
-template <uint BITS, uint OFF>
-inline void dequant16(device const uint *wk, float scale, float bias, threadgroup float *out) {
-    uint packed[BITS];
-    for (uint j = 0; j < BITS; j++) {
-        packed[j] = wk[j];
-    }
-#pragma clang loop unroll(full)
-    for (uint i = 0; i < 16; i++) {
-        out[i] = scale * float(unpack<BITS>(packed, OFF + i)) + bias;
-    }
+struct MmTiles {
+    half x_hi[MM_BM * MM_LD];
+    half x_lo[MM_BM * MM_LD];
+    half q[MM_BN * MM_LD];
+    float x_sum[2][MM_BM];
+    float scale[MM_BN];
+    float bias[MM_BN];
+};
+
+// Row and first column of the two values a lane holds in an 8 x 8
+// simdgroup matrix, as MLX steel uses them.
+inline uint2 frag_pos(uint lane) {
+    uint qid = lane / 4;
+    return uint2((qid & 4) + (lane / 2) % 4, (qid & 2) * 2 + (lane % 2) * 2);
 }
 
-template <uint BITS>
+template <uint BITS, uint SPLIT>
 kernel void qmm(device const uint *words [[buffer(0)]],
                 device const ushort *scales [[buffer(1)]],
                 device const ushort *biases [[buffer(2)]],
@@ -56,31 +62,30 @@ kernel void qmm(device const uint *words [[buffer(0)]],
                 device const uint *tile_count [[buffer(8)]],
                 uint2 tg [[threadgroup_position_in_grid]],
                 uint tid [[thread_index_in_threadgroup]],
-                uint simd [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float smem[MM_BM * MM_LD + MM_BN * MM_LD];
-    threadgroup float *xs = smem;
-    threadgroup float *ws = smem + MM_BM * MM_LD;
+                uint simd [[simdgroup_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup MmTiles t;
 
     uint expert = 0, first, count;
     if (s.gather != 0) {
         if (tg.y >= tile_count[0]) {
             return;
         }
-        uint4 t = tiles[tg.y];
-        expert = t.x;
-        first = t.y;
-        count = t.z;
+        uint4 tile = tiles[tg.y];
+        expert = tile.x;
+        first = tile.y;
+        count = tile.z;
     } else {
         first = tg.y * MM_BM;
         count = min(MM_BM, s.m - first);
     }
     uint n0 = tg.x * MM_BN;
 
-    // Each thread copies 16 values of one x row and dequantizes 16 values
-    // of one W row per step. Simdgroups 0 and 1 take the first 16 of the 32
-    // columns, so the branch in dequant16 is the same across a simdgroup.
+    // Each thread loads 32 values of one x row and unpacks 32 values of
+    // one W row per step.
     uint lr = tid % 64;
-    uint lc = (tid / 64) * 16;
+    uint half_k = tid / 64;
+    uint lc = half_k * 32;
     bool x_ok = lr < count;
     device const float *xrow = x;
     if (x_ok) {
@@ -90,14 +95,14 @@ kernel void qmm(device const uint *words [[buffer(0)]],
     uint wr = n0 + lr;
     bool w_ok = wr < s.n;
     ulong wrow = ulong(expert) * s.n + (w_ok ? wr : 0);
-    uint row_words = s.k * BITS / 32;
     uint groups = s.k / 64;
-    device const uint *wp = words + wrow * row_words;
+    device const uint *wp = words + wrow * (s.k * BITS / 32) + half_k * BITS;
     device const ushort *sp = scales + wrow * groups;
     device const ushort *bp = biases + wrow * groups;
 
     uint sm = (simd / 2) * 32;
     uint sn = (simd % 2) * 32;
+    uint2 fp = frag_pos(lane);
     simdgroup_float8x8 acc[4][4];
     for (uint i = 0; i < 4; i++) {
         for (uint j = 0; j < 4; j++) {
@@ -106,66 +111,111 @@ kernel void qmm(device const uint *words [[buffer(0)]],
     }
 
     for (uint k0 = 0; k0 < s.k; k0 += MM_BK) {
-        threadgroup float *xd = xs + lr * MM_LD + lc;
+        threadgroup half *xh = t.x_hi + lr * MM_LD + lc;
+        threadgroup half *xl = t.x_lo + lr * MM_LD + lc;
+        float sum = 0;
         if (x_ok) {
             device const float4 *p = (device const float4 *)(xrow + k0);
-            for (uint i = 0; i < 4; i++) {
+            for (uint i = 0; i < 8; i++) {
                 float4 v = p[i];
-                xd[4 * i] = v.x;
-                xd[4 * i + 1] = v.y;
-                xd[4 * i + 2] = v.z;
-                xd[4 * i + 3] = v.w;
+                half4 hi = half4(v);
+                sum += v.x + v.y + v.z + v.w;
+                *(threadgroup half4 *)(xh + 4 * i) = hi;
+                if (SPLIT == 2) {
+                    *(threadgroup half4 *)(xl + 4 * i) = half4(v - float4(hi));
+                }
             }
         } else {
-            for (uint i = 0; i < 16; i++) {
-                xd[i] = 0;
+            for (uint i = 0; i < 8; i++) {
+                *(threadgroup half4 *)(xh + 4 * i) = half4(0);
+                if (SPLIT == 2) {
+                    *(threadgroup half4 *)(xl + 4 * i) = half4(0);
+                }
             }
         }
+        t.x_sum[half_k][lr] = sum;
 
-        threadgroup float *wd = ws + lr * MM_LD + lc;
+        threadgroup half *qd = t.q + lr * MM_LD + lc;
         if (w_ok) {
+            uint packed[BITS];
             device const uint *wk = wp + k0 / 32 * BITS;
-            uint g = (k0 + lc) / 64;
-            float scale = bf16_to_float(sp[g]);
-            float bias = bf16_to_float(bp[g]);
-            if (lc == 0) {
-                dequant16<BITS, 0>(wk, scale, bias, wd);
-            } else {
-                dequant16<BITS, 16>(wk, scale, bias, wd);
+            for (uint j = 0; j < BITS; j++) {
+                packed[j] = wk[j];
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 32; i++) {
+                qd[i] = half(unpack<BITS>(packed, i));
+            }
+            if (half_k == 0) {
+                t.scale[lr] = bf16_to_float(sp[k0 / 64]);
+                t.bias[lr] = bf16_to_float(bp[k0 / 64]);
             }
         } else {
-            for (uint i = 0; i < 16; i++) {
-                wd[i] = 0;
+            for (uint i = 0; i < 32; i++) {
+                qd[i] = 0;
+            }
+            if (half_k == 0) {
+                t.scale[lr] = 0;
+                t.bias[lr] = 0;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        simdgroup_float8x8 part[4][4];
+        for (uint i = 0; i < 4; i++) {
+            for (uint j = 0; j < 4; j++) {
+                part[i][j] = simdgroup_float8x8(0);
+            }
+        }
         for (uint kk = 0; kk < MM_BK; kk += 8) {
-            simdgroup_float8x8 a[4];
-            simdgroup_float8x8 b[4];
+            simdgroup_half8x8 a[4];
+            simdgroup_half8x8 b[4];
             for (uint i = 0; i < 4; i++) {
-                simdgroup_load(a[i], xs + (sm + 8 * i) * MM_LD + kk, MM_LD);
-                simdgroup_load(b[i], ws + (sn + 8 * i) * MM_LD + kk, MM_LD, ulong2(0, 0), true);
+                simdgroup_load(a[i], t.x_hi + (sm + 8 * i) * MM_LD + kk, MM_LD);
+                simdgroup_load(b[i], t.q + (sn + 8 * i) * MM_LD + kk, MM_LD, ulong2(0, 0), true);
             }
             for (uint i = 0; i < 4; i++) {
                 for (uint j = 0; j < 4; j++) {
-                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                    simdgroup_multiply_accumulate(part[i][j], a[i], b[j], part[i][j]);
                 }
+            }
+            if (SPLIT == 2) {
+                for (uint i = 0; i < 4; i++) {
+                    simdgroup_load(a[i], t.x_lo + (sm + 8 * i) * MM_LD + kk, MM_LD);
+                }
+                for (uint i = 0; i < 4; i++) {
+                    for (uint j = 0; j < 4; j++) {
+                        simdgroup_multiply_accumulate(part[i][j], a[i], b[j], part[i][j]);
+                    }
+                }
+            }
+        }
+
+        // acc += scale[col] * part + bias[col] * x_sum[row]
+        for (uint i = 0; i < 4; i++) {
+            uint row = sm + 8 * i + fp.x;
+            float xs = t.x_sum[0][row] + t.x_sum[1][row];
+            for (uint j = 0; j < 4; j++) {
+                uint col = sn + 8 * j + fp.y;
+                thread auto &pe = part[i][j].thread_elements();
+                thread auto &ae = acc[i][j].thread_elements();
+                ae[0] += t.scale[col] * pe[0] + t.bias[col] * xs;
+                ae[1] += t.scale[col + 1] * pe[1] + t.bias[col + 1] * xs;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // The 64 x 64 result goes through threadgroup memory so partial tiles
-    // can be written with bounds checks.
-    threadgroup float *c = smem;
+    // The result goes through threadgroup memory so partial tiles can be
+    // written with bounds checks.
+    threadgroup float *c = (threadgroup float *)t.x_hi;
     for (uint i = 0; i < 4; i++) {
         for (uint j = 0; j < 4; j++) {
             simdgroup_store(acc[i][j], c + (sm + 8 * i) * MM_BN + sn + 8 * j, MM_BN);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint oc = (tid / 64) * 32;
+    uint oc = half_k * 32;
     if (lr < count) {
         device float *yrow = y + ulong(first + lr) * s.n;
         for (uint i = 0; i < 32; i++) {
@@ -177,8 +227,10 @@ kernel void qmm(device const uint *words [[buffer(0)]],
     }
 }
 
-template [[host_name("qmm_5bit")]] kernel decltype(qmm<5>) qmm<5>;
-template [[host_name("qmm_8bit")]] kernel decltype(qmm<8>) qmm<8>;
+template [[host_name("qmm_5bit")]] kernel decltype(qmm<5, 1>) qmm<5, 1>;
+template [[host_name("qmm_8bit")]] kernel decltype(qmm<8, 1>) qmm<8, 1>;
+template [[host_name("qmm_5bit_split")]] kernel decltype(qmm<5, 2>) qmm<5, 2>;
+template [[host_name("qmm_8bit_split")]] kernel decltype(qmm<8, 2>) qmm<8, 2>;
 
 // ---------------------------------------------------------------------------
 // Small batched ops.
@@ -400,8 +452,10 @@ kernel void delta_rows(device const float *mixed [[buffer(0)]],
 // Causal attention of T new tokens over the KV cache, which already holds
 // them at positions pos .. pos + T - 1. A simdgroup takes 8 query tokens of
 // one head and walks the keys in blocks of 32 with an online softmax, using
-// 8 x 8 simdgroup matrices for q K^T and P V. The 4 simdgroups of a
-// threadgroup are 4 heads of the same kv head, so they share K and V loads.
+// 8 x 8 simdgroup matrices for q K^T and P V with f32 sums. T is float, or
+// half for twice the speed; with half, q, K and V are half copies (to_half).
+// The 4 simdgroups of a threadgroup are 4 heads of the same kv head, so they
+// share K and V loads.
 // Output is softmax(q K^T * scale) V * sigmoid(gate), [T, heads * dim].
 // Needs dim 256. q has room for T rounded up to 8 rows, the cache for
 // pos + T rounded up to 32 rows, and cache rows past pos + T must be finite.
@@ -418,9 +472,10 @@ constant uint ATT_DIM = 256;
 constant uint ATT_KB = 32;
 constant uint ATT_SIMDS = 4;
 
-kernel void attention_rows(device const float *q [[buffer(0)]],
-                           device const float *keys [[buffer(1)]],
-                           device const float *values [[buffer(2)]],
+template <typename T>
+kernel void attention_rows(device const T *q [[buffer(0)]],
+                           device const T *keys [[buffer(1)]],
+                           device const T *values [[buffer(2)]],
                            device const float *q_and_gate [[buffer(3)]],
                            device float *out [[buffer(4)]],
                            constant PrefillAttentionParams &p [[buffer(5)]],
@@ -428,33 +483,34 @@ kernel void attention_rows(device const float *q [[buffer(0)]],
                            uint simd [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float s_all[ATT_SIMDS][8 * ATT_KB];
-    threadgroup float d_all[ATT_SIMDS][64];
+    threadgroup T p_all[ATT_SIMDS][8 * ATT_KB];
+    threadgroup float a_all[ATT_SIMDS][8];
     threadgroup float *sc = s_all[simd];
-    threadgroup float *dg = d_all[simd];
+    threadgroup T *pt = p_all[simd];
+    threadgroup float *al = a_all[simd];
 
     uint h = tg.y * ATT_SIMDS + simd;
     uint kv = h / (p.heads / p.kv_heads);
     uint q0 = tg.x * 8;
     uint q_stride = p.heads * ATT_DIM;
     uint kv_stride = p.kv_heads * ATT_DIM;
-    device const float *qh = q + ulong(q0) * q_stride + h * ATT_DIM;
-    device const float *kh = keys + kv * ATT_DIM;
-    device const float *vh = values + kv * ATT_DIM;
+    device const T *qh = q + ulong(q0) * q_stride + h * ATT_DIM;
+    device const T *kh = keys + kv * ATT_DIM;
+    device const T *vh = values + kv * ATT_DIM;
     uint end = p.pos + min(q0 + 8, p.tokens);
 
-    // Lane l handles row l / 4, columns (l % 4) * 8 .. + 8 of the scores.
+    // For the softmax, lane l handles row l / 4, columns (l % 4) * 8 .. + 8
+    // of the scores. In the matrices it holds row fp.x.
     uint r = lane / 4;
     uint c0 = (lane % 4) * 8;
     uint last = p.pos + q0 + r;  // the newest key this row may see
+    uint2 fp = frag_pos(lane);
     float m = -INFINITY;
     float l = 0;
 
     simdgroup_float8x8 o[ATT_DIM / 8];
     for (uint i = 0; i < ATT_DIM / 8; i++) {
         o[i] = simdgroup_float8x8(0);
-    }
-    for (uint i = lane; i < 64; i += 32) {
-        dg[i] = 0;
     }
 
     for (uint k0 = 0; k0 < end; k0 += ATT_KB) {
@@ -463,10 +519,10 @@ kernel void attention_rows(device const float *q [[buffer(0)]],
             s[j] = simdgroup_float8x8(0);
         }
         for (uint d = 0; d < ATT_DIM; d += 8) {
-            simdgroup_float8x8 qm;
+            simdgroup_matrix<T, 8, 8> qm;
             simdgroup_load(qm, qh + d, q_stride);
             for (uint j = 0; j < ATT_KB / 8; j++) {
-                simdgroup_float8x8 km;
+                simdgroup_matrix<T, 8, 8> km;
                 simdgroup_load(km, kh + ulong(k0 + 8 * j) * kv_stride + d, kv_stride, ulong2(0, 0),
                                true);
                 simdgroup_multiply_accumulate(s[j], qm, km, s[j]);
@@ -487,32 +543,33 @@ kernel void attention_rows(device const float *q [[buffer(0)]],
         bm = max(bm, simd_shuffle_xor(bm, 1));
         bm = max(bm, simd_shuffle_xor(bm, 2));
         float m_new = max(m, bm);
-        float alpha = exp(m - m_new);
         float sum = 0;
         for (uint i = 0; i < 8; i++) {
             float e = exp(v[i] - m_new);
-            sc[r * ATT_KB + c0 + i] = e;
+            pt[r * ATT_KB + c0 + i] = T(e);
             sum += e;
         }
         sum += simd_shuffle_xor(sum, 1);
         sum += simd_shuffle_xor(sum, 2);
+        float alpha = exp(m - m_new);
         l = l * alpha + sum;
         m = m_new;
         if (lane % 4 == 0) {
-            dg[r * 8 + r] = alpha;
+            al[r] = alpha;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_float8x8 scale_rows;
-        simdgroup_load(scale_rows, dg, 8);
-        simdgroup_float8x8 pm[ATT_KB / 8];
+        float a = al[fp.x];
+        simdgroup_matrix<T, 8, 8> pm[ATT_KB / 8];
         for (uint j = 0; j < ATT_KB / 8; j++) {
-            simdgroup_load(pm[j], sc + 8 * j, ATT_KB);
+            simdgroup_load(pm[j], pt + 8 * j, ATT_KB);
         }
         for (uint d = 0; d < ATT_DIM / 8; d++) {
-            simdgroup_multiply(o[d], scale_rows, o[d]);
+            thread auto &oe = o[d].thread_elements();
+            oe[0] *= a;
+            oe[1] *= a;
             for (uint j = 0; j < ATT_KB / 8; j++) {
-                simdgroup_float8x8 vm;
+                simdgroup_matrix<T, 8, 8> vm;
                 simdgroup_load(vm, vh + ulong(k0 + 8 * j) * kv_stride + 8 * d, kv_stride);
                 simdgroup_multiply_accumulate(o[d], pm[j], vm, o[d]);
             }
@@ -535,6 +592,15 @@ kernel void attention_rows(device const float *q [[buffer(0)]],
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+template [[host_name("attention_rows")]] kernel decltype(attention_rows<float>) attention_rows<float>;
+template [[host_name("attention_rows_half")]] kernel decltype(attention_rows<half>) attention_rows<half>;
+
+kernel void to_half(device const float *x [[buffer(0)]],
+                    device half *y [[buffer(1)]],
+                    uint i [[thread_position_in_grid]]) {
+    y[i] = half(x[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -682,4 +748,16 @@ kernel void moe_combine(device float *x [[buffer(0)]],
         v += weights[slot] * expert_out[ulong(order[slot]) * p.dim + i];
     }
     x[at] += v;
+}
+
+// out[slot] = max(out[slot], max |x[i]|), on the bits of the float: for
+// values >= 0 they order the same as the floats. For range checks only.
+kernel void max_abs(device const float *x [[buffer(0)]],
+                    device atomic_uint *out [[buffer(1)]],
+                    constant uint &slot [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+    float v = simd_max(abs(x[i]));
+    if (simd_is_first()) {
+        atomic_fetch_max_explicit(&out[slot], as_type<uint>(v), memory_order_relaxed);
+    }
 }

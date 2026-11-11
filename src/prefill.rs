@@ -57,18 +57,33 @@ mod mac {
         gather: u32,
     }
 
-    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant) -> metal::ComputePipelineState {
-        match w.bits {
-            5 => gpu.pipeline("qmm_5bit"),
-            8 => gpu.pipeline("qmm_8bit"),
+    /// `split` picks the kernel that splits x into two halves, for close
+    /// to f32 results.
+    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
+        let name = match w.bits {
+            5 => "qmm_5bit",
+            8 => "qmm_8bit",
             b => panic!("no qmm kernel for {b} bits"),
-        }
+        };
+        gpu.pipeline(&if split {
+            format!("{name}_split")
+        } else {
+            name.to_string()
+        })
     }
 
     /// y = x W^T for `m` rows of x.
-    fn qmm(gpu: &Gpu, enc: &ComputeCommandEncoderRef, w: &GpuQuant, x: &View, y: &View, m: usize) {
+    fn qmm(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        y: &View,
+        m: usize,
+        split: bool,
+    ) {
         assert_eq!(w.experts, 1);
-        enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w));
+        enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
         w.set_buffers(enc, 0);
         set_views(enc, 3, &[x, y, x, x, x]);
         let shape = MmShape {
@@ -89,6 +104,7 @@ mod mac {
         max_tiles: usize,
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// qmm over the tiles of `g`. With `gather_x`, input row i is
     /// x[rows[i]]; without, x[i]. Output row i is y[i].
     fn qmm_grouped(
@@ -99,8 +115,9 @@ mod mac {
         y: &View,
         g: &Grouped,
         gather_x: bool,
+        split: bool,
     ) {
-        enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w));
+        enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
         w.set_buffers(enc, 0);
         set_views(enc, 3, &[x, y]);
         let shape = MmShape {
@@ -157,7 +174,47 @@ mod mac {
     /// What a layer keeps between tokens, on the GPU.
     pub enum State {
         Linear(GpuDeltaNetState),
-        Full(GpuKvCache),
+        Full(KvState),
+    }
+
+    /// The KV cache, and the half copy of it that fast prefill reads.
+    pub struct KvState {
+        pub cache: GpuKvCache,
+        half_keys: Buffer,
+        half_values: Buffer,
+        /// Tokens copied to the half buffers.
+        half_len: usize,
+    }
+
+    impl KvState {
+        fn new(gpu: &Gpu, cfg: &AttentionConfig, capacity: usize) -> KvState {
+            let size = capacity * cfg.kv_heads * cfg.head_dim * 2;
+            KvState {
+                cache: GpuKvCache::new(gpu, cfg, capacity),
+                half_keys: gpu.buffer(size),
+                half_values: gpu.buffer(size),
+                half_len: 0,
+            }
+        }
+    }
+
+    /// Encodes y[i] = half(x[i]) for i < n.
+    fn to_half(gpu: &Gpu, enc: &ComputeCommandEncoderRef, x: &View, y: &View, n: usize) {
+        if n > 0 {
+            dispatch_1d(
+                enc,
+                &gpu.pipeline("to_half"),
+                &[(&x.buffer, x.offset), (&y.buffer, y.offset)],
+                n,
+            );
+        }
+    }
+
+    fn at_half(buffer: &Buffer, halves: usize) -> View {
+        View {
+            buffer: buffer.clone(),
+            offset: (halves * 2) as u64,
+        }
     }
 
     /// Scratch for one chunk of up to `chunk` tokens.
@@ -174,6 +231,8 @@ mod mac {
         a: Buffer,
         b: Buffer,
         mixer_out: Buffer,
+        /// q after norm and rope, in half
+        q_half: Buffer,
         router: Buffer,
         shared_gate: Buffer,
         shared_g: Buffer,
@@ -212,6 +271,7 @@ mod mac {
                 a: f(chunk * d.v_heads),
                 b: f(chunk * d.v_heads),
                 mixer_out: f(chunk * h),
+                q_half: f(chunk * narrow / 2),
                 router: f(chunk * cfg.num_experts),
                 shared_gate: f(chunk),
                 shared_g: f(chunk * cfg.shared_expert_intermediate_size),
@@ -300,7 +360,20 @@ mod mac {
         lm_head: GpuQuant<'a>,
         chunk: usize,
         scratch: Scratch,
+        /// Use the split qmm kernels: slower, close to f32.
+        pub exact: bool,
+        /// Largest |x| seen at each of `RANGES`, when tracked.
+        ranges: Option<Buffer>,
     }
+
+    /// The inputs whose range `track_ranges` records: half tops out at 65504.
+    pub const RANGES: [&str; 5] = [
+        "qmm input after RMSNorm",
+        "DeltaNet out_proj input",
+        "attention o_proj input",
+        "shared expert down_proj input",
+        "expert down_proj input",
+    ];
 
     impl<'a> Prefill<'a> {
         /// `chunk` is the number of tokens per dispatch.
@@ -383,7 +456,38 @@ mod mac {
                 lm_head: matrix("language_model.lm_head")?,
                 scratch: Scratch::new(gpu, cfg, chunk),
                 chunk,
+                exact: false,
+                ranges: None,
             })
+        }
+
+        /// Starts recording the largest |x| at each of `RANGES`.
+        pub fn track_ranges(&mut self, gpu: &Gpu) {
+            self.ranges = Some(gpu.buffer(RANGES.len() * 4));
+        }
+
+        /// The largest |x| at each of `RANGES` so far.
+        pub fn ranges(&self) -> Vec<f32> {
+            self.ranges
+                .as_ref()
+                .map(|b| contents::<f32>(b, RANGES.len()).to_vec())
+                .unwrap_or_default()
+        }
+
+        fn record(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            slot: usize,
+            x: &View,
+            n: usize,
+        ) {
+            let Some(ranges) = &self.ranges else { return };
+            enc.set_compute_pipeline_state(&gpu.pipeline("max_abs"));
+            set_views(enc, 0, &[x, &whole(ranges)]);
+            params(enc, 2, &(slot as u32));
+            // n is a multiple of 32 everywhere it is called.
+            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
         }
 
         /// Empty states with room for `capacity` tokens in the KV caches.
@@ -397,7 +501,7 @@ mod mac {
                         State::Linear(GpuDeltaNetState::new(gpu, &self.deltanet))
                     }
                     LayerType::FullAttention => {
-                        State::Full(GpuKvCache::new(gpu, &self.attention, capacity))
+                        State::Full(KvState::new(gpu, &self.attention, capacity))
                     }
                 })
                 .collect()
@@ -440,23 +544,42 @@ mod mac {
         /// one command buffer.
         pub fn layer(&self, gpu: &Gpu, l: usize, x: &Buffer, n: usize, state: &mut State) {
             let pos = match state {
-                State::Full(cache) => {
+                State::Full(kv) => {
                     assert!(
-                        cache.len + n.next_multiple_of(KEY_BLOCK) <= cache.capacity,
+                        kv.cache.len + n.next_multiple_of(KEY_BLOCK) <= kv.cache.capacity,
                         "KV cache is full"
                     );
-                    cache.len
+                    kv.cache.len
                 }
                 State::Linear(_) => 0,
             };
             gpu.run(|enc| {
+                if let (State::Full(kv), false) = (&*state, self.exact) {
+                    // Tokens added by decode since the last prefill.
+                    let size = self.attention.kv_heads * self.attention.head_dim;
+                    for (f32s, halves) in [
+                        (&kv.cache.keys, &kv.half_keys),
+                        (&kv.cache.values, &kv.half_values),
+                    ] {
+                        to_half(
+                            gpu,
+                            enc,
+                            &at(f32s, kv.half_len * size),
+                            &at_half(halves, kv.half_len * size),
+                            (pos - kv.half_len) * size,
+                        );
+                    }
+                }
                 for start in (0..n).step_by(self.chunk) {
                     let t = self.chunk.min(n - start);
                     self.encode_chunk(gpu, enc, l, x, start, t, pos + start, state);
                 }
             });
-            if let State::Full(cache) = state {
-                cache.len += n;
+            if let State::Full(kv) = state {
+                kv.cache.len += n;
+                if !self.exact {
+                    kv.half_len = kv.cache.len;
+                }
             }
         }
 
@@ -501,12 +624,13 @@ mod mac {
             let mixer_out = whole(&s.mixer_out);
 
             Norm::rows(t, h, eps, &layer.input_norm).encode(gpu, enc, &xt, &normed);
+            self.record(gpu, enc, 0, &normed, t * h);
             match (&layer.mixer, state) {
                 (Mixer::Linear(w), State::Linear(st)) => {
                     self.encode_deltanet(gpu, enc, w, st, &normed, &mixer_out, t)
                 }
-                (Mixer::Full(w), State::Full(cache)) => {
-                    self.encode_attention(gpu, enc, w, cache, &normed, &mixer_out, t, pos)
+                (Mixer::Full(w), State::Full(kv)) => {
+                    self.encode_attention(gpu, enc, w, kv, &normed, &mixer_out, t, pos)
                 }
                 _ => panic!("layer {l}: state does not match the layer type"),
             }
@@ -535,10 +659,10 @@ mod mac {
             let s = &self.scratch;
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
             let [wide, mixed, z, y, a, b] = [&s.wide, &s.mixed, &s.z, &s.y, &s.a, &s.b].map(whole);
-            qmm(gpu, enc, &w.qkv, x, &wide, t);
-            qmm(gpu, enc, &w.z, x, &z, t);
-            qmm(gpu, enc, &w.b, x, &b, t);
-            qmm(gpu, enc, &w.a, x, &a, t);
+            qmm(gpu, enc, &w.qkv, x, &wide, t, self.exact);
+            qmm(gpu, enc, &w.z, x, &z, t, self.exact);
+            qmm(gpu, enc, &w.b, x, &b, t, self.exact);
+            qmm(gpu, enc, &w.a, x, &a, t, self.exact);
 
             enc.set_compute_pipeline_state(&gpu.pipeline("conv_rows"));
             set_views(enc, 0, &[&wide, &w.conv1d, &whole(&state.conv), &mixed]);
@@ -579,7 +703,8 @@ mod mac {
             let mut gated = Norm::rows(t * c.v_heads, c.v_dim, c.eps, &w.norm);
             gated.gate = Some(&z);
             gated.encode(gpu, enc, &y, &y);
-            qmm(gpu, enc, &w.out, &y, out, t);
+            self.record(gpu, enc, 1, &y, t * c.v_heads * c.v_dim);
+            qmm(gpu, enc, &w.out, &y, out, t, self.exact);
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -588,7 +713,7 @@ mod mac {
             gpu: &Gpu,
             enc: &ComputeCommandEncoderRef,
             w: &AttentionWeights,
-            cache: &GpuKvCache,
+            kv: &KvState,
             x: &View,
             out: &View,
             t: usize,
@@ -598,14 +723,15 @@ mod mac {
             let s = &self.scratch;
             let d = c.head_dim;
             let kv_size = c.kv_heads * d;
+            let cache = &kv.cache;
             let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
             let (keys, values) = (
                 at(&cache.keys, pos * kv_size),
                 at(&cache.values, pos * kv_size),
             );
-            qmm(gpu, enc, &w.q, x, &q_and_gate, t);
-            qmm(gpu, enc, &w.k, x, &keys, t);
-            qmm(gpu, enc, &w.v, x, &values, t);
+            qmm(gpu, enc, &w.q, x, &q_and_gate, t, self.exact);
+            qmm(gpu, enc, &w.k, x, &keys, t, self.exact);
+            qmm(gpu, enc, &w.v, x, &values, t, self.exact);
 
             let mut norm = Norm::rows(t * c.heads, d, c.eps, &w.q_norm);
             norm.in_stride = 2 * d;
@@ -629,18 +755,26 @@ mod mac {
                 );
             }
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows"));
-            set_views(
-                enc,
-                0,
-                &[
-                    &q,
-                    &whole(&cache.keys),
-                    &whole(&cache.values),
-                    &q_and_gate,
-                    &y,
-                ],
-            );
+            if self.exact {
+                enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows"));
+                set_views(enc, 0, &[&q, &whole(&cache.keys), &whole(&cache.values)]);
+            } else {
+                let q_half = whole(&s.q_half);
+                to_half(gpu, enc, &q, &q_half, t * c.heads * d);
+                let (hk, hv) = (
+                    at_half(&kv.half_keys, pos * kv_size),
+                    at_half(&kv.half_values, pos * kv_size),
+                );
+                to_half(gpu, enc, &keys, &hk, t * kv_size);
+                to_half(gpu, enc, &values, &hv, t * kv_size);
+                enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows_half"));
+                set_views(
+                    enc,
+                    0,
+                    &[&q_half, &whole(&kv.half_keys), &whole(&kv.half_values)],
+                );
+            }
+            set_views(enc, 3, &[&q_and_gate, &y]);
             let p = AttentionParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -651,7 +785,8 @@ mod mac {
             params(enc, 5, &p);
             // 4 heads of one kv head per threadgroup.
             groups(enc, (t.div_ceil(8), c.heads / 4), 128);
-            qmm(gpu, enc, &w.o, &y, out, t);
+            self.record(gpu, enc, 2, &y, t * c.heads * d);
+            qmm(gpu, enc, &w.o, &y, out, t, self.exact);
         }
 
         /// x += moe(normed) for `t` tokens.
@@ -676,10 +811,18 @@ mod mac {
                 &s.shared_out,
             ]
             .map(whole);
-            qmm(gpu, enc, &layer.router, normed, &router, t);
-            qmm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
-            qmm(gpu, enc, &layer.shared[0], normed, &sg, t);
-            qmm(gpu, enc, &layer.shared[1], normed, &su, t);
+            qmm(gpu, enc, &layer.router, normed, &router, t, self.exact);
+            qmm(
+                gpu,
+                enc,
+                &layer.shared_gate,
+                normed,
+                &shared_gate,
+                t,
+                self.exact,
+            );
+            qmm(gpu, enc, &layer.shared[0], normed, &sg, t, self.exact);
+            qmm(gpu, enc, &layer.shared[1], normed, &su, t, self.exact);
             let silu_mul = gpu.pipeline("silu_mul");
             dispatch_1d(
                 enc,
@@ -687,7 +830,8 @@ mod mac {
                 &[(&s.shared_g, 0), (&s.shared_u, 0)],
                 t * layer.shared[0].rows,
             );
-            qmm(gpu, enc, &layer.shared[2], &sg, &sd, t);
+            self.record(gpu, enc, 3, &sg, t * layer.shared[0].rows);
+            qmm(gpu, enc, &layer.shared[2], &sg, &sd, t, self.exact);
 
             let [ids, weights, order, rows, tiles, tile_count] = [
                 &s.ids,
@@ -726,15 +870,16 @@ mod mac {
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
-            qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true);
-            qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true);
+            qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, self.exact);
+            qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, self.exact);
             dispatch_1d(
                 enc,
                 &silu_mul,
                 &[(&s.expert_g, 0), (&s.expert_u, 0)],
                 t * top_k * e.size(),
             );
-            qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false);
+            self.record(gpu, enc, 4, &eg, t * top_k * e.size());
+            qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, self.exact);
 
             enc.set_compute_pipeline_state(&gpu.pipeline("moe_combine"));
             set_views(enc, 0, &[x, &sd, &shared_gate, &eo, &order, &weights]);
@@ -834,26 +979,44 @@ mod mac {
                     View::new(gpu.buffer_from(&x)),
                     View::new(gpu.buffer(want.len() * 4)),
                 );
-                gpu.run(|enc| qmm(&gpu, enc, &w, &xv, &yv, m));
-                let err = rel_rms(contents::<f32>(&yv.buffer, want.len()), &want);
-                println!(
-                    "{module}: {}x{} {}-bit, rel rms {err:.2e}",
-                    w.rows, w.cols, w.bits
-                );
-                assert!(err < 1e-5);
+                for (split, bound) in [(true, 1e-5), (false, 2e-3)] {
+                    gpu.run(|enc| qmm(&gpu, enc, &w, &xv, &yv, m, split));
+                    let err = rel_rms(contents::<f32>(&yv.buffer, want.len()), &want);
+                    println!(
+                        "{module}: {}x{} {}-bit, split {split}, rel rms {err:.2e}",
+                        w.rows, w.cols, w.bits
+                    );
+                    assert!(err < bound);
+                }
             }
         }
 
-        /// 45 tokens in two calls (29 then 16) with chunks of 64 rounded
-        /// from 20: the hidden state after each layer, every layer state and
-        /// the logits must match the CPU.
+        /// With the split kernels, prefill is within f32 rounding of the CPU.
         #[test]
         #[ignore = "needs the model on the Mac"]
-        fn prefill_matches_token_by_token() {
+        fn exact_prefill_matches_token_by_token() {
+            check_prefill(true, 2e-5, 1e-4);
+        }
+
+        /// With half inputs the error is that of rounding x to half, far
+        /// below the bf16 MLX server's (1e-2 after a few layers, see the
+        /// golden test in src/cpu/model.rs).
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn fast_prefill_matches_token_by_token() {
+            check_prefill(false, 5e-3, 1e-2);
+        }
+
+        /// 45 tokens in two calls (29 then 16) with chunks of 64 rounded
+        /// from 20: the hidden state after each layer and every layer state
+        /// must be within `bound` of the CPU fed one token at a time, the
+        /// logits within `logits_bound`, with the same argmax.
+        fn check_prefill(exact: bool, bound: f32, logits_bound: f32) {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
-            let prefill = Prefill::new(&gpu, &cfg, &weights, 20).unwrap();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 20).unwrap();
+            prefill.exact = exact;
             let tokens = test_tokens(45);
             let parts = [&tokens[..29], &tokens[29..]];
             let h = cfg.hidden_size;
@@ -884,7 +1047,8 @@ mod mac {
                         );
                         conv.max(rec)
                     }
-                    (LayerState::Full(c), State::Full(g)) => {
+                    (LayerState::Full(c), State::Full(kv)) => {
+                        let g = &kv.cache;
                         assert_eq!(c.len(), g.len);
                         let n = c.keys().len();
                         let k = rel_rms(contents::<f32>(&g.keys, n), c.keys());
@@ -894,7 +1058,7 @@ mod mac {
                     _ => panic!("layer {l}: state types differ"),
                 };
                 println!("layer {l}: hidden rel rms {err:.2e}, state {state:.2e}");
-                assert!(err < 2e-5 && state < 2e-5, "layer {l}");
+                assert!(err < bound && state < bound, "layer {l}");
             }
 
             let norm = weights
@@ -912,11 +1076,72 @@ mod mac {
             let got = prefill.logits(&gpu, &gpu_x[1], parts[1].len());
             let err = rel_rms(&got, &want);
             println!("logits: rel rms {err:.2e}");
-            assert!(err < 1e-4);
+            assert!(err < logits_bound);
             assert_eq!(
                 crate::cpu::model::argmax(&got),
                 crate::cpu::model::argmax(&want)
             );
+        }
+
+        fn read_f32(path: &std::path::Path) -> Vec<f32> {
+            let b = std::fs::read(path).unwrap();
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_le_bytes(*w))
+                .collect()
+        }
+
+        /// KL(p || q) of two logit vectors, in nats.
+        fn kl(p: &[f32], q: &[f32]) -> f64 {
+            let log_softmax = |x: &[f32]| -> Vec<f64> {
+                let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let s: f64 = x.iter().map(|&v| (v as f64 - m).exp()).sum();
+                x.iter().map(|&v| v as f64 - m - s.ln()).collect()
+            };
+            let (lp, lq) = (log_softmax(p), log_softmax(q));
+            lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
+        }
+
+        /// The 32k eval prompt of track F, prefilled in pieces that end at
+        /// its checkpoints: KL against MLX f32 at each, and the largest |x|
+        /// going into the half kernels.
+        #[test]
+        #[ignore = "needs the model and ~/saetta/eval on the Mac"]
+        fn long_prompt_against_mlx_f32() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let eval = PathBuf::from(std::env::var("HOME").unwrap()).join("saetta/eval");
+            let tokens: Vec<u32> = std::fs::read(eval.join("long_tokens.bin"))
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_le_bytes(*w))
+                .collect();
+            let exact = std::env::var("SAETTA_EXACT").is_ok();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
+            prefill.exact = exact;
+            prefill.track_ranges(&gpu);
+            let mut states = prefill.new_states(&gpu, tokens.len());
+            let mut done = 0;
+            for end in [1024, 4096, 8192, 16384, 32768] {
+                let start = Instant::now();
+                let logits = prefill.run(&gpu, &tokens[done..end], &mut states);
+                let secs = start.elapsed().as_secs_f64();
+                let want = read_f32(&eval.join(format!("f32_logits_{}.bin", end - 1)));
+                let k = kl(&want, &logits);
+                println!(
+                    "exact {exact}, tokens {done}..{end} in {secs:.1} s: KL vs MLX f32 at {} {k:.2e}, argmax {} vs {}",
+                    end - 1,
+                    crate::cpu::model::argmax(&logits),
+                    crate::cpu::model::argmax(&want),
+                );
+                done = end;
+            }
+            for (name, v) in RANGES.iter().zip(prefill.ranges()) {
+                println!("max |x| {name}: {v}");
+            }
         }
 
         #[test]
@@ -946,17 +1171,37 @@ mod mac {
                 println!("{name}: {:.2} ms", d.as_secs_f64() * 1e3);
             };
             if let (Mixer::Linear(w), State::Linear(st)) = (&layer.mixer, &states[0]) {
-                time("qkv qmm", &|enc| qmm(&gpu, enc, &w.qkv, &normed, &whole(&s.wide), t));
-                time("deltanet all", &|enc| p.encode_deltanet(&gpu, enc, w, st, &normed, &whole(&s.mixer_out), t));
+                time("qkv qmm", &|enc| {
+                    qmm(&gpu, enc, &w.qkv, &normed, &whole(&s.wide), t, false)
+                });
+                time("deltanet all", &|enc| {
+                    p.encode_deltanet(&gpu, enc, w, st, &normed, &whole(&s.mixer_out), t)
+                });
             }
             if let (Mixer::Full(w), State::Full(c)) = (&p.layers[3].mixer, &mut states[3]) {
-                c.len = 0;
-                time("attention all", &|enc| p.encode_attention(&gpu, enc, w, c, &normed, &whole(&s.mixer_out), t, 0));
-                time("q qmm", &|enc| qmm(&gpu, enc, &w.q, &normed, &whole(&s.wide), t));
+                c.cache.len = 0;
+                time("attention all", &|enc| {
+                    p.encode_attention(&gpu, enc, w, c, &normed, &whole(&s.mixer_out), t, 0)
+                });
+                time("q qmm", &|enc| {
+                    qmm(&gpu, enc, &w.q, &normed, &whole(&s.wide), t, false)
+                });
             }
             let xt = at(&x, 0);
-            time("moe all", &|enc| p.encode_moe(&gpu, enc, layer, &normed, &xt, t));
-            time("shared gate qmm", &|enc| qmm(&gpu, enc, &layer.shared[0], &normed, &whole(&s.shared_g), t));
+            time("moe all", &|enc| {
+                p.encode_moe(&gpu, enc, layer, &normed, &xt, t)
+            });
+            time("shared gate qmm", &|enc| {
+                qmm(
+                    &gpu,
+                    enc,
+                    &layer.shared[0],
+                    &normed,
+                    &whole(&s.shared_g),
+                    t,
+                    false,
+                )
+            });
         }
     }
 }
