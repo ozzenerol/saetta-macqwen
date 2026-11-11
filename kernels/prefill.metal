@@ -1365,6 +1365,21 @@ kernel void moe_combine(device float *x [[buffer(0)]],
     x[at] += v;
 }
 
+// x[t] += sigmoid(shared_gate[t]) * shared[t] + experts[t], where experts
+// already holds the weighted sum of the token's experts (moe_down_mma3).
+kernel void moe_add_rows(device float *x [[buffer(0)]],
+                         device const float *shared [[buffer(1)]],
+                         device const float *shared_gate [[buffer(2)]],
+                         device const float *experts [[buffer(3)]],
+                         constant uint &dim [[buffer(4)]],
+                         uint2 id [[thread_position_in_grid]]) {
+    if (id.x >= dim) {
+        return;
+    }
+    ulong at = ulong(id.y) * dim + id.x;
+    x[at] += sigmoid(shared_gate[id.y]) * shared[at] + experts[at];
+}
+
 // out[slot] = max(out[slot], max |x[i]|), on the bits of the float: for
 // values >= 0 they order the same as the floats. For range checks only.
 kernel void max_abs(device const float *x [[buffer(0)]],
