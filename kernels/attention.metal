@@ -91,17 +91,32 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Weighted values: thread tid owns dim tid for all 8 heads.
-    float acc[DEC_GROUP] = {0};
-    device const half *v = values + start * stride + kv * DEC_DIM + tid;
-    for (uint t = 0; t < n; t++) {
-        float x = float(v[t * stride]);
+    // Weighted values: thread tid owns dims 4 * (tid % 64) .. + 3 of all 8
+    // heads, for the tokens t with t % 4 == tid / 64. One half4 load per
+    // token; the four token phases are summed through `sum` afterwards.
+    threadgroup float4 sum[DEC_GROUP][DEC_DIM / 4];
+    uint d4 = tid % 64, phase = tid / 64;
+    float4 acc[DEC_GROUP] = {0};
+    device const half4 *v = (device const half4 *)(values + start * stride + kv * DEC_DIM) + d4;
+    for (uint t = phase; t < n; t += 4) {
+        float4 x = float4(v[t * stride / 4]);
         for (uint g = 0; g < DEC_GROUP; g++) {
             acc[g] += sc[g][t] * x;
         }
     }
-    for (uint g = 0; g < DEC_GROUP; g++) {
-        part_o[(tg.x * p.heads + kv * DEC_GROUP + g) * DEC_DIM + tid] = acc[g];
+    for (uint step = 3; step > 0; step--) {
+        if (phase == step) {
+            for (uint g = 0; g < DEC_GROUP; g++) {
+                sum[g][d4] = step == 3 ? acc[g] : sum[g][d4] + acc[g];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (phase == 0) {
+        for (uint g = 0; g < DEC_GROUP; g++) {
+            device float4 *o = (device float4 *)(part_o + (tg.x * p.heads + kv * DEC_GROUP + g) * DEC_DIM);
+            o[d4] = sum[g][d4] + acc[g];
+        }
     }
 }
 
