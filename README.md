@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="saetta-macqwen" width="640"></p>
+
 # saetta-macqwen
 
 An inference engine for the Qwen3.6 MoE models on Apple Silicon, written in Rust with Metal kernels. It runs one model family on one kind of machine and is built to be faster than MLX and llama.cpp there.
