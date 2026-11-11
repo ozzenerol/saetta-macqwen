@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -30,6 +30,20 @@ fn main() -> ExitCode {
             Ok(flags) => report(serve(Path::new(dir), flags)),
             Err(e) => {
                 eprintln!("{e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        ["eval", dir, reference, ref options @ ..] => match eval_options(options) {
+            Some(options) => match eval(Path::new(dir), Path::new(reference), options) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("{USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -192,6 +206,20 @@ fn serve_gpu(
     listener: TcpListener,
     what: &str,
 ) -> Result<(), Box<dyn Error>> {
+    let served = load_gpu(config, weights)?;
+    let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
+    let server = Arc::new(Server::new(model, tokenizer, settings)?);
+    eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context)");
+    server.serve(listener)?;
+    Ok(())
+}
+
+/// The 40-layer GPU model with its prefill and snapshot pool, as served.
+#[cfg(target_os = "macos")]
+fn load_gpu(
+    config: &'static Config,
+    weights: &'static Weights,
+) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let model =
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
@@ -200,17 +228,12 @@ fn serve_gpu(
     let mut prefill =
         saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, GPU_CONTEXT)?;
     prefill.exact = exact_prefill();
-    let served = GpuServed {
+    Ok(GpuServed {
         model,
         prefill,
         pool,
         last_blit: RefCell::new(None),
-    };
-    let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
-    let server = Arc::new(Server::new(model, tokenizer, settings)?);
-    eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context)");
-    server.serve(listener)?;
-    Ok(())
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -357,6 +380,70 @@ impl Restore for CpuModel {
     fn restore(&mut self, state: &Self::State, len: usize) {
         cache::restore_cpu(&mut self.states, state, len);
     }
+}
+
+struct EvalOptions {
+    gpu: bool,
+    ppl: bool,
+    long: usize,
+}
+
+/// `--gpu` runs the GPU model instead of the CPU one; `--long N` runs the
+/// first N tokens of the long prompt (default 0, off); `--no-ppl` skips the
+/// perplexity text.
+fn eval_options(options: &[&str]) -> Option<EvalOptions> {
+    let mut o = EvalOptions {
+        gpu: false,
+        ppl: true,
+        long: 0,
+    };
+    let mut rest = options.iter();
+    while let Some(&option) = rest.next() {
+        match option {
+            "--gpu" => o.gpu = true,
+            "--no-ppl" => o.ppl = false,
+            "--long" => o.long = rest.next()?.parse().ok()?,
+            _ => return None,
+        }
+    }
+    Some(o)
+}
+
+fn eval(dir: &Path, reference: &Path, o: EvalOptions) -> Result<bool, Box<dyn Error>> {
+    let reference = saetta::eval::Reference::load(reference)?;
+    // The GPU model borrows these for the whole run, as in serve.
+    let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
+    let weights: &'static Weights = Box::leak(Box::new(Weights::open(dir)?));
+    if o.gpu {
+        return eval_gpu(config, weights, &reference, o);
+    }
+    let model = Model::new(config, weights)?;
+    let states = model.new_states();
+    let mut model = CpuModel { model, states };
+    saetta::eval::gate(&mut model, &reference, o.ppl, o.long)
+}
+
+#[cfg(target_os = "macos")]
+fn eval_gpu(
+    config: &'static Config,
+    weights: &'static Weights,
+    reference: &saetta::eval::Reference,
+    o: EvalOptions,
+) -> Result<bool, Box<dyn Error>> {
+    let mut model = load_gpu(config, weights)?;
+    let prefill = if model.prefill.exact { "exact" } else { "fast" };
+    println!("GPU model, {prefill} prefill");
+    saetta::eval::gate(&mut model, reference, o.ppl, o.long)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn eval_gpu(
+    _: &'static Config,
+    _: &'static Weights,
+    _: &saetta::eval::Reference,
+    _: EvalOptions,
+) -> Result<bool, Box<dyn Error>> {
+    Err("--gpu needs macOS".into())
 }
 
 fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
