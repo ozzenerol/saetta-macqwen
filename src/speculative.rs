@@ -474,7 +474,8 @@ mod gpu {
     use crate::gpu_model::GpuModel;
     use crate::gpu_mtp::GpuMtp;
     use crate::qmv::View;
-    use crate::sample_gpu::supports;
+    use crate::sample::Sampler;
+    use crate::sample_gpu::{NO_DRAFT, slot, supports};
     use std::time::Instant;
 
     /// The drafter and what a round needs to go back. The main model is
@@ -484,6 +485,7 @@ mod gpu {
         gpu: &'a Gpu,
         k: usize,
         hidden: usize,
+        vocab: usize,
         /// The normed hidden state after the last token the model ran.
         last: View,
         /// For each MTP cache entry, the model position of its hidden state.
@@ -513,6 +515,7 @@ mod gpu {
                 gpu,
                 k,
                 hidden,
+                vocab: cfg.vocab_size,
             }
         }
 
@@ -700,32 +703,62 @@ mod gpu {
             let tokens: Vec<u32> = std::iter::once(pending)
                 .chain(drafts.iter().copied())
                 .collect();
+            // At temperature > 0 the GPU sampler applies the rejection rule
+            // to each row inside the verify, reading the drafts from its
+            // ring.
+            let on_gpu = match decide.sampling() {
+                Some((p, sampler)) if p.temperature > 0.0 && supports(&p) => {
+                    let s = model.sampler();
+                    s.set(self.vocab, &p, false);
+                    s.seed(sampler.state());
+                    for (i, &d) in drafts.iter().enumerate() {
+                        s.set_draft(base + i + 1, d);
+                    }
+                    s.set_draft(base + k + 1, NO_DRAFT);
+                    true
+                }
+                _ => false,
+            };
             // One verify of all rows; the states move on by all of them
             // until `accept`.
             let argmax = model.verify(&tokens);
-            let mut accepted = 0;
-            let mut next = None;
-            for (i, &d) in drafts.iter().enumerate() {
-                let verdict = if decide.greedy() {
-                    (argmax[i] != d).then_some(argmax[i])
-                } else {
-                    decide.check(&model.verify_logits(i), d)
-                };
-                match verdict {
-                    None => accepted += 1,
-                    Some(t) => {
-                        next = Some(t);
-                        break;
+            let (accepted, next) = if on_gpu {
+                let s = model.sampler();
+                let ring = s.read();
+                s.clear_drafts();
+                if let Some((_, sampler)) = decide.sampling() {
+                    *sampler = Sampler::new(s.rng());
+                }
+                let accepted = (0..k)
+                    .take_while(|&i| ring.accepted[slot(base + i + 1)] == 1)
+                    .count();
+                (accepted, ring.ids[slot(base + accepted + 1)])
+            } else {
+                let mut accepted = 0;
+                let mut next = None;
+                for (i, &d) in drafts.iter().enumerate() {
+                    let verdict = if decide.greedy() {
+                        (argmax[i] != d).then_some(argmax[i])
+                    } else {
+                        decide.check(&model.verify_logits(i), d)
+                    };
+                    match verdict {
+                        None => accepted += 1,
+                        Some(t) => {
+                            next = Some(t);
+                            break;
+                        }
                     }
                 }
-            }
-            let next = next.unwrap_or_else(|| {
-                if decide.greedy() {
-                    argmax[k]
-                } else {
-                    decide.pick(&model.verify_logits(k))
-                }
-            });
+                let next = next.unwrap_or_else(|| {
+                    if decide.greedy() {
+                        argmax[k]
+                    } else {
+                        decide.pick(&model.verify_logits(k))
+                    }
+                });
+                (accepted, next)
+            };
             model.accept(accepted + 1);
 
             self.mtp.truncate(mark + 1);
