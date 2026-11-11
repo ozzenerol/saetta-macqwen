@@ -525,6 +525,15 @@ mod mac {
                     "ctx {ctx}: decode {decode:.2} ms; verify {}",
                     rows.join(", ")
                 );
+                // Each kernel's ops of a 4-row verify alone, with barriers.
+                let plan = model.verify_plan(4);
+                for (name, ops) in plan.kernels() {
+                    let built = plan.build_where(|k| k == name, true);
+                    let ms = median(&mut || built.run_timed(&gpu).1 * 1e3);
+                    if ms > 0.05 {
+                        println!("  m4 {name}: {ops} ops {ms:.2} ms");
+                    }
+                }
             }
         }
     }

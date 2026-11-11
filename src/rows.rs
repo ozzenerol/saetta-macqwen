@@ -404,9 +404,10 @@ mod mac {
             }
             let threads = MTLSize::new(32 * MOE_SIMDS as u64, 1, 1);
             let shape = plan.constant(&[g.rows as u32, g.cols as u32, top_k as u32]);
-            plan.op(
-                &format!("moe_gate_up_rows_{m}"),
-                &[
+            assert!(g.rows.is_multiple_of(QR * QR_SIMDS));
+            for (pass, r0) in (0..m).step_by(REG_ROWS).enumerate() {
+                let rows = plan.constant(&[m as u32, r0 as u32]);
+                let buffers = [
                     &g.words,
                     &g.scales,
                     &g.biases,
@@ -418,10 +419,13 @@ mod mac {
                     &shape,
                     &self.list,
                     &self.slots,
-                ],
-                MTLSize::new((g.rows / MOE_SIMDS) as u64, (m * top_k) as u64, 1),
-                threads,
-            );
+                    &rows,
+                ];
+                let grid = MTLSize::new((g.rows / (QR * QR_SIMDS)) as u64, (m * top_k) as u64, 1);
+                let kernel = format!("moe_gate_up_reg_{}", REG_ROWS.min(m - r0));
+                let tg = MTLSize::new(32 * QR_SIMDS as u64, 1, 1);
+                op(plan, &kernel, &buffers, grid, tg, pass > 0);
+            }
             let shape = plan.constant(&[d.rows as u32, d.cols as u32, top_k as u32]);
             plan.op(
                 &format!("moe_down_rows_{m}"),
