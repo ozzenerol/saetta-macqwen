@@ -99,28 +99,43 @@ mod mac {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct RopeParams {
-        stride: u32,
+    struct PrepParams {
+        heads: u32,
+        kv_heads: u32,
+        dim: u32,
         half_dims: u32,
         log2_theta: f32,
+        eps: f32,
     }
 
-    /// RoPE in place on `rows` heads of `x` at the token's position.
-    fn rope(plan: &mut Plan, x: &View, rows: usize, cfg: &AttentionConfig) {
-        let half = cfg.rope_dims / 2;
-        let p = plan.constant(&[RopeParams {
-            stride: cfg.head_dim as u32,
-            half_dims: half as u32,
-            log2_theta: cfg.rope_theta.log2(),
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ResidualParams {
+        dim: u32,
+        eps: f32,
+    }
+
+    /// Records `x += y; out = rms_norm(x) * w` as one op, for buffers
+    /// `[x, y, w, out]` of `dim` values.
+    pub fn add_norm(plan: &mut Plan, buffers: [&View; 4], dim: usize, eps: f32) {
+        residual(plan, "add_norm", &buffers, dim, eps);
+    }
+
+    /// Records `x += sigmoid(shared_logit[0]) * shared + routed;
+    /// out = rms_norm(x) * w` as one op, for buffers
+    /// `[x, shared_logit, shared, routed, w, out]`.
+    pub fn mix_norm(plan: &mut Plan, buffers: [&View; 6], dim: usize, eps: f32) {
+        residual(plan, "mix_norm", &buffers, dim, eps);
+    }
+
+    fn residual(plan: &mut Plan, kernel: &str, buffers: &[&View], dim: usize, eps: f32) {
+        let p = plan.constant(&[ResidualParams {
+            dim: dim as u32,
+            eps,
         }]);
-        let params = plan.params.clone();
-        let group = half.min(64);
-        plan.op(
-            "rope",
-            &[x, &p, &params],
-            size(half.div_ceil(group), rows),
-            size(group, 1),
-        );
+        let mut all = buffers.to_vec();
+        all.push(&p);
+        plan.op(kernel, &all, size(1, 1), size(dim.min(1024), 1));
     }
 
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
@@ -193,6 +208,9 @@ mod mac {
             prefix: &str,
         ) -> Result<GpuAttention<'a>, String> {
             let a = attention_config(cfg);
+            if a.head_dim > 1024 || a.rope_dims > a.head_dim {
+                return Err("attention_prep takes head_dim up to 1024".into());
+            }
             let size = a.heads * a.head_dim;
             let kv = a.kv_heads * a.head_dim;
             let m = |n: &str| matrix(gpu, weights, cfg, &format!("{prefix}.self_attn.{n}"));
@@ -218,7 +236,6 @@ mod mac {
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, cache: &GpuKvCache) {
             let c = &self.cfg;
             let d = c.head_dim;
-            let kv_size = c.kv_heads * d;
             let [q_and_gate, q, k, v, attn] =
                 [&self.q_and_gate, &self.q, &self.k, &self.v, &self.out].map(whole);
 
@@ -226,21 +243,32 @@ mod mac {
             self.k_proj.record(plan, x, &k, true);
             self.v_proj.record(plan, x, &v, true);
 
-            let mut norm = Norm::rows(c.heads, d, c.eps, &self.q_norm);
-            norm.in_stride = 2 * d;
-            norm.record(plan, &q_and_gate, &q, false);
-            rope(plan, &q, c.heads, c);
-            Norm::rows(c.kv_heads, d, c.eps, &self.k_norm).record(plan, &k, &k, false);
-            rope(plan, &k, c.kv_heads, c);
-
             let (keys, values) = (whole(&cache.keys), whole(&cache.values));
-            let n = plan.constant(&[kv_size as u32]);
+            let p = plan.constant(&[PrepParams {
+                heads: c.heads as u32,
+                kv_heads: c.kv_heads as u32,
+                dim: d as u32,
+                half_dims: (c.rope_dims / 2) as u32,
+                log2_theta: c.rope_theta.log2(),
+                eps: c.eps,
+            }]);
             let params = plan.params.clone();
             plan.op(
-                "kv_store",
-                &[&k, &v, &keys, &values, &n, &params],
-                size(kv_size.div_ceil(256), 1),
-                size(256, 1),
+                "attention_prep",
+                &[
+                    &q_and_gate,
+                    &k,
+                    &v,
+                    &self.q_norm,
+                    &self.k_norm,
+                    &q,
+                    &keys,
+                    &values,
+                    &p,
+                    &params,
+                ],
+                size(c.heads + c.kv_heads, 1),
+                size(d, 1),
             );
 
             cache
@@ -278,11 +306,11 @@ mod mac {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct DeltaParams {
+    struct StepParams {
         k_heads: u32,
         v_heads: u32,
-        k_dim: u32,
         v_dim: u32,
+        eps: f32,
     }
 
     /// Gated DeltaNet: projections, conv1d, q/k L2 norm, the delta rule,
@@ -314,6 +342,9 @@ mod mac {
             prefix: &str,
         ) -> Result<GpuDeltaNet<'a>, String> {
             let c = deltanet_config(cfg);
+            if c.k_dim != 128 || c.v_dim > 256 {
+                return Err("deltanet_step is written for k_dim 128 and v_dim up to 256".into());
+            }
             let p = format!("{prefix}.linear_attn");
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
             let values = c.v_heads * c.v_dim;
@@ -364,35 +395,19 @@ mod mac {
                 size(256, 1),
             );
 
-            // normalize_qk in MLX: rms_norm with eps / k_dim, then q scaled
-            // by 1 / k_dim and k by 1 / sqrt(k_dim).
             let (q, k, v) = (
                 at(&self.mixed, 0),
                 at(&self.mixed, key_size),
                 at(&self.mixed, 2 * key_size),
             );
-            let l2 = |scale: f32| Norm {
-                rows: c.k_heads,
-                dim: c.k_dim,
-                in_stride: c.k_dim,
-                out_stride: c.k_dim,
-                eps: c.eps / c.k_dim as f32,
-                scale,
-                weight: None,
-                gate: None,
-            };
-            l2(1.0 / c.k_dim as f32).record(plan, &q, &q, false);
-            l2(1.0 / (c.k_dim as f32).sqrt()).record(plan, &k, &k, true);
-
-            let p = plan.constant(&[DeltaParams {
+            let p = plan.constant(&[StepParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
-                k_dim: c.k_dim as u32,
                 v_dim: c.v_dim as u32,
+                eps: c.eps,
             }]);
-            let rows = c.v_heads * c.v_dim;
             plan.op(
-                "delta_rule",
+                "deltanet_step",
                 &[
                     &q,
                     &k,
@@ -402,16 +417,14 @@ mod mac {
                     &self.a_log,
                     &self.dt_bias,
                     &whole(&state.recurrent),
+                    &z,
+                    &self.norm,
                     &y,
                     &p,
                 ],
-                size(rows.div_ceil(128), 1),
-                size(128, 1),
+                size(c.v_heads, 1),
+                size(1024, 1),
             );
-
-            let mut gated = Norm::rows(c.v_heads, c.v_dim, c.eps, &self.norm);
-            gated.gate = Some(&z);
-            gated.record(plan, &y, &y, false);
 
             self.out_proj.record(plan, &y, out, false);
         }
