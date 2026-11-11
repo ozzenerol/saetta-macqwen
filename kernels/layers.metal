@@ -1,6 +1,7 @@
 // Kernels for the attention and Gated DeltaNet layers, one token at a time.
 // They follow src/cpu/ (attention.rs, deltanet.rs), which is checked against
-// MLX; src/gpu_layers.rs tests each one against it.
+// MLX; src/gpu_layers.rs tests each one against it. They are recorded once
+// into a Plan, so what changes per token comes from TokenParams.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -90,15 +91,15 @@ kernel void rms_norm(device const float *x [[buffer(0)]],
 struct RopeParams {
     uint stride;     // floats between heads
     uint half_dims;  // rotary dims / 2
-    uint pos;
     float log2_theta;
 };
 
 // In place, one thread per (head, i < half_dims): value i pairs with
-// i + half_dims, as `traditional=False` in MLX. The angle is computed in f32
-// as MLX does.
+// i + half_dims, as `traditional=False` in MLX, at the token's position.
+// The angle is computed in f32 as MLX does.
 kernel void rope(device float *x [[buffer(0)]],
                  constant RopeParams &p [[buffer(1)]],
+                 constant TokenParams &t [[buffer(2)]],
                  uint2 id [[thread_position_in_grid]]) {
     uint i = id.x;
     if (i >= p.half_dims) {
@@ -106,7 +107,7 @@ kernel void rope(device float *x [[buffer(0)]],
     }
     device float *h = x + id.y * p.stride;
     float freq = exp2(-float(i) / float(p.half_dims) * p.log2_theta);
-    float angle = float(p.pos) * freq;
+    float angle = float(t.position) * freq;
     float s = precise::sin(angle);
     float c = precise::cos(angle);
     float a = h[i];
@@ -119,13 +120,29 @@ struct AttentionParams {
     uint heads;
     uint kv_heads;
     uint dim;
-    uint len;       // tokens in the cache, this one included
-    uint capacity;  // scores row length
+    uint capacity;  // tokens the cache and the scores rows hold
     float scale;
 };
 
-// One threadgroup per query head: softmax(q K^T * scale) V over the cache,
-// times sigmoid(gate). The gate of head h sits at q_and_gate[h * 2 * dim + dim].
+// Copies the token's key and value (`kv_heads * dim` each) into its slot of
+// the cache, one thread per value.
+kernel void kv_store(device const float *k [[buffer(0)]],
+                     device const float *v [[buffer(1)]],
+                     device float *keys [[buffer(2)]],
+                     device float *values [[buffer(3)]],
+                     constant uint &size [[buffer(4)]],
+                     constant TokenParams &t [[buffer(5)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= size) {
+        return;
+    }
+    keys[t.position * size + i] = k[i];
+    values[t.position * size + i] = v[i];
+}
+
+// One threadgroup per query head: softmax(q K^T * scale) V over the first
+// kv_len tokens of the cache, times sigmoid(gate). The gate of head h sits
+// at q_and_gate[h * 2 * dim + dim].
 kernel void attention(device const float *q [[buffer(0)]],
                       device const float *keys [[buffer(1)]],
                       device const float *values [[buffer(2)]],
@@ -133,6 +150,7 @@ kernel void attention(device const float *q [[buffer(0)]],
                       device float *out [[buffer(4)]],
                       device float *scores [[buffer(5)]],
                       constant AttentionParams &p [[buffer(6)]],
+                      constant TokenParams &tp [[buffer(7)]],
                       uint h [[threadgroup_position_in_grid]],
                       uint tid [[thread_position_in_threadgroup]],
                       uint threads [[threads_per_threadgroup]],
@@ -140,12 +158,13 @@ kernel void attention(device const float *q [[buffer(0)]],
                       uint lane [[thread_index_in_simdgroup]],
                       uint simds [[simdgroups_per_threadgroup]]) {
     threadgroup float tmp[32];
+    uint len = min(tp.kv_len, p.capacity);
     uint kv = h / (p.heads / p.kv_heads);
     uint stride = p.kv_heads * p.dim;
     device const float *qh = q + h * p.dim;
     device float *sh = scores + h * p.capacity;
 
-    for (uint t = simd; t < p.len; t += simds) {
+    for (uint t = simd; t < len; t += simds) {
         device const float *k = keys + t * stride + kv * p.dim;
         float d = 0;
         for (uint i = lane; i < p.dim; i += 32) {
@@ -159,12 +178,12 @@ kernel void attention(device const float *q [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_device);
 
     float m = -INFINITY;
-    for (uint t = tid; t < p.len; t += threads) {
+    for (uint t = tid; t < len; t += threads) {
         m = max(m, sh[t]);
     }
     m = group_max(m, tmp, simd, lane, simds);
     float sum = 0;
-    for (uint t = tid; t < p.len; t += threads) {
+    for (uint t = tid; t < len; t += threads) {
         float e = exp(sh[t] - m);
         sh[t] = e;
         sum += e;
@@ -174,7 +193,7 @@ kernel void attention(device const float *q [[buffer(0)]],
 
     for (uint i = tid; i < p.dim; i += threads) {
         float acc = 0;
-        for (uint t = 0; t < p.len; t++) {
+        for (uint t = 0; t < len; t++) {
             acc += sh[t] * values[t * stride + kv * p.dim + i];
         }
         out[h * p.dim + i] = acc / sum * sigmoid(q_and_gate[h * 2 * p.dim + p.dim + i]);
