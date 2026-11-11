@@ -101,8 +101,8 @@ mod mac {
             plan.op(
                 "attention_reduce",
                 &[&o, &ml, q_and_gate, out, &p, &params],
-                MTLSize::new(self.heads as u64, 1, 1),
-                MTLSize::new(DIM as u64, 1, 1),
+                MTLSize::new(self.heads as u64, (DIM / 64) as u64, 1),
+                MTLSize::new(1024, 1, 1),
             );
         }
     }

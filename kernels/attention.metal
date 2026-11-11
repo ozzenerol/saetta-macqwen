@@ -225,26 +225,51 @@ kernel void attention_partial_mma(device const float *q [[buffer(0)]],
     }
 }
 
+// attention_reduce: grid (heads, DEC_DIM / 64), 1024 threads. Thread
+// (phase, d) merges chunks phase, phase + 16, ... for dim d of its 64-dim
+// slice with a running max, then the 16 phases are merged.
+constant uint RED_PHASES = 16;
+
 kernel void attention_reduce(device const float *part_o [[buffer(0)]],
                              device const float *part_ml [[buffer(1)]],
                              device const float *q_and_gate [[buffer(2)]],
                              device float *out [[buffer(3)]],
                              constant DecodeParams &p [[buffer(4)]],
                              constant TokenParams &tp [[buffer(5)]],
-                             uint h [[threadgroup_position_in_grid]],
-                             uint d [[thread_index_in_threadgroup]]) {
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sm[RED_PHASES][64], sl[RED_PHASES][64], sa[RED_PHASES][64];
+    uint h = tg.x;
+    uint dl = tid % 64, phase = tid / 64;
+    uint d = tg.y * 64 + dl;
     uint len = min(tp.kv_len, p.capacity);
     uint chunks = (len + DEC_CHUNK - 1) / DEC_CHUNK;
-    float m = -INFINITY;
-    for (uint c = 0; c < chunks; c++) {
-        m = max(m, part_ml[2 * (c * p.heads + h)]);
-    }
-    float l = 0, acc = 0;
-    for (uint c = 0; c < chunks; c++) {
+    float m = -INFINITY, l = 0, acc = 0;
+    for (uint c = phase; c < chunks; c += RED_PHASES) {
         uint i = c * p.heads + h;
-        float w = exp(part_ml[2 * i] - m);
-        l += w * part_ml[2 * i + 1];
-        acc += w * part_o[i * DEC_DIM + d];
+        float cm = part_ml[2 * i];
+        float nm = max(m, cm);
+        float a = exp(m - nm), b = exp(cm - nm);
+        l = l * a + part_ml[2 * i + 1] * b;
+        acc = acc * a + part_o[i * DEC_DIM + d] * b;
+        m = nm;
     }
-    out[h * DEC_DIM + d] = acc / l * sigmoid(q_and_gate[h * 2 * DEC_DIM + DEC_DIM + d]);
+    sm[phase][dl] = m;
+    sl[phase][dl] = l;
+    sa[phase][dl] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (phase != 0) {
+        return;
+    }
+    float mm = -INFINITY;
+    for (uint f = 0; f < RED_PHASES; f++) {
+        mm = max(mm, sm[f][dl]);
+    }
+    float tl = 0, ta = 0;
+    for (uint f = 0; f < RED_PHASES; f++) {
+        float w = sm[f][dl] == -INFINITY ? 0 : exp(sm[f][dl] - mm);
+        tl += w * sl[f][dl];
+        ta += w * sa[f][dl];
+    }
+    out[h * DEC_DIM + d] = ta / tl * sigmoid(q_and_gate[h * 2 * DEC_DIM + DEC_DIM + d]);
 }
