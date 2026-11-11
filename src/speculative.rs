@@ -38,6 +38,10 @@ pub trait Decider {
     /// Checks `draft` against the main model's `logits`. `None` accepts it;
     /// `Some(t)` rejects it and puts `t` in its place.
     fn check(&mut self, logits: &[f32], draft: u32) -> Option<u32>;
+    /// True when `pick` is the argmax, so a GPU argmax can stand in for it.
+    fn greedy(&self) -> bool {
+        false
+    }
 }
 
 /// Greedy decoding: a draft is accepted when it is the main model's argmax,
@@ -52,6 +56,10 @@ impl Decider for Greedy {
     fn check(&mut self, logits: &[f32], draft: u32) -> Option<u32> {
         let best = argmax(logits);
         (best != draft).then_some(best)
+    }
+
+    fn greedy(&self) -> bool {
+        true
     }
 }
 
@@ -113,6 +121,10 @@ impl Decider for Sampled {
             return Some(draft);
         }
         Some(self.draw(&p))
+    }
+
+    fn greedy(&self) -> bool {
+        self.params.temperature <= 0.0
     }
 }
 
@@ -332,10 +344,11 @@ mod gpu {
     //! layer.
 
     use super::{Decider, Stats};
-    use crate::gpu::Gpu;
-    use crate::gpu_cache::{GpuSnapshot, SnapshotPool, restore, save};
+    use crate::config::Config;
+    use crate::gpu::{Gpu, contents};
     use crate::gpu_model::GpuModel;
     use crate::gpu_mtp::GpuMtp;
+    use crate::prefill::Prefill;
     use crate::qmv::View;
 
     /// The drafter and what a round needs to go back. The main model is
@@ -345,26 +358,22 @@ mod gpu {
         gpu: &'a Gpu,
         k: usize,
         hidden: usize,
+        vocab: usize,
         /// The normed hidden state after the last token the model ran.
         last: View,
-        /// The normed hidden state after each token of a verify pass.
-        rows: Vec<View>,
-        pool: SnapshotPool,
         /// For each MTP cache entry, the model position of its hidden state.
         mtp_positions: Vec<usize>,
         pub stats: Stats,
     }
 
     impl<'a> GpuSpec<'a> {
-        /// Drafts `k` tokens per round.
-        pub fn new(model: &GpuModel<'a>, mtp: GpuMtp<'a>, hidden: usize, k: usize) -> GpuSpec<'a> {
+        /// Drafts `k` tokens per round. `prefill` checks them and needs
+        /// `enable_verify` for `k + 1` rows.
+        pub fn new(model: &GpuModel<'a>, mtp: GpuMtp<'a>, cfg: &Config, k: usize) -> GpuSpec<'a> {
             let gpu = model.gpu();
-            let pool = SnapshotPool::new(gpu, &model.deltanet_states(), k);
-            let view = || View::new(gpu.buffer(hidden * 4));
+            let hidden = cfg.hidden_size;
             GpuSpec {
-                last: view(),
-                rows: (0..=k).map(|_| view()).collect(),
-                pool,
+                last: View::new(gpu.buffer(hidden * 4)),
                 mtp_positions: Vec::new(),
                 stats: Stats {
                     accepted_at: vec![0; k],
@@ -374,6 +383,7 @@ mod gpu {
                 gpu,
                 k,
                 hidden,
+                vocab: cfg.vocab_size,
             }
         }
 
@@ -483,10 +493,12 @@ mod gpu {
         pub fn speculate(
             &mut self,
             model: &mut GpuModel<'a>,
+            prefill: &Prefill,
             pending: u32,
             decide: &mut dyn Decider,
         ) -> (Vec<u32>, u32) {
             let k = self.k;
+            let vocab = self.vocab;
             let base = model.position();
             let mark = self.mtp.len();
 
@@ -498,27 +510,26 @@ mod gpu {
                 drafts.push(d);
             }
 
-            // Stand-in for a batched verify pass: one token at a time, with
-            // the DeltaNet states saved after each.
-            let mut logits = Vec::with_capacity(k + 1);
-            let mut saved: Vec<GpuSnapshot> = Vec::with_capacity(k);
-            for (i, t) in std::iter::once(pending)
+            // One pass over `pending` and the drafts, keeping each row.
+            let tokens: Vec<u32> = std::iter::once(pending)
                 .chain(drafts.iter().copied())
-                .enumerate()
-            {
-                logits.push(model.forward(t));
-                copy(model.final_hidden(), &self.rows[i], self.hidden);
-                if i < k {
-                    let (snapshot, blit) = save(self.gpu, &self.pool, &model.deltanet_states());
-                    blit.wait_until_completed();
-                    saved.push(snapshot);
-                }
-            }
+                .collect();
+            let states: Vec<_> = model.states().collect();
+            let v = prefill.verify(self.gpu, &tokens, base, &states);
+            let row = |i: usize| {
+                let at = v.logits.offset as usize / 4 + i * vocab;
+                &contents::<f32>(&v.logits.buffer, at + vocab)[at..]
+            };
 
             let mut accepted = 0;
             let mut next = None;
             for (i, &d) in drafts.iter().enumerate() {
-                match decide.check(&logits[i], d) {
+                let verdict = if decide.greedy() {
+                    (v.argmax[i] != d).then_some(v.argmax[i])
+                } else {
+                    decide.check(row(i), d)
+                };
+                match verdict {
                     None => accepted += 1,
                     Some(t) => {
                         next = Some(t);
@@ -526,20 +537,25 @@ mod gpu {
                     }
                 }
             }
-            let next = next.unwrap_or_else(|| decide.pick(&logits[k]));
+            let next = next.unwrap_or_else(|| {
+                if decide.greedy() {
+                    v.argmax[k]
+                } else {
+                    decide.pick(row(k))
+                }
+            });
 
             if accepted < k {
-                let blit = restore(self.gpu, &saved[accepted], &model.deltanet_states());
-                blit.wait_until_completed();
-                model.set_position(base + accepted + 1);
+                prefill.restore(self.gpu, accepted, &states);
             }
+            drop(states);
+            model.set_position(base + accepted + 1);
             self.mtp.truncate(mark + 1);
             self.mtp_positions.truncate(mark + 1);
             for (i, &d) in drafts[..accepted].iter().enumerate() {
-                let row = self.rows[i].clone();
-                self.mtp_step(&row, base + i, d);
+                self.mtp_step(&v.hidden_row(i), base + i, d);
             }
-            copy(&self.rows[accepted], &self.last, self.hidden);
+            copy(&v.hidden_row(accepted), &self.last, self.hidden);
 
             self.stats.rounds += 1;
             self.stats.drafted += k;
@@ -652,7 +668,10 @@ mod gpu_real {
 
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 1024).unwrap();
             let mtp = GpuMtp::load(&gpu, &cfg, &weights, 1024).unwrap();
-            let mut spec = GpuSpec::new(&model, mtp, h, 3);
+            let mut spec = GpuSpec::new(&model, mtp, &cfg, 3);
+            let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 64, 1024).unwrap();
+            prefill.exact = true;
+            prefill.enable_verify(&gpu, 4);
             let mut rows = Vec::with_capacity(prompt.len() * h);
             let mut logits = Vec::new();
             for &t in &prompt {
@@ -665,7 +684,7 @@ mod gpu_real {
             let start = Instant::now();
             while got.len() < count {
                 got.push(pending);
-                let (accepted, next) = spec.speculate(&mut model, pending, &mut Greedy);
+                let (accepted, next) = spec.speculate(&mut model, &prefill, pending, &mut Greedy);
                 got.extend(accepted);
                 pending = next;
             }
@@ -673,7 +692,7 @@ mod gpu_real {
             got.truncate(count);
 
             println!(
-                "{:?}\n  plain {:.1} tok/s, stand-in speculative {:.1} tok/s, {:.2} tokens per round, {:?}",
+                "{:?}\n  plain {:.1} tok/s, speculative {:.1} tok/s, {:.2} tokens per round, {:?}",
                 tok.decode(&got),
                 count as f64 / plain_time.as_secs_f64(),
                 count as f64 / spec_time.as_secs_f64(),

@@ -261,11 +261,14 @@ fn load_gpu(
     let mut prefill =
         saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, GPU_CONTEXT)?;
     prefill.exact = exact_prefill();
+    if draft > 0 {
+        prefill.enable_verify(gpu, draft + 1);
+    }
     let spec = if draft > 0 {
         let mtp = saetta::gpu_mtp::GpuMtp::load(gpu, config, weights, GPU_CONTEXT)?;
         let norm = weights.tensor("language_model.model.norm.weight")?.to_f32();
         Some(Drafting {
-            spec: saetta::speculative::GpuSpec::new(&model, mtp, config.hidden_size, draft),
+            spec: saetta::speculative::GpuSpec::new(&model, mtp, config, draft),
             norm,
             eps: config.rms_norm_eps,
         })
@@ -417,7 +420,9 @@ impl server::Model for GpuServed {
         decide: &mut dyn saetta::speculative::Decider,
     ) -> (Vec<u32>, u32) {
         match &mut self.drafting {
-            Some(d) => d.spec.speculate(&mut self.model, pending, decide),
+            Some(d) => d
+                .spec
+                .speculate(&mut self.model, &self.prefill, pending, decide),
             None => {
                 let logits = self.model.forward(pending);
                 (Vec::new(), decide.pick(&logits))
