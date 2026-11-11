@@ -288,10 +288,10 @@ mod mac {
         groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
     }
 
-    /// Fast-mode dense matrices run on qmm2 (w exact up to its scale, x in
-    /// half); SAETTA_QMM2=0 picks qmm_dq (w rounded to half), to compare.
+    /// Fast-mode dense matrices run on qmm_dq (w rounded to half), 6% faster
+    /// than qmm2 at 1800 tokens; SAETTA_QMM2=1 picks qmm2 (x in half).
     fn dense_qmm2() -> bool {
-        std::env::var("SAETTA_QMM2").map_or(true, |v| v != "0")
+        std::env::var("SAETTA_QMM2").is_ok_and(|v| v == "1")
     }
 
     /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
