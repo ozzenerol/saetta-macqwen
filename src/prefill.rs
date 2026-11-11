@@ -121,17 +121,18 @@ mod mac {
 
     /// `split` picks the kernel that splits x into two halves, for close
     /// to f32 results.
-    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
-        let name = match w.bits {
-            5 => "qmm_5bit",
-            8 => "qmm_8bit",
-            b => panic!("no qmm kernel for {b} bits"),
-        };
-        gpu.pipeline(&if split {
-            format!("{name}_split")
+    /// qmm_<bits>bit_split with `split`, else qmm_dq_<bits>bit.
+    fn qmm_name(w: &GpuQuant, split: bool) -> String {
+        assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
+        if split {
+            format!("qmm_{}bit_split", w.bits)
         } else {
-            name.to_string()
-        })
+            format!("qmm_dq_{}bit", w.bits)
+        }
+    }
+
+    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
+        gpu.pipeline(&qmm_name(w, split))
     }
 
     /// y = x W^T for `m` rows of x.
@@ -144,6 +145,19 @@ mod mac {
         m: usize,
         split: bool,
     ) {
+        qmm_with(gpu, enc, w, x, y, m, &qmm_name(w, split));
+    }
+
+    /// qmm with the named large-m kernel.
+    fn qmm_with(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        y: &View,
+        m: usize,
+        kernel: &str,
+    ) {
         assert_eq!(w.experts, 1);
         let shape = MmShape {
             m: m as u32,
@@ -154,7 +168,7 @@ mod mac {
         if m <= FEW_MAX {
             enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
         } else {
-            enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
         }
         set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y, x, x, x]);
@@ -1232,12 +1246,17 @@ mod mac {
             let w = GpuQuant::new(&gpu, &weights.quantized(module, &cfg.quantization)?);
             let x = View::new(gpu.buffer_from(&vec![0.01f32; m * w.cols]));
             let y = View::new(gpu.buffer(m * w.rows * 4));
-            for split in [false, true] {
+            let b = w.bits;
+            for name in [
+                format!("qmm_dq_{b}bit"),
+                format!("qmm_{b}bit"),
+                format!("qmm_{b}bit_split"),
+            ] {
                 let mut times: Vec<f64> = (0..=runs)
                     .map(|_| {
                         gpu.run(|enc| {
                             for _ in 0..5 {
-                                qmm(&gpu, enc, &w, &x, &y, m, split);
+                                qmm_with(&gpu, enc, &w, &x, &y, m, &name);
                             }
                         })
                         .as_secs_f64()
@@ -1248,7 +1267,7 @@ mod mac {
                 times.sort_by(f64::total_cmp);
                 let flops = 2.0 * (m * w.rows * w.cols) as f64;
                 println!(
-                    "qmm {}x{} {}-bit, m {m}, split {split}: median {:.2} ms, {:.1} TFLOP/s ({runs} runs)",
+                    "{name} {}x{} {}-bit, m {m}: median {:.2} ms, {:.1} TFLOP/s ({runs} runs)",
                     w.rows,
                     w.cols,
                     w.bits,
