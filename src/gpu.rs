@@ -5,7 +5,9 @@
 
 pub const KERNELS: &str = concat!(
     include_str!("../kernels/basic.metal"),
+    include_str!("../kernels/quant.metal"),
     include_str!("../kernels/qmv.metal"),
+    include_str!("../kernels/moe.metal"),
 );
 
 #[cfg(target_os = "macos")]

@@ -3,6 +3,7 @@ pub mod config;
 pub mod convert;
 pub mod cpu;
 pub mod gpu;
+pub mod moe;
 pub mod qmv;
 pub mod quant;
 pub mod tokenizer;
