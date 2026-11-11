@@ -188,6 +188,10 @@ pub struct Cached<M: Restore> {
     tokens: Vec<u32>,
     snapshots: Snapshots<M::State>,
     every: usize,
+    /// A snapshot at a multiple of `every` is skipped when the piece before
+    /// or after it would be shorter than this: a short prefill call costs
+    /// about as much as a long one on the GPU.
+    min_piece: usize,
     /// The token that ends a message (<|im_end|>): prefill keeps an anchor
     /// snapshot after the first one.
     message_end: Option<u32>,
@@ -214,6 +218,7 @@ impl<M: Model + Restore> Cached<M> {
             tokens: Vec::new(),
             snapshots: Snapshots::new(limit),
             every: every.max(1),
+            min_piece: 0,
             message_end: None,
             rows: Vec::new(),
             backup: None,
@@ -226,6 +231,25 @@ impl<M: Model + Restore> Cached<M> {
     pub fn anchor_after(mut self, token: u32) -> Cached<M> {
         self.message_end = Some(token);
         self
+    }
+
+    /// Skips the snapshots at multiples of `every` that would cut a piece
+    /// shorter than `n` tokens off a prefill (see `min_piece`).
+    pub fn min_piece(mut self, n: usize) -> Cached<M> {
+        self.min_piece = n;
+        self
+    }
+
+    /// Where the piece of a prefill from token `at` ends: the next multiple
+    /// of `every`, `anchor` or `last`, whichever comes first, past the
+    /// multiples that would leave a piece shorter than `min_piece`.
+    fn piece_end(&self, at: usize, last: usize, anchor: Option<usize>) -> usize {
+        let end = anchor.filter(|&a| a > at).map_or(last, |a| a.min(last));
+        let mut stop = (at / self.every + 1) * self.every;
+        while stop < end && (stop - at < self.min_piece || end - stop < self.min_piece) {
+            stop += self.every;
+        }
+        stop.min(end)
     }
 
     /// Records that `tokens` went into the rows from `at`.
@@ -319,10 +343,7 @@ impl<M: Model + Restore> Model for Cached<M> {
             if !alive() {
                 return Err(start + done);
             }
-            let mut stop = (((start + done) / self.every + 1) * self.every).min(last);
-            if let Some(a) = anchor.filter(|&a| a > start + done) {
-                stop = stop.min(a);
-            }
+            let stop = self.piece_end(start + done, last, anchor);
             let chunk = &tokens[done..stop - start];
             self.write_rows(start + done, chunk);
             self.model.prefill(chunk);
@@ -606,6 +627,23 @@ mod tests {
         let held = c.tokens.clone();
         let keep = c.resume(&held, &prompt[..prompt.len() - 1]);
         (c.prefill(&prompt[keep..]), keep)
+    }
+
+    /// With min_piece 3, the multiples of 4 that leave a piece of 1 or 2
+    /// tokens get no snapshot; the end ones stay.
+    #[test]
+    fn min_piece_skips_short_cuts() {
+        let mut c = Cached::new(Toy::default(), 16, 4).min_piece(3);
+        c.prefill(&tokens(10, 0));
+        assert_eq!(c.snapshots().lengths(), vec![4, 9]);
+        c.step(5);
+        // From 11 (the state saved first) to 20: 12 would leave a piece of 1.
+        c.prefill(&tokens(10, 3));
+        assert_eq!(c.snapshots().lengths(), vec![4, 9, 11, 16, 20]);
+        let mut whole = tokens(10, 0);
+        whole.push(5);
+        whole.extend(tokens(10, 3));
+        assert_eq!(c.step(1), fresh(&[whole, vec![1]].concat()));
     }
 
     #[test]

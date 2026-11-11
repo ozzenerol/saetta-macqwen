@@ -399,7 +399,7 @@ fn serve_gpu(
     let served = load_gpu(config, weights, draft, memory)?;
     let snapshots = served.snapshots;
     let model = anchored(
-        Cached::new(served, snapshots, SNAPSHOT_EVERY),
+        Cached::new(served, snapshots, SNAPSHOT_EVERY).min_piece(PREFILL_CHUNK),
         &tokenizer,
     );
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
@@ -581,6 +581,9 @@ const PREFILL_CHUNK: usize = 2048;
 /// prefill, and each piece between two is one prefill call. Pieces of
 /// cache::DEFAULT_EVERY (1024) would run half chunks and pay the fixed cost
 /// of a call four times as often.
+/// A follow-up turn of 3k tokens that crosses a multiple of it runs in one
+/// call, not two: `Cached::min_piece` skips a snapshot that leaves a piece
+/// under PREFILL_CHUNK, which costs about as much as a full chunk.
 #[cfg(target_os = "macos")]
 const SNAPSHOT_EVERY: usize = 2 * PREFILL_CHUNK;
 
