@@ -44,6 +44,14 @@ impl KvCache {
         self.len == 0
     }
 
+    /// Keeps the first `len` tokens.
+    pub fn truncate(&mut self, len: usize) {
+        let width = self.keys.len() / self.len.max(1);
+        self.keys.truncate(len * width);
+        self.values.truncate(len * width);
+        self.len = self.len.min(len);
+    }
+
     /// `[len, kv_heads, head_dim]`
     pub fn keys(&self) -> &[f32] {
         &self.keys

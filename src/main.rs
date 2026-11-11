@@ -1,4 +1,6 @@
+use saetta::cache::{self, Cached, Restore};
 use saetta::config::{Config, LayerType};
+use saetta::cpu::deltanet::DeltaNetState;
 use saetta::cpu::model::{LayerState, Model};
 use saetta::sample::Params;
 use saetta::server::{self, Server, Settings};
@@ -97,7 +99,11 @@ fn serve(dir: &Path, port: u16) -> Result<(), Box<dyn Error>> {
         eos_token_ids: config.eos_token_ids.clone(),
     };
     let server = Arc::new(Server::new(
-        CpuModel { model, states },
+        Cached::new(
+            CpuModel { model, states },
+            cache::DEFAULT_LIMIT,
+            cache::DEFAULT_EVERY,
+        ),
         tokenizer,
         settings,
     )?);
@@ -143,13 +149,25 @@ impl server::Model for CpuModel {
         self.run(token)
     }
 
-    /// The recurrent state cannot go back yet; snapshots come later.
-    fn truncate(&mut self, _len: usize) -> bool {
-        false
+    /// `Cached` goes back through snapshots instead.
+    fn truncate(&mut self, _len: usize) -> usize {
+        0
     }
 
     fn reset(&mut self) {
         self.states = self.model.new_states();
+    }
+}
+
+impl Restore for CpuModel {
+    type State = Vec<DeltaNetState>;
+
+    fn save(&self) -> Self::State {
+        cache::save_cpu(&self.states)
+    }
+
+    fn restore(&mut self, state: &Self::State, len: usize) {
+        cache::restore_cpu(&mut self.states, state, len);
     }
 }
 

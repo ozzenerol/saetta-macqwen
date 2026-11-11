@@ -47,6 +47,7 @@ pub struct DeltaNetWeights<'a> {
 }
 
 /// What the layer keeps between tokens.
+#[derive(Clone)]
 pub struct DeltaNetState {
     /// The last `kernel - 1` conv inputs, oldest first, each `[conv_size]`.
     pub conv: Vec<f32>,

@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod chat;
 pub mod config;
 pub mod convert;

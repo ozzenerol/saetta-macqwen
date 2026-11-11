@@ -14,8 +14,8 @@ saetta keeps copies of the state at chosen points and goes back to the nearest o
 
 ## When to take one
 
-1. At the end of every prefill, at the prompt length.
-2. At the end of every generation, at the final length.
+1. At the end of every prefill, one token before the prompt length. The server always runs at least one token to get logits, so a retry of the same prompt goes back to length - 1 and reruns a single token.
+2. At the end of every generation, at the final length (saved when the next request starts).
 3. Every 1024 tokens inside a long prefill, so a change in the middle of a long prompt does not start from zero.
 
 ## Using them
@@ -26,11 +26,11 @@ For each request:
 2. Pick the newest snapshot at or before that length.
 3. Copy it back into the DeltaNet buffers, cut the KV length to the snapshot length, and prefill from there.
 
-`Model::truncate(len)` in `src/server.rs` is this step: it returns false when no snapshot fits, and the server then runs the whole prompt.
+`Cached` in `src/cache.rs` does this in `Model::truncate(len)`: it returns the length it went back to, and 0 when no snapshot fits, so the server then runs the whole prompt. A snapshot also has to match the tokens the model holds up to its length: the KV cache can only be cut, so a snapshot from another branch past the common prefix does not fit.
 
 ## Memory
 
-Snapshots live in GPU buffers. A limit of 16 (about 1 GB) is the default; the oldest goes first, except the one at the end of the last prompt. With qh, each turn adds the model's answer and a tool result to the end of the prompt, so rule 1 or 2 almost always gives a hit, and only the new tokens are read.
+Snapshots live in GPU buffers. A limit of 16 (about 1 GB) is the default; the least recently used goes first, except the one at the end of the last prompt. With qh, each turn adds the model's answer and a tool result to the end of the prompt, so rule 1 or 2 almost always gives a hit, and only the new tokens are read.
 
 ## Checks
 

@@ -24,9 +24,9 @@ pub trait Model: Send {
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32>;
     /// Runs one token and returns the logits after it.
     fn step(&mut self, token: u32) -> Vec<f32>;
-    /// Keeps the state after the first `len` tokens. Returns false when the
-    /// model cannot go back that far; the server then resets it.
-    fn truncate(&mut self, len: usize) -> bool;
+    /// Goes back to at most `len` tokens and returns how many the state
+    /// holds now. At 0 the server resets the model.
+    fn truncate(&mut self, len: usize) -> usize;
     fn reset(&mut self);
 }
 
@@ -306,9 +306,11 @@ impl<M: Model> Engine<M> {
             .count();
         // At least one token has to run to get logits.
         keep = keep.min(prompt.len().saturating_sub(1));
-        if keep < self.tokens.len() && !self.model.truncate(keep) {
-            self.model.reset();
-            keep = 0;
+        if keep < self.tokens.len() {
+            keep = self.model.truncate(keep);
+            if keep == 0 {
+                self.model.reset();
+            }
         }
         let logits = self.model.prefill(&prompt[keep..]);
         self.tokens = prompt.to_vec();

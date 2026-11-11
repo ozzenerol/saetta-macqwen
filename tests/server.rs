@@ -1,6 +1,8 @@
 //! Runs the server on a local port with a fake model that writes a fixed
 //! token script, and talks to it over HTTP.
 
+use saetta::cache::{Cached, Restore};
+use saetta::chat::{self, Message, Options};
 use saetta::sample::Params;
 use saetta::server::{Model, Server, Settings};
 use saetta::tokenizer::Tokenizer;
@@ -71,6 +73,7 @@ fn script(parts: &[Result<&str, u32>]) -> Vec<u32> {
 struct Log {
     prefills: Vec<usize>,
     resets: usize,
+    restores: Vec<usize>,
 }
 
 /// Writes `script` after every prefill, one token per step.
@@ -101,9 +104,9 @@ impl Model for Fake {
         self.at += 1;
         self.logits()
     }
-    fn truncate(&mut self, len: usize) -> bool {
+    fn truncate(&mut self, len: usize) -> usize {
         self.len = len;
-        true
+        len
     }
     fn reset(&mut self) {
         self.len = 0;
@@ -111,7 +114,21 @@ impl Model for Fake {
     }
 }
 
-fn start(script: Vec<u32>) -> (String, Arc<Mutex<Log>>) {
+/// The fake's only state is its length, which is enough to see where the
+/// cache goes back to.
+impl Restore for Fake {
+    type State = usize;
+    fn save(&self) -> usize {
+        self.len
+    }
+    fn restore(&mut self, state: &usize, len: usize) {
+        assert_eq!(*state, len);
+        self.len = len;
+        self.log.lock().unwrap().restores.push(len);
+    }
+}
+
+fn fake(script: Vec<u32>) -> (Fake, Arc<Mutex<Log>>) {
     let log = Arc::new(Mutex::new(Log::default()));
     let model = Fake {
         script,
@@ -119,6 +136,21 @@ fn start(script: Vec<u32>) -> (String, Arc<Mutex<Log>>) {
         len: 0,
         log: Arc::clone(&log),
     };
+    (model, log)
+}
+
+fn start(script: Vec<u32>) -> (String, Arc<Mutex<Log>>) {
+    let (model, log) = fake(script);
+    (serve(model), log)
+}
+
+/// The fake behind the prompt cache, with a snapshot every `every` tokens.
+fn start_cached(script: Vec<u32>, every: usize) -> (String, Arc<Mutex<Log>>) {
+    let (model, log) = fake(script);
+    (serve(Cached::new(model, 16, every)), log)
+}
+
+fn serve(model: impl Model + 'static) -> String {
     let settings = Settings {
         model_name: "fake".into(),
         sampling: Params {
@@ -133,7 +165,7 @@ fn start(script: Vec<u32>) -> (String, Arc<Mutex<Log>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     thread::spawn(move || server.serve(listener));
-    (addr, log)
+    addr
 }
 
 /// Sends one request and returns the status code and body.
@@ -343,4 +375,108 @@ fn keeps_cut_tool_call_as_text() {
     assert_eq!(choice["message"]["content"], "<tool_call>\n<functio");
     assert_eq!(choice["message"]["tool_calls"], Value::Null);
     assert_eq!(choice["finish_reason"], "length");
+}
+
+fn usage(body: &str) -> (u64, u64) {
+    let v: Value = serde_json::from_str(body).unwrap();
+    let u = &v["usage"];
+    (
+        u["prompt_tokens"].as_u64().unwrap(),
+        u["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap(),
+    )
+}
+
+/// A qh session of 10 tool steps: every request extends the last one, so the
+/// model reads each prompt token once and never goes back.
+#[test]
+fn tool_steps_read_each_token_once() {
+    let call = "\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n</function>\n";
+    let (addr, log) = start_cached(
+        script(&[
+            Ok("\n"),
+            Err(THINK_END),
+            Ok("\n\nReading.\n\n"),
+            Err(TOOL),
+            Ok(call),
+            Err(TOOL_END),
+        ]),
+        64,
+    );
+    let mut messages = vec![json!({"role": "user", "content": "Read main.go ten times."})];
+    let mut state_len = 0;
+    for step in 0..10 {
+        let (_, body) = post(
+            &addr,
+            json!({"messages": messages, "tools": read_tool(),
+                   "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true}}),
+        );
+        let (prompt, cached) = usage(&body);
+        assert_eq!(cached, state_len, "step {step}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let message = &v["choices"][0]["message"];
+        let completion = v["usage"]["completion_tokens"].as_u64().unwrap();
+        // The end token is sampled but never run.
+        state_len = prompt + completion - 1;
+        messages.push(json!({"role": "assistant", "content": message["content"],
+                             "tool_calls": message["tool_calls"]}));
+        messages.push(json!({"role": "tool", "content": format!("file contents {step}")}));
+    }
+    let log = log.lock().unwrap();
+    assert!(log.restores.is_empty());
+    assert_eq!(log.resets, 0);
+}
+
+/// An edit near the end of a long prompt goes back to the last snapshot
+/// before it, not to the start.
+#[test]
+fn edit_goes_back_to_a_snapshot() {
+    let (addr, log) = start_cached(script(&[Ok("ok")]), 64);
+    let long = "x ".repeat(200);
+    let ask = |last: &str| {
+        json!({"messages": [{"role": "user", "content": long}, {"role": "assistant", "content": "seen"},
+                            {"role": "user", "content": last}],
+               "chat_template_kwargs": {"enable_thinking": false}})
+    };
+    let tokens = |request: &Value| {
+        let messages: Vec<Message> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| Message::from_json(m).unwrap())
+            .collect();
+        let options = Options {
+            enable_thinking: false,
+            ..Options::default()
+        };
+        tokenizer().encode(&chat::render(&messages, &[], &options).unwrap())
+    };
+    let (first, second) = (
+        tokens(&ask("first question")),
+        tokens(&ask("second question")),
+    );
+    let common = first
+        .iter()
+        .zip(&second)
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(
+        common % 64 > 10,
+        "the test needs a snapshot well before the edit"
+    );
+
+    post(&addr, ask("first question"));
+    let (_, body) = post(&addr, ask("second question"));
+    let (_, cached) = usage(&body);
+    assert_eq!(cached as usize, common / 64 * 64);
+    let log = log.lock().unwrap();
+    assert_eq!(log.restores, vec![cached as usize]);
+    assert_eq!(log.resets, 0);
+
+    drop(log);
+    // The same prompt again reruns one token.
+    let (_, body) = post(&addr, ask("second question"));
+    let (prompt, cached) = usage(&body);
+    assert_eq!(cached, prompt - 1);
 }
