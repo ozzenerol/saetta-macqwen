@@ -9,10 +9,13 @@ use saetta::quant;
 use saetta::weights::Weights;
 use std::path::PathBuf;
 
+/// The aligned copy from `saetta convert` if it is there, else the MLX dir.
 fn model_dir() -> Option<PathBuf> {
-    let dir =
-        PathBuf::from(std::env::var("HOME").ok()?).join("llm/mlx-models/Qwen3.6-35B-A3B-5bit");
-    dir.exists().then_some(dir)
+    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    ["llm/saetta-models", "llm/mlx-models"]
+        .iter()
+        .map(|d| home.join(d).join("Qwen3.6-35B-A3B-5bit"))
+        .find(|d| d.exists())
 }
 
 /// A fixed input with mixed signs and sizes.
