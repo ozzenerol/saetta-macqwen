@@ -1326,16 +1326,17 @@ mod mac {
         }
 
         /// With the split kernels and the CPU rounding its KV cache to half
-        /// as well, the median token is within f32 rounding of the CPU (1e-6
-        /// to 1e-4 over the layers). The two round slightly different keys,
-        /// so now and then a key lands on the next half value, and a token
-        /// at a near tie of the router picks another expert (3e-3 for one
-        /// token at layer 20 of this prompt). So the median is bounded
-        /// tightly, the worst token and the states loosely.
+        /// as well, prefill is within f32 rounding of the CPU (1e-6 to 1e-4
+        /// up to layer 19 of this prompt). The two round slightly different
+        /// keys, so now and then a key lands on the next half value, and a
+        /// token at a near tie of the router picks another expert: 3e-3 for
+        /// one token at layer 20, which attention and the DeltaNet states
+        /// spread to the median token (3e-4 at layer 21). A layout or slot
+        /// bug is off by order 1, so the bounds still catch it.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 2e-4, 1e-2);
+            check_prefill(true, 1e-3, 1e-2);
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1517,9 +1518,9 @@ mod mac {
                     argmax(&want)
                 );
                 // Prefill and decode round slightly different keys to half,
-                // which can flip a near tie of the router (5e-3 on these
-                // tokens; 1e-6 with an f32 cache).
-                assert!(err < 2e-2);
+                // which can flip a near tie of the router (2e-3 to 3e-2 on
+                // these tokens; 1e-6 with an f32 cache). A bug is order 1.
+                assert!(err < 5e-2);
                 assert_eq!(argmax(&got), argmax(&want));
             }
         }
@@ -1559,7 +1560,7 @@ mod mac {
                     argmax(&want[i])
                 );
                 // As in decode_after_prefill_matches_gpu_model.
-                assert!(err < 2e-2);
+                assert!(err < 5e-2);
                 assert_eq!(v.argmax[i], argmax(&want[i]));
             }
             assert_eq!(v.argmax[0], argmax(got_row(logits, 0, cfg.vocab_size)));
@@ -1575,7 +1576,7 @@ mod mac {
             let got = spec.forward(tokens[25]);
             let err = rel_rms(&got, &want);
             println!("after restore of row 2: logits rel rms {err:.2e}");
-            assert!(err < 2e-2);
+            assert!(err < 5e-2);
             assert_eq!(argmax(&got), argmax(&want));
         }
 
