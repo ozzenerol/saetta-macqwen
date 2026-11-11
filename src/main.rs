@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta profile-prefill <model dir> <tokens> | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta profile-prefill <model dir> <tokens> | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -47,6 +47,40 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        #[cfg(target_os = "macos")]
+        ["bench-attention-prefill", ref contexts @ ..] => {
+            let parsed: Result<Vec<usize>, _> = contexts.iter().map(|c| c.parse()).collect();
+            match parsed {
+                Ok(c) if c.is_empty() => {
+                    report(saetta::attention_prefill::bench(&[32768, 118784], 2048, 10))
+                }
+                Ok(c) => report(saetta::attention_prefill::bench(&c, 2048, 10)),
+                Err(_) => {
+                    eprintln!("{USAGE}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        ["kernel-info", ref names @ ..] => {
+            // Compiles only; runs nothing on the GPU.
+            let gpu = match saetta::gpu::Gpu::new() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            for name in names {
+                let p = gpu.pipeline(name);
+                println!(
+                    "{name}: max {} threads per threadgroup, {} bytes static threadgroup memory",
+                    p.max_total_threads_per_threadgroup(),
+                    p.static_threadgroup_memory_length()
+                );
+            }
+            ExitCode::SUCCESS
+        }
         #[cfg(target_os = "macos")]
         ["bench-qmv", dir] => report(saetta::qmv::bench(Path::new(dir), 5, 20)),
         #[cfg(target_os = "macos")]
