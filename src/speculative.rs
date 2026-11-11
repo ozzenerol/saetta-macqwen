@@ -470,10 +470,9 @@ mod gpu {
 
     use super::{Decider, DraftLength, Stats};
     use crate::config::Config;
-    use crate::gpu::{Gpu, contents};
+    use crate::gpu::Gpu;
     use crate::gpu_model::GpuModel;
     use crate::gpu_mtp::GpuMtp;
-    use crate::prefill::Prefill;
     use crate::qmv::View;
     use crate::sample::Sampler;
     use crate::sample_gpu::{NO_DRAFT, slot, supports};
@@ -498,8 +497,8 @@ mod gpu {
     }
 
     impl<'a> GpuSpec<'a> {
-        /// Drafts up to `k` tokens per round, as many as pays. `prefill`
-        /// checks them and needs `enable_verify` for `k + 1` rows.
+        /// Drafts up to `k` tokens per round, as many as pays. The model
+        /// checks them and needs `enable_verify(k + 1)`.
         pub fn new(model: &GpuModel<'a>, mtp: GpuMtp<'a>, cfg: &Config, k: usize) -> GpuSpec<'a> {
             let gpu = model.gpu();
             let hidden = cfg.hidden_size;
@@ -640,7 +639,6 @@ mod gpu {
         pub fn speculate(
             &mut self,
             model: &mut GpuModel<'a>,
-            prefill: &Prefill,
             pending: u32,
             decide: &mut dyn Decider,
         ) -> (Vec<u32>, u32) {
@@ -650,14 +648,9 @@ mod gpu {
             let (drafts, next) = if k == 0 {
                 self.plain(model, pending, decide)
             } else {
-                self.round(model, prefill, pending, decide, k)
+                self.round(model, pending, decide, k)
             };
             let seconds = start.elapsed().as_secs_f64();
-            eprintln!(
-                "ROUND k {k} ctx {context} accepted {} {:.1} ms",
-                drafts.len(),
-                seconds * 1e3
-            );
             self.length.record(context, k, drafts.len(), seconds);
             self.lengths[k] += 1;
             (drafts, next)
@@ -686,12 +679,10 @@ mod gpu {
         fn round(
             &mut self,
             model: &mut GpuModel<'a>,
-            prefill: &Prefill,
             pending: u32,
             decide: &mut dyn Decider,
             k: usize,
         ) -> (Vec<u32>, u32) {
-            let vocab = self.vocab;
             let base = model.position();
             let mark = self.mtp.len();
 
@@ -708,11 +699,12 @@ mod gpu {
                 .chain(drafts.iter().copied())
                 .collect();
             // At temperature > 0 the GPU sampler applies the rejection rule
-            // to each row, in the verify's command buffer.
+            // to each row inside the verify, reading the drafts from its
+            // ring.
             let on_gpu = match decide.sampling() {
                 Some((p, sampler)) if p.temperature > 0.0 && supports(&p) => {
                     let s = model.sampler();
-                    s.set(vocab, &p, false);
+                    s.set(self.vocab, &p, false);
                     s.seed(sampler.state());
                     for (i, &d) in drafts.iter().enumerate() {
                         s.set_draft(base + i + 1, d);
@@ -722,14 +714,9 @@ mod gpu {
                 }
                 _ => false,
             };
-            let states: Vec<_> = model.states().collect();
-            let sampler = on_gpu.then(|| model.sampler());
-            let v = prefill.verify(self.gpu, &tokens, base, &states, sampler);
-            let row = |i: usize| {
-                let at = v.logits.offset as usize / 4 + i * vocab;
-                &contents::<f32>(&v.logits.buffer, at + vocab)[at..]
-            };
-
+            // One verify of all rows; the states move on by all of them
+            // until `accept`.
+            let argmax = model.verify(&tokens);
             let (accepted, next) = if on_gpu {
                 let s = model.sampler();
                 let ring = s.read();
@@ -746,9 +733,9 @@ mod gpu {
                 let mut next = None;
                 for (i, &d) in drafts.iter().enumerate() {
                     let verdict = if decide.greedy() {
-                        (v.argmax[i] != d).then_some(v.argmax[i])
+                        (argmax[i] != d).then_some(argmax[i])
                     } else {
-                        decide.check(row(i), d)
+                        decide.check(&model.verify_logits(i), d)
                     };
                     match verdict {
                         None => accepted += 1,
@@ -760,25 +747,21 @@ mod gpu {
                 }
                 let next = next.unwrap_or_else(|| {
                     if decide.greedy() {
-                        v.argmax[k]
+                        argmax[k]
                     } else {
-                        decide.pick(row(k))
+                        decide.pick(&model.verify_logits(k))
                     }
                 });
                 (accepted, next)
             };
+            model.accept(accepted + 1);
 
-            if accepted < k {
-                prefill.restore(self.gpu, accepted, &states);
-            }
-            drop(states);
-            model.set_position(base + accepted + 1);
             self.mtp.truncate(mark + 1);
             self.mtp_positions.truncate(mark + 1);
             for (i, &d) in drafts[..accepted].iter().enumerate() {
-                self.mtp_record(&v.hidden_row(i), base + i, d);
+                self.mtp_record(&model.verify_hidden(i), base + i, d);
             }
-            copy(&v.hidden_row(accepted), &self.last, self.hidden);
+            copy(&model.verify_hidden(accepted), &self.last, self.hidden);
 
             self.stats.rounds += 1;
             self.stats.drafted += k;
@@ -826,6 +809,79 @@ mod gpu_real {
     use std::time::Instant;
 
     const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
+
+    /// The top two logits of plain GPU greedy decode around the first
+    /// character where plain and --draft output differ. SAETTA_MARGIN names a
+    /// JSON file with "system", "user" and "prefix" (the answer up to the
+    /// first differing character), as tools/context_bench.py --margin writes.
+    #[test]
+    #[ignore = "needs the model on the Mac"]
+    fn margin_at_first_difference() {
+        let file = std::env::var("SAETTA_MARGIN").expect("SAETTA_MARGIN=<json>");
+        let case: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        let text = |k: &str| case[k].as_str().unwrap().to_string();
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+        let cfg = Config::load(&dir).unwrap();
+        let weights = Weights::open(&dir).unwrap();
+        let tok = Tokenizer::load(&dir).unwrap();
+        let gpu = Gpu::new().unwrap();
+        let message = |role: &str, content: String| Message {
+            role: role.into(),
+            content,
+            ..Message::default()
+        };
+        let opts = chat::Options {
+            enable_thinking: false,
+            ..chat::Options::default()
+        };
+        let messages = [
+            message("system", text("system")),
+            message("user", text("user")),
+        ];
+        let mut tokens = tok.encode(&chat::render(&messages, &[], &opts).unwrap());
+        let prefix = tok.encode(&text("prefix"));
+        // The last prefix token may be cut mid-word; decode from before it.
+        tokens.extend(&prefix[..prefix.len().saturating_sub(1)]);
+        let (&last, prompt) = tokens.split_last().unwrap();
+
+        let capacity = (tokens.len() + 64).next_multiple_of(128);
+        let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity).unwrap();
+        let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
+        prefill.exact = crate::prefill::exact_from_env();
+        for piece in prompt.chunks(1024) {
+            let pos = model.position();
+            let states: Vec<_> = model.states().collect();
+            prefill.run(&gpu, piece, pos, &states);
+            drop(states);
+            model.set_position(pos + piece.len());
+        }
+        let mut logits = model.forward(last);
+        println!(
+            "{} tokens of context; greedy steps from the prefix:",
+            tokens.len()
+        );
+        for _ in 0..6 {
+            let mut top: Vec<(u32, f32)> = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, l)| (i as u32, l))
+                .collect();
+            top.select_nth_unstable_by(1, |a, b| b.1.total_cmp(&a.1));
+            top.truncate(2);
+            top.sort_by(|a, b| b.1.total_cmp(&a.1));
+            println!(
+                "  {:?} {:.5} vs {:?} {:.5}: gap {:.2e}",
+                tok.decode(&[top[0].0]),
+                top[0].1,
+                tok.decode(&[top[1].0]),
+                top[1].1,
+                top[0].1 - top[1].1
+            );
+            logits = model.forward(top[0].0);
+        }
+    }
 
     /// The two best logits' gap.
     fn top2_gap(logits: &[f32]) -> f32 {
@@ -891,10 +947,8 @@ mod gpu_real {
 
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 1024).unwrap();
             let mtp = GpuMtp::load(&gpu, &cfg, &weights, 1024).unwrap();
+            model.enable_verify(4);
             let mut spec = GpuSpec::new(&model, mtp, &cfg, 3);
-            let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 64).unwrap();
-            prefill.exact = true;
-            prefill.enable_verify(&gpu, 4);
             let mut rows = Vec::with_capacity(prompt.len() * h);
             let mut logits = Vec::new();
             for &t in &prompt {
@@ -907,7 +961,7 @@ mod gpu_real {
             let start = Instant::now();
             while got.len() < count {
                 got.push(pending);
-                let (accepted, next) = spec.speculate(&mut model, &prefill, pending, &mut Greedy);
+                let (accepted, next) = spec.speculate(&mut model, pending, &mut Greedy);
                 got.extend(accepted);
                 pending = next;
             }

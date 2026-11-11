@@ -153,7 +153,8 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
 #[derive(Clone, Copy)]
 struct ServeFlags {
     gpu: bool,
-    /// Tokens the MTP layer drafts per round; 0 turns drafting off.
+    /// Tokens the MTP layer drafts per round; 0 turns drafting off. With
+    /// `--gpu` it is 3 unless `--draft` says otherwise.
     draft: usize,
     port: u16,
     exact_history: bool,
@@ -182,6 +183,7 @@ impl Default for Memory {
 
 /// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
+    let mut draft = None;
     let mut f = ServeFlags {
         gpu: false,
         draft: 0,
@@ -195,12 +197,13 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             "--gpu" => f.gpu = true,
             "--draft" => {
                 let value = it.next().ok_or("--draft needs a number")?;
-                f.draft = value
+                let k: usize = value
                     .parse()
                     .map_err(|_| format!("bad draft count {value}"))?;
-                if f.draft > 7 {
+                if k > 7 {
                     return Err("--draft takes 0 to 7".into());
                 }
+                draft = Some(k);
             }
             "--exact-history" => f.exact_history = true,
             "--context" => {
@@ -226,9 +229,12 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
-    if f.draft > 0 && !f.gpu {
-        return Err("--draft needs --gpu".into());
-    }
+    f.draft = match draft {
+        Some(k) if k > 0 && !f.gpu => return Err("--draft needs --gpu".into()),
+        Some(k) => k,
+        None if f.gpu => 3,
+        None => 0,
+    };
     Ok(f)
 }
 
@@ -342,7 +348,7 @@ fn load_gpu(
 ) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let context = memory.context;
-    let model =
+    let mut model =
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), context)?;
     let layers = model.deltanet_states();
     let snapshot: usize = layers
@@ -355,7 +361,7 @@ fn load_gpu(
     let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
     prefill.exact = exact_prefill();
     if draft > 0 {
-        prefill.enable_verify(gpu, draft + 1);
+        model.enable_verify(draft + 1);
     }
     let spec = if draft > 0 {
         let mtp = saetta::gpu_mtp::GpuMtp::load(gpu, config, weights, context)?;
@@ -539,15 +545,10 @@ impl server::Model for GpuServed {
             let logits = match &mut self.drafting {
                 None => self.prefill.run(m.gpu(), tokens, pos, &states),
                 Some(d) => {
-                    // The same work as `run`, keeping the hidden states of the
-                    // last tokens for the MTP cache.
-                    let gpu = m.gpu();
+                    // `run`, keeping the hidden states of the last tokens for
+                    // the MTP cache.
                     let n = tokens.len();
-                    let x = self.prefill.embed(gpu, tokens);
-                    for (l, state) in states.iter().enumerate() {
-                        self.prefill.layer(gpu, l, &x, n, pos, state);
-                    }
-                    let logits = self.prefill.logits(gpu, &x, n);
+                    let (logits, x) = self.prefill.run_hidden(m.gpu(), tokens, pos, &states);
                     let h = d.norm.len();
                     let first = n.saturating_sub(MTP_WINDOW + 1);
                     let mut rows = saetta::gpu::contents::<f32>(&x, n * h)[first * h..].to_vec();
@@ -585,9 +586,7 @@ impl server::Model for GpuServed {
         decide: &mut dyn saetta::speculative::Decider,
     ) -> (Vec<u32>, u32) {
         match &mut self.drafting {
-            Some(d) => d
-                .spec
-                .speculate(&mut self.model, &self.prefill, pending, decide),
+            Some(d) => d.spec.speculate(&mut self.model, pending, decide),
             None => match decide.sampling() {
                 Some((p, sampler)) if saetta::sample_gpu::supports(&p) => {
                     (Vec::new(), self.model.run_sampled(pending, &p, sampler))
@@ -877,5 +876,22 @@ fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_flags;
+
+    #[test]
+    fn draft_defaults_to_3_on_the_gpu() {
+        let draft = |flags: &[&str]| serve_flags(flags).map(|f| f.draft);
+        assert_eq!(draft(&["--gpu"]), Ok(3));
+        assert_eq!(draft(&["--gpu", "--draft", "0"]), Ok(0));
+        assert_eq!(draft(&["--draft", "5", "--gpu"]), Ok(5));
+        assert_eq!(draft(&[]), Ok(0));
+        assert_eq!(draft(&["--draft", "0"]), Ok(0));
+        assert!(draft(&["--draft", "2"]).is_err());
+        assert!(draft(&["--gpu", "--draft", "8"]).is_err());
     }
 }
