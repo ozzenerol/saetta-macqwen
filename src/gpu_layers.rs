@@ -1,7 +1,8 @@
 //! The attention and Gated DeltaNet layers and RMSNorm on the GPU
-//! (`kernels/layers.metal`), for one token. Each `encode` only adds
-//! dispatches to the caller's encoder, so a whole token can go in one
-//! command buffer. Projections use `GpuQuant` from `qmv.rs`.
+//! (`kernels/layers.metal`), for one token. Each `record` adds its
+//! dispatches to a `Plan` once; the plan then runs for every token, with the
+//! position taken from the plan's `TokenParams`. Projections use `GpuQuant`
+//! from `qmv.rs`.
 
 #[cfg(target_os = "macos")]
 pub use mac::*;
@@ -13,9 +14,10 @@ mod mac {
     use crate::cpu::deltanet::DeltaNetConfig;
     use crate::cpu::model::{attention_config, deltanet_config};
     use crate::gpu::Gpu;
+    use crate::plan::Plan;
     use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
-    use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+    use metal::{Buffer, MTLSize};
 
     /// A view `floats` values into `buffer`.
     fn at(buffer: &Buffer, floats: usize) -> View {
@@ -25,17 +27,16 @@ mod mac {
         }
     }
 
-    fn bind(enc: &ComputeCommandEncoderRef, views: &[&View]) {
-        for (i, v) in views.iter().enumerate() {
-            enc.set_buffer(i as u64, Some(&v.buffer), v.offset);
-        }
+    fn whole(buffer: &Buffer) -> View {
+        View::new(buffer.clone())
     }
 
-    fn params<T>(enc: &ComputeCommandEncoderRef, index: u64, p: &T) {
-        enc.set_bytes(index, size_of::<T>() as u64, (p as *const T).cast());
+    fn size(x: usize, y: usize) -> MTLSize {
+        MTLSize::new(x as u64, y as u64, 1)
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct NormParams {
         dim: u32,
         in_stride: u32,
@@ -74,13 +75,8 @@ mod mac {
         }
 
         /// `out = rms_norm(x)` as configured. `out` may be `x`.
-        pub fn encode(&self, gpu: &Gpu, enc: &ComputeCommandEncoderRef, x: &View, out: &View) {
-            enc.set_compute_pipeline_state(&gpu.pipeline("rms_norm"));
-            bind(
-                enc,
-                &[x, self.weight.unwrap_or(x), self.gate.unwrap_or(x), out],
-            );
-            let p = NormParams {
+        pub fn record(&self, plan: &mut Plan, x: &View, out: &View, parallel: bool) {
+            let p = plan.constant(&[NormParams {
                 dim: self.dim as u32,
                 in_stride: self.in_stride as u32,
                 out_stride: self.out_stride as u32,
@@ -88,45 +84,41 @@ mod mac {
                 scale: self.scale,
                 weighted: self.weight.is_some() as u32,
                 gated: self.gate.is_some() as u32,
-            };
-            params(enc, 4, &p);
-            let threads = self.dim.next_multiple_of(32).min(256) as u64;
-            enc.dispatch_thread_groups(
-                MTLSize::new(self.rows as u64, 1, 1),
-                MTLSize::new(threads, 1, 1),
-            );
+            }]);
+            let buffers = [x, self.weight.unwrap_or(x), self.gate.unwrap_or(x), out, &p];
+            let threads = self.dim.next_multiple_of(32).min(256);
+            let (grid, group) = (size(self.rows, 1), size(threads, 1));
+            if parallel {
+                plan.op_parallel("rms_norm", &buffers, grid, group);
+            } else {
+                plan.op("rms_norm", &buffers, grid, group);
+            }
         }
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct RopeParams {
         stride: u32,
         half_dims: u32,
-        pos: u32,
         log2_theta: f32,
     }
 
-    fn rope(
-        gpu: &Gpu,
-        enc: &ComputeCommandEncoderRef,
-        x: &View,
-        rows: usize,
-        cfg: &AttentionConfig,
-        pos: usize,
-    ) {
-        enc.set_compute_pipeline_state(&gpu.pipeline("rope"));
-        bind(enc, &[x]);
+    /// RoPE in place on `rows` heads of `x` at the token's position.
+    fn rope(plan: &mut Plan, x: &View, rows: usize, cfg: &AttentionConfig) {
         let half = cfg.rope_dims / 2;
-        let p = RopeParams {
+        let p = plan.constant(&[RopeParams {
             stride: cfg.head_dim as u32,
             half_dims: half as u32,
-            pos: pos as u32,
             log2_theta: cfg.rope_theta.log2(),
-        };
-        params(enc, 1, &p);
-        enc.dispatch_threads(
-            MTLSize::new(half as u64, rows as u64, 1),
-            MTLSize::new(half.min(64) as u64, 1, 1),
+        }]);
+        let params = plan.params.clone();
+        let group = half.min(64);
+        plan.op(
+            "rope",
+            &[x, &p, &params],
+            size(half.div_ceil(group), rows),
+            size(group, 1),
         );
     }
 
@@ -147,13 +139,13 @@ mod mac {
     }
 
     /// The keys (after norm and rope) and values on the GPU, each token
-    /// `[kv_heads * head_dim]`, room for `capacity` tokens.
+    /// `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p` goes in
+    /// slot `p`.
     pub struct GpuKvCache {
         pub keys: Buffer,
         pub values: Buffer,
         scores: Buffer,
         pub capacity: usize,
-        pub len: usize,
     }
 
     impl GpuKvCache {
@@ -164,17 +156,16 @@ mod mac {
                 values: gpu.buffer(capacity * token),
                 scores: gpu.buffer(cfg.heads * capacity * 4),
                 capacity,
-                len: 0,
             }
         }
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct AttentionParams {
         heads: u32,
         kv_heads: u32,
         dim: u32,
-        len: u32,
         capacity: u32,
         scale: f32,
     }
@@ -190,6 +181,8 @@ mod mac {
         k_norm: View,
         q_and_gate: Buffer,
         q: Buffer,
+        k: Buffer,
+        v: Buffer,
         out: Buffer,
     }
 
@@ -203,75 +196,71 @@ mod mac {
         ) -> Result<GpuAttention<'a>, String> {
             let a = attention_config(cfg);
             let size = a.heads * a.head_dim;
+            let kv = a.kv_heads * a.head_dim;
+            let m = |n: &str| matrix(gpu, weights, cfg, &format!("{prefix}.self_attn.{n}"));
             Ok(GpuAttention {
-                q_proj: matrix(gpu, weights, cfg, &format!("{prefix}.self_attn.q_proj"))?,
-                k_proj: matrix(gpu, weights, cfg, &format!("{prefix}.self_attn.k_proj"))?,
-                v_proj: matrix(gpu, weights, cfg, &format!("{prefix}.self_attn.v_proj"))?,
-                o_proj: matrix(gpu, weights, cfg, &format!("{prefix}.self_attn.o_proj"))?,
+                q_proj: m("q_proj")?,
+                k_proj: m("k_proj")?,
+                v_proj: m("v_proj")?,
+                o_proj: m("o_proj")?,
                 q_norm: vector(gpu, weights, &format!("{prefix}.self_attn.q_norm.weight"))?,
                 k_norm: vector(gpu, weights, &format!("{prefix}.self_attn.k_norm.weight"))?,
                 q_and_gate: gpu.buffer(2 * size * 4),
                 q: gpu.buffer(size * 4),
+                k: gpu.buffer(kv * 4),
+                v: gpu.buffer(kv * 4),
                 out: gpu.buffer(size * 4),
                 cfg: a,
             })
         }
 
-        /// Encodes one token: `x` is the normed hidden state, `out` gets the
-        /// layer output. Appends the token to `cache`.
-        pub fn encode(
-            &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
-            x: &View,
-            out: &View,
-            cache: &mut GpuKvCache,
-        ) {
+        /// Records one token: `x` is the normed hidden state, `out` gets the
+        /// layer output, and the token's key and value go into `cache` at
+        /// its position.
+        pub fn record(&self, plan: &mut Plan, x: &View, out: &View, cache: &GpuKvCache) {
             let c = &self.cfg;
-            let (d, pos) = (c.head_dim, cache.len);
-            assert!(pos < cache.capacity, "KV cache is full");
-            let slot = pos * c.kv_heads * d;
-            let q_and_gate = View::new(self.q_and_gate.clone());
-            let q = View::new(self.q.clone());
-            let key = at(&cache.keys, slot);
+            let d = c.head_dim;
+            let kv_size = c.kv_heads * d;
+            let [q_and_gate, q, k, v, attn] =
+                [&self.q_and_gate, &self.q, &self.k, &self.v, &self.out].map(whole);
 
-            self.q_proj.encode(gpu, enc, x, &q_and_gate);
-            self.k_proj.encode(gpu, enc, x, &key);
-            self.v_proj.encode(gpu, enc, x, &at(&cache.values, slot));
+            self.q_proj.record(plan, x, &q_and_gate, false);
+            self.k_proj.record(plan, x, &k, true);
+            self.v_proj.record(plan, x, &v, true);
 
             let mut norm = Norm::rows(c.heads, d, c.eps, &self.q_norm);
             norm.in_stride = 2 * d;
-            norm.encode(gpu, enc, &q_and_gate, &q);
-            rope(gpu, enc, &q, c.heads, c, pos);
-            Norm::rows(c.kv_heads, d, c.eps, &self.k_norm).encode(gpu, enc, &key, &key);
-            rope(gpu, enc, &key, c.kv_heads, c, pos);
+            norm.record(plan, &q_and_gate, &q, false);
+            rope(plan, &q, c.heads, c);
+            Norm::rows(c.kv_heads, d, c.eps, &self.k_norm).record(plan, &k, &k, false);
+            rope(plan, &k, c.kv_heads, c);
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("attention"));
-            let attn = View::new(self.out.clone());
-            bind(
-                enc,
-                &[
-                    &q,
-                    &View::new(cache.keys.clone()),
-                    &View::new(cache.values.clone()),
-                    &q_and_gate,
-                    &attn,
-                    &View::new(cache.scores.clone()),
-                ],
+            let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+            let n = plan.constant(&[kv_size as u32]);
+            let params = plan.params.clone();
+            plan.op(
+                "kv_store",
+                &[&k, &v, &keys, &values, &n, &params],
+                size(kv_size.div_ceil(256), 1),
+                size(256, 1),
             );
-            let p = AttentionParams {
+
+            let p = plan.constant(&[AttentionParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
                 dim: d as u32,
-                len: (pos + 1) as u32,
                 capacity: cache.capacity as u32,
                 scale: 1.0 / (d as f32).sqrt(),
-            };
-            params(enc, 6, &p);
-            enc.dispatch_thread_groups(MTLSize::new(c.heads as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }]);
+            let scores = whole(&cache.scores);
+            plan.op(
+                "attention",
+                &[&q, &keys, &values, &q_and_gate, &attn, &scores, &p, &params],
+                size(c.heads, 1),
+                size(256, 1),
+            );
 
-            self.o_proj.encode(gpu, enc, &attn, out);
-            cache.len += 1;
+            self.o_proj.record(plan, &attn, out, false);
         }
     }
 
@@ -294,12 +283,14 @@ mod mac {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct ConvParams {
         channels: u32,
         kernel_size: u32,
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct DeltaParams {
         k_heads: u32,
         v_heads: u32,
@@ -339,16 +330,18 @@ mod mac {
             let p = format!("{prefix}.linear_attn");
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
             let values = c.v_heads * c.v_dim;
+            let m = |n: &str| matrix(gpu, weights, cfg, &format!("{p}.{n}"));
+            let v = |n: &str| vector(gpu, weights, &format!("{p}.{n}"));
             Ok(GpuDeltaNet {
-                in_proj_qkv: matrix(gpu, weights, cfg, &format!("{p}.in_proj_qkv"))?,
-                in_proj_z: matrix(gpu, weights, cfg, &format!("{p}.in_proj_z"))?,
-                in_proj_b: matrix(gpu, weights, cfg, &format!("{p}.in_proj_b"))?,
-                in_proj_a: matrix(gpu, weights, cfg, &format!("{p}.in_proj_a"))?,
-                out_proj: matrix(gpu, weights, cfg, &format!("{p}.out_proj"))?,
-                conv1d: vector(gpu, weights, &format!("{p}.conv1d.weight"))?,
-                a_log: vector(gpu, weights, &format!("{p}.A_log"))?,
-                dt_bias: vector(gpu, weights, &format!("{p}.dt_bias"))?,
-                norm: vector(gpu, weights, &format!("{p}.norm.weight"))?,
+                in_proj_qkv: m("in_proj_qkv")?,
+                in_proj_z: m("in_proj_z")?,
+                in_proj_b: m("in_proj_b")?,
+                in_proj_a: m("in_proj_a")?,
+                out_proj: m("out_proj")?,
+                conv1d: v("conv1d.weight")?,
+                a_log: v("A_log")?,
+                dt_bias: v("dt_bias")?,
+                norm: v("norm.weight")?,
                 qkv: gpu.buffer(channels * 4),
                 mixed: gpu.buffer(channels * 4),
                 z: gpu.buffer(values * 4),
@@ -359,39 +352,30 @@ mod mac {
             })
         }
 
-        /// Encodes one token: `x` is the normed hidden state, `out` gets the
+        /// Records one token: `x` is the normed hidden state, `out` gets the
         /// layer output, `state` is updated.
-        pub fn encode(
-            &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
-            x: &View,
-            out: &View,
-            state: &GpuDeltaNetState,
-        ) {
+        pub fn record(&self, plan: &mut Plan, x: &View, out: &View, state: &GpuDeltaNetState) {
             let c = &self.cfg;
             let key_size = c.k_heads * c.k_dim;
             let channels = 2 * key_size + c.v_heads * c.v_dim;
             let [qkv, mixed, z, a, b, y] =
-                [&self.qkv, &self.mixed, &self.z, &self.a, &self.b, &self.y]
-                    .map(|buf| View::new(buf.clone()));
+                [&self.qkv, &self.mixed, &self.z, &self.a, &self.b, &self.y].map(whole);
 
-            self.in_proj_qkv.encode(gpu, enc, x, &qkv);
-            self.in_proj_z.encode(gpu, enc, x, &z);
-            self.in_proj_b.encode(gpu, enc, x, &b);
-            self.in_proj_a.encode(gpu, enc, x, &a);
+            self.in_proj_qkv.record(plan, x, &qkv, false);
+            self.in_proj_z.record(plan, x, &z, true);
+            self.in_proj_b.record(plan, x, &b, true);
+            self.in_proj_a.record(plan, x, &a, true);
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("deltanet_conv"));
-            bind(
-                enc,
-                &[&qkv, &self.conv1d, &View::new(state.conv.clone()), &mixed],
-            );
-            let p = ConvParams {
+            let p = plan.constant(&[ConvParams {
                 channels: channels as u32,
                 kernel_size: c.kernel as u32,
-            };
-            params(enc, 4, &p);
-            enc.dispatch_threads(MTLSize::new(channels as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }]);
+            plan.op(
+                "deltanet_conv",
+                &[&qkv, &self.conv1d, &whole(&state.conv), &mixed, &p],
+                size(channels.div_ceil(256), 1),
+                size(256, 1),
+            );
 
             // normalize_qk in MLX: rms_norm with eps / k_dim, then q scaled
             // by 1 / k_dim and k by 1 / sqrt(k_dim).
@@ -410,12 +394,18 @@ mod mac {
                 weight: None,
                 gate: None,
             };
-            l2(1.0 / c.k_dim as f32).encode(gpu, enc, &q, &q);
-            l2(1.0 / (c.k_dim as f32).sqrt()).encode(gpu, enc, &k, &k);
+            l2(1.0 / c.k_dim as f32).record(plan, &q, &q, false);
+            l2(1.0 / (c.k_dim as f32).sqrt()).record(plan, &k, &k, true);
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("delta_rule"));
-            bind(
-                enc,
+            let p = plan.constant(&[DeltaParams {
+                k_heads: c.k_heads as u32,
+                v_heads: c.v_heads as u32,
+                k_dim: c.k_dim as u32,
+                v_dim: c.v_dim as u32,
+            }]);
+            let rows = c.v_heads * c.v_dim;
+            plan.op(
+                "delta_rule",
                 &[
                     &q,
                     &k,
@@ -424,33 +414,27 @@ mod mac {
                     &b,
                     &self.a_log,
                     &self.dt_bias,
-                    &View::new(state.recurrent.clone()),
+                    &whole(&state.recurrent),
                     &y,
+                    &p,
                 ],
-            );
-            let p = DeltaParams {
-                k_heads: c.k_heads as u32,
-                v_heads: c.v_heads as u32,
-                k_dim: c.k_dim as u32,
-                v_dim: c.v_dim as u32,
-            };
-            params(enc, 9, &p);
-            enc.dispatch_threads(
-                MTLSize::new((c.v_heads * c.v_dim) as u64, 1, 1),
-                MTLSize::new(128, 1, 1),
+                size(rows.div_ceil(128), 1),
+                size(128, 1),
             );
 
             let mut gated = Norm::rows(c.v_heads, c.v_dim, c.eps, &self.norm);
             gated.gate = Some(&z);
-            gated.encode(gpu, enc, &y, &y);
+            gated.record(plan, &y, &y, false);
 
-            self.out_proj.encode(gpu, enc, &y, out);
+            self.out_proj.record(plan, &y, out, false);
         }
     }
 
     #[cfg(test)]
     mod tests {
-        //! Each GPU layer against the CPU layer on real weights:
+        //! Each GPU layer against the CPU layer on real weights, run both
+        //! from a serial encoder and replayed from the indirect command
+        //! buffer, which must agree bit for bit:
         //!   scripts/mac.sh test --release --lib gpu_layers -- --ignored --nocapture
 
         use super::*;
@@ -459,6 +443,7 @@ mod mac {
         use crate::cpu::matrix::Matrix;
         use crate::cpu::ops::rms_norm;
         use crate::gpu::contents;
+        use crate::plan::TokenParams;
         use std::path::PathBuf;
 
         const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
@@ -476,12 +461,24 @@ mod mac {
             let mut x: Vec<f32> = (0..2048)
                 .map(|i| ((i * 37 + t * 101) as f32 * 0.013).sin())
                 .collect();
-            let w = weights
-                .tensor(&format!("{prefix}.input_layernorm.weight"))
-                .unwrap()
-                .to_f32();
-            rms_norm(&mut x, &w, eps);
+            let name = format!("{prefix}.input_layernorm.weight");
+            rms_norm(&mut x, &weights.tensor(&name).unwrap().to_f32(), eps);
             x
+        }
+
+        fn write(buffer: &Buffer, data: &[f32]) {
+            assert!(size_of_val(data) <= buffer.length() as usize);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    buffer.contents() as *mut f32,
+                    data.len(),
+                )
+            };
+        }
+
+        fn read(buffer: &Buffer, n: usize) -> Vec<f32> {
+            contents::<f32>(buffer, n).to_vec()
         }
 
         fn rel_rms(got: &[f32], want: &[f32]) -> f32 {
@@ -489,6 +486,10 @@ mod mac {
             let err: f32 = got.iter().zip(want).map(|(g, w)| (g - w) * (g - w)).sum();
             let norm: f32 = want.iter().map(|w| w * w).sum();
             (err / norm).sqrt()
+        }
+
+        fn bits(x: &[f32]) -> Vec<u32> {
+            x.iter().map(|v| v.to_bits()).collect()
         }
 
         fn quant<'a>(weights: &'a Weights, cfg: &Config, module: &str) -> Matrix<'a> {
@@ -514,8 +515,13 @@ mod mac {
                 View::new(gpu.buffer_from(&w)),
                 View::new(gpu.buffer(x.len() * 4)),
             );
-            gpu.run(|enc| Norm::rows(2, 2048, cfg.rms_norm_eps, &wv).encode(&gpu, enc, &xv, &out));
-            let err = rel_rms(contents::<f32>(&out.buffer, x.len()), &want);
+            let mut plan = Plan::new(&gpu);
+            Norm::rows(2, 2048, cfg.rms_norm_eps, &wv).record(&mut plan, &xv, &out, false);
+            plan.run_serial();
+            let serial = read(&out.buffer, x.len());
+            plan.build().run(&gpu);
+            assert_eq!(bits(&serial), bits(&read(&out.buffer, x.len())));
+            let err = rel_rms(&serial, &want);
             println!("rms_norm: rel rms {err:.2e}");
             assert!(err < BOUND);
         }
@@ -526,8 +532,18 @@ mod mac {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let prefix = "language_model.model.layers.0";
-            let gpu_layer = GpuDeltaNet::load(&gpu, &cfg, &weights, prefix).unwrap();
-            let gpu_state = GpuDeltaNetState::new(&gpu, &gpu_layer.cfg);
+            let layer = GpuDeltaNet::load(&gpu, &cfg, &weights, prefix).unwrap();
+            let x = View::new(gpu.buffer(cfg.hidden_size * 4));
+            let mut runs = Vec::new();
+            for _ in 0..2 {
+                let state = GpuDeltaNetState::new(&gpu, &layer.cfg);
+                let out = View::new(gpu.buffer(cfg.hidden_size * 4));
+                let mut plan = Plan::new(&gpu);
+                layer.record(&mut plan, &x, &out, &state);
+                runs.push((plan, state, out));
+            }
+            let built = runs[1].0.build();
+            println!("deltanet: {} ops", runs[0].0.len());
 
             let p = format!("{prefix}.linear_attn");
             let v = |n: &str| weights.tensor(&format!("{p}.{n}")).unwrap().to_f32();
@@ -537,12 +553,13 @@ mod mac {
                 v("dt_bias"),
                 v("norm.weight"),
             );
+            let m = |n: &str| quant(&weights, &cfg, &format!("{p}.{n}"));
             let w = DeltaNetWeights {
-                in_proj_qkv: quant(&weights, &cfg, &format!("{p}.in_proj_qkv")),
-                in_proj_z: quant(&weights, &cfg, &format!("{p}.in_proj_z")),
-                in_proj_b: quant(&weights, &cfg, &format!("{p}.in_proj_b")),
-                in_proj_a: quant(&weights, &cfg, &format!("{p}.in_proj_a")),
-                out_proj: quant(&weights, &cfg, &format!("{p}.out_proj")),
+                in_proj_qkv: m("in_proj_qkv"),
+                in_proj_z: m("in_proj_z"),
+                in_proj_b: m("in_proj_b"),
+                in_proj_a: m("in_proj_a"),
+                out_proj: m("out_proj"),
                 conv1d: &conv1d,
                 a_log: &a_log,
                 dt_bias: &dt_bias,
@@ -551,26 +568,35 @@ mod mac {
             let c = deltanet_config(&cfg);
             let mut cpu_state = DeltaNetState::new(&c);
 
-            let out = View::new(gpu.buffer(cfg.hidden_size * 4));
+            let n = cfg.hidden_size;
             for t in 0..TOKENS {
-                let x = input(&weights, prefix, t, cfg.rms_norm_eps);
-                let want = deltanet(&c, &w, &x, &mut cpu_state);
-                let xv = View::new(gpu.buffer_from(&x));
-                gpu.run(|enc| gpu_layer.encode(&gpu, enc, &xv, &out, &gpu_state));
-                let err = rel_rms(contents::<f32>(&out.buffer, want.len()), &want);
+                let input = input(&weights, prefix, t, cfg.rms_norm_eps);
+                let want = deltanet(&c, &w, &input, &mut cpu_state);
+                write(&x.buffer, &input);
+                runs[0].0.set_params(TokenParams::new(0, t as u32));
+                runs[0].0.run_serial();
+                runs[1].0.set_params(TokenParams::new(0, t as u32));
+                built.run(&gpu);
+                let serial = read(&runs[0].2.buffer, n);
+                assert_eq!(
+                    bits(&serial),
+                    bits(&read(&runs[1].2.buffer, n)),
+                    "token {t}: replay"
+                );
+                let err = rel_rms(&serial, &want);
                 println!("deltanet token {t}: rel rms {err:.2e}");
                 assert!(err < BOUND, "token {t}");
             }
-            let conv = rel_rms(
-                contents::<f32>(&gpu_state.conv, cpu_state.conv.len()),
-                &cpu_state.conv,
-            );
-            let rec = rel_rms(
-                contents::<f32>(&gpu_state.recurrent, cpu_state.recurrent.len()),
-                &cpu_state.recurrent,
-            );
+            let (conv_n, rec_n) = (cpu_state.conv.len(), cpu_state.recurrent.len());
+            let state = &runs[0].1;
+            let conv = rel_rms(&read(&state.conv, conv_n), &cpu_state.conv);
+            let rec = rel_rms(&read(&state.recurrent, rec_n), &cpu_state.recurrent);
             println!("deltanet state: conv {conv:.2e}, recurrent {rec:.2e}");
             assert!(conv < BOUND && rec < BOUND);
+            assert_eq!(
+                bits(&read(&state.recurrent, rec_n)),
+                bits(&read(&runs[1].1.recurrent, rec_n))
+            );
         }
 
         #[test]
@@ -579,36 +605,57 @@ mod mac {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let prefix = "language_model.model.layers.3";
-            let gpu_layer = GpuAttention::load(&gpu, &cfg, &weights, prefix).unwrap();
-            let mut gpu_cache = GpuKvCache::new(&gpu, &gpu_layer.cfg, 64);
+            let layer = GpuAttention::load(&gpu, &cfg, &weights, prefix).unwrap();
+            let x = View::new(gpu.buffer(cfg.hidden_size * 4));
+            let mut runs = Vec::new();
+            for _ in 0..2 {
+                let cache = GpuKvCache::new(&gpu, &layer.cfg, 64);
+                let out = View::new(gpu.buffer(cfg.hidden_size * 4));
+                let mut plan = Plan::new(&gpu);
+                layer.record(&mut plan, &x, &out, &cache);
+                runs.push((plan, cache, out));
+            }
+            let built = runs[1].0.build();
+            println!("attention: {} ops", runs[0].0.len());
 
             let p = format!("{prefix}.self_attn");
             let v = |n: &str| weights.tensor(&format!("{p}.{n}")).unwrap().to_f32();
             let (q_norm, k_norm) = (v("q_norm.weight"), v("k_norm.weight"));
+            let m = |n: &str| quant(&weights, &cfg, &format!("{p}.{n}"));
             let w = AttentionWeights {
-                q_proj: quant(&weights, &cfg, &format!("{p}.q_proj")),
-                k_proj: quant(&weights, &cfg, &format!("{p}.k_proj")),
-                v_proj: quant(&weights, &cfg, &format!("{p}.v_proj")),
-                o_proj: quant(&weights, &cfg, &format!("{p}.o_proj")),
+                q_proj: m("q_proj"),
+                k_proj: m("k_proj"),
+                v_proj: m("v_proj"),
+                o_proj: m("o_proj"),
                 q_norm: &q_norm,
                 k_norm: &k_norm,
             };
             let c = attention_config(&cfg);
             let mut cpu_cache = KvCache::default();
 
-            let out = View::new(gpu.buffer(cfg.hidden_size * 4));
+            let n = cfg.hidden_size;
             for t in 0..TOKENS {
-                let x = input(&weights, prefix, t, cfg.rms_norm_eps);
-                let want = attention(&c, &w, &x, &mut cpu_cache);
-                let xv = View::new(gpu.buffer_from(&x));
-                gpu.run(|enc| gpu_layer.encode(&gpu, enc, &xv, &out, &mut gpu_cache));
-                let err = rel_rms(contents::<f32>(&out.buffer, want.len()), &want);
+                let input = input(&weights, prefix, t, cfg.rms_norm_eps);
+                let want = attention(&c, &w, &input, &mut cpu_cache);
+                write(&x.buffer, &input);
+                runs[0].0.set_params(TokenParams::new(0, t as u32));
+                runs[0].0.run_serial();
+                runs[1].0.set_params(TokenParams::new(0, t as u32));
+                built.run(&gpu);
+                let serial = read(&runs[0].2.buffer, n);
+                assert_eq!(
+                    bits(&serial),
+                    bits(&read(&runs[1].2.buffer, n)),
+                    "token {t}: replay"
+                );
+                let err = rel_rms(&serial, &want);
                 println!("attention token {t}: rel rms {err:.2e}");
                 assert!(err < BOUND, "token {t}");
             }
-            let n = cpu_cache.keys().len();
-            let keys = rel_rms(contents::<f32>(&gpu_cache.keys, n), cpu_cache.keys());
-            let values = rel_rms(contents::<f32>(&gpu_cache.values, n), cpu_cache.values());
+            let kv_n = cpu_cache.keys().len();
+            let cache = &runs[0].1;
+            let keys = rel_rms(&read(&cache.keys, kv_n), cpu_cache.keys());
+            let values = rel_rms(&read(&cache.values, kv_n), cpu_cache.values());
             println!("attention cache: keys {keys:.2e}, values {values:.2e}");
             assert!(keys < BOUND && values < BOUND);
         }
