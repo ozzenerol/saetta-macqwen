@@ -95,6 +95,23 @@ def compare(a_path, b_path):
     return wins
 
 
+def margin(a_path, b_path, root, out_dir):
+    """For each length where the outputs differ, writes margin-N.json with
+    the request and the answer up to the first differing character, for
+    the margin_at_first_difference test."""
+    a, b = json.load(open(a_path)), json.load(open(b_path))
+    text = source(root)
+    for n in a:
+        x, y = a[n]["text"], b.get(n, {}).get("text")
+        if y is None or x == y:
+            continue
+        i = next((j for j, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
+        case = {"system": f"Run {n}.", "user": prompt(text, int(n)), "prefix": x[:i]}
+        path = pathlib.Path(out_dir, f"margin-{n}.json")
+        json.dump(case, open(path, "w"))
+        print(f"{path}: differs at character {i}: {x[i:i + 20]!r} vs {y[i:i + 20]!r}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8093")
@@ -103,7 +120,11 @@ def main():
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2)
+    ap.add_argument("--margin", nargs=3, metavar=("PLAIN", "DRAFT", "OUT_DIR"))
     args = ap.parse_args()
+    if args.margin:
+        margin(*args.margin[:2], args.root, args.margin[2])
+        return
     if args.compare:
         sys.exit(0 if compare(*args.compare) else 1)
     result = bench(args.url, args.root, args.lengths, args.tokens)

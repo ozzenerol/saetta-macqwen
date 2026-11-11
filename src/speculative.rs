@@ -815,6 +815,79 @@ mod gpu_real {
 
     const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
 
+    /// The top two logits of plain GPU greedy decode around the first
+    /// character where plain and --draft output differ. SAETTA_MARGIN names a
+    /// JSON file with "system", "user" and "prefix" (the answer up to the
+    /// first differing character), as tools/context_bench.py --margin writes.
+    #[test]
+    #[ignore = "needs the model on the Mac"]
+    fn margin_at_first_difference() {
+        let file = std::env::var("SAETTA_MARGIN").expect("SAETTA_MARGIN=<json>");
+        let case: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        let text = |k: &str| case[k].as_str().unwrap().to_string();
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+        let cfg = Config::load(&dir).unwrap();
+        let weights = Weights::open(&dir).unwrap();
+        let tok = Tokenizer::load(&dir).unwrap();
+        let gpu = Gpu::new().unwrap();
+        let message = |role: &str, content: String| Message {
+            role: role.into(),
+            content,
+            ..Message::default()
+        };
+        let opts = chat::Options {
+            enable_thinking: false,
+            ..chat::Options::default()
+        };
+        let messages = [
+            message("system", text("system")),
+            message("user", text("user")),
+        ];
+        let mut tokens = tok.encode(&chat::render(&messages, &[], &opts).unwrap());
+        let prefix = tok.encode(&text("prefix"));
+        // The last prefix token may be cut mid-word; decode from before it.
+        tokens.extend(&prefix[..prefix.len().saturating_sub(1)]);
+        let (&last, prompt) = tokens.split_last().unwrap();
+
+        let capacity = (tokens.len() + 64).next_multiple_of(128);
+        let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity).unwrap();
+        let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
+        prefill.exact = !crate::prefill::fast_from_env();
+        for piece in prompt.chunks(1024) {
+            let pos = model.position();
+            let states: Vec<_> = model.states().collect();
+            prefill.run(&gpu, piece, pos, &states);
+            drop(states);
+            model.set_position(pos + piece.len());
+        }
+        let mut logits = model.forward(last);
+        println!(
+            "{} tokens of context; greedy steps from the prefix:",
+            tokens.len()
+        );
+        for _ in 0..6 {
+            let mut top: Vec<(u32, f32)> = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, l)| (i as u32, l))
+                .collect();
+            top.select_nth_unstable_by(1, |a, b| b.1.total_cmp(&a.1));
+            top.truncate(2);
+            top.sort_by(|a, b| b.1.total_cmp(&a.1));
+            println!(
+                "  {:?} {:.5} vs {:?} {:.5}: gap {:.2e}",
+                tok.decode(&[top[0].0]),
+                top[0].1,
+                tok.decode(&[top[1].0]),
+                top[1].1,
+                top[0].1 - top[1].1
+            );
+            logits = model.forward(top[0].0);
+        }
+    }
+
     /// The two best logits' gap.
     fn top2_gap(logits: &[f32]) -> f32 {
         let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
