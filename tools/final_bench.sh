@@ -24,23 +24,15 @@ bench() {
 		--contexts "$contexts" --runs "$runs" --turns "$turns" --out "$out/$2.json"
 }
 
-# Tokens of context for the longest prompt plus its answer and the turns.
-context_for() {
-	"$python" - "$contexts" <<'PY'
-import sys
-k = lambda t: int(float(t[:-1]) * 1024) if t.endswith("k") else int(t)
-print(max(32768, max(k(t) for t in sys.argv[1].split(",")) + 2048))
-PY
-}
-
 case "${1:-}" in
 saetta)
 	if up 8080; then
 		echo "a server is up on 8080 (MLX?); stop it first, never run both"
 		exit 1
 	fi
-	ctx=$(context_for)
-	"$here/target/release/saetta" serve "$model" --gpu --port 8094 --context "$ctx" \
+	# No --context: the default 262144 fits the longest prompt, since "128k"
+	# of filler comes out near 150k tokens.
+	"$here/target/release/saetta" serve "$model" --gpu --port 8094 \
 		>"$out/saetta-serve.log" 2>&1 &
 	pid=$!
 	trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null' EXIT
