@@ -653,7 +653,11 @@ mod gpu {
                 self.round(model, prefill, pending, decide, k)
             };
             let seconds = start.elapsed().as_secs_f64();
-            eprintln!("ROUND k {k} ctx {context} accepted {} {:.1} ms", drafts.len(), seconds * 1e3);
+            eprintln!(
+                "ROUND k {k} ctx {context} accepted {} {:.1} ms",
+                drafts.len(),
+                seconds * 1e3
+            );
             self.length.record(context, k, drafts.len(), seconds);
             self.lengths[k] += 1;
             (drafts, next)
@@ -718,6 +722,8 @@ mod gpu {
                 }
                 _ => false,
             };
+            // The verify writes a KV row for every token it runs.
+            model.reserve(base + tokens.len());
             let states: Vec<_> = model.states().collect();
             let sampler = on_gpu.then(|| model.sampler());
             let v = prefill.verify(self.gpu, &tokens, base, &states, sampler);

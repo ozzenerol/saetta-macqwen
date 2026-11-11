@@ -391,25 +391,30 @@ fn report_memory(
         .iter()
         .map(|c| (c.keys.length() + c.values.length()) as usize)
         .sum();
-    // Keys and values of one token in every attention layer; the caches
-    // round the context up to KV_ALIGN.
+    // Keys and values of one token in every attention layer (and the MTP
+    // layer's). The caches start at `allocated` tokens and grow with the
+    // context, so the KV is counted both ways.
     let row = decode / caches[0].capacity;
     let one_layer = row / caches.len();
-    let mtp_kv = usize::from(mtp) * one_layer * memory.context;
-    let kv = decode + mtp_kv;
+    let token = row + usize::from(mtp) * one_layer;
+    let allocated = model.allocated();
+    let (start, full) = (token * allocated, token * memory.context);
     let cache = (snapshots + 1) * snapshot;
     let backup = cache::BACKUP_ROWS * row;
     let mb = |b: usize| b >> 20;
     eprintln!(
-        "memory besides the weights: KV {} MB ({} tokens at {} KB), prompt cache {} MB ({} snapshots of {} MB) plus {} MB of KV rows, {} MB in all",
-        mb(kv),
+        "memory besides the weights: KV {} MB for the first {} tokens, growing to {} MB at {} ({} KB a token), prompt cache {} MB ({} snapshots of {} MB) plus {} MB of KV rows, {} to {} MB in all",
+        mb(start),
+        allocated,
+        mb(full),
         memory.context,
-        (kv / memory.context) >> 10,
+        token >> 10,
         mb(cache),
         snapshots + 1,
         mb(snapshot),
         mb(backup),
-        mb(kv + cache + backup)
+        mb(start + cache + backup),
+        mb(full + cache + backup)
     );
 }
 
@@ -492,7 +497,12 @@ impl server::Model for GpuServed {
         if tokens.is_empty() {
             return Vec::new();
         }
+        // The prefill writes the KV rows of all the tokens, and the MTP cache
+        // never holds more entries than the model has tokens.
+        let need = m.position() + tokens.len();
+        m.reserve(need);
         if let Some(d) = &mut self.drafting {
+            d.spec.mtp.reserve(need);
             d.spec.report(m.position());
         }
         let start = Instant::now();
