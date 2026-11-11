@@ -595,3 +595,55 @@ fn edited_answer_is_rendered() {
     let (_, body) = post(&fresh, ask("Five."));
     assert_eq!(usage(&body).0, second);
 }
+
+/// The answer of a non-streamed request with thinking on and the read tool.
+fn think_and_answer(script: Vec<u32>) -> Value {
+    let (addr, _) = start(script);
+    let (status, body) = post(
+        &addr,
+        json!({"messages": [{"role": "user", "content": "x"}], "tools": read_tool(),
+               "chat_template_kwargs": {"enable_thinking": true}}),
+    );
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[test]
+fn tool_call_written_in_reasoning_stays_reasoning() {
+    let about = "\n<function=name>\n<parameter=x>\n1\n</parameter>\n</function>\n";
+    let v = think_and_answer(script(&[
+        Ok("The format is "),
+        Err(TOOL),
+        Ok(about),
+        Err(TOOL_END),
+        Ok(" so I answer."),
+        Err(THINK_END),
+        Ok("\n\nDone."),
+    ]));
+    let choice = &v["choices"][0];
+    assert_eq!(
+        choice["message"]["reasoning_content"],
+        format!("The format is <tool_call>{about}</tool_call> so I answer.")
+    );
+    assert_eq!(choice["message"]["content"], "Done.");
+    assert_eq!(choice["message"]["tool_calls"], Value::Null);
+    assert_eq!(choice["finish_reason"], "stop");
+}
+
+/// As in mlx_lm, a real call ends the reasoning even without `</think>`.
+#[test]
+fn tool_call_from_reasoning_runs() {
+    let v = think_and_answer(script(&[
+        Ok("Need the file."),
+        Err(TOOL),
+        Ok("\n<function=read>\n<parameter=path>\nmain.go\n</parameter>\n</function>\n"),
+        Err(TOOL_END),
+    ]));
+    let choice = &v["choices"][0];
+    assert_eq!(choice["message"]["reasoning_content"], "Need the file.");
+    assert_eq!(
+        choice["message"]["tool_calls"][0]["function"]["name"],
+        "read"
+    );
+    assert_eq!(choice["finish_reason"], "tool_calls");
+}

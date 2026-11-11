@@ -223,6 +223,12 @@ struct GpuServed {
     prefill: saetta::prefill::Prefill<'static>,
 }
 
+/// Inputs shorter than this run as decode steps. A prefill pass has a fixed
+/// cost of 0.5 to 1.5 s (track D measured 1.79 s for 17 tokens), while a
+/// decode step takes about 16 ms. Tool results are often this short.
+#[cfg(target_os = "macos")]
+const SHORT_PREFILL: usize = 48;
+
 /// Tokens per prefill dispatch.
 #[cfg(target_os = "macos")]
 const PREFILL_CHUNK: usize = 1024;
@@ -252,10 +258,17 @@ impl server::Model for GpuServed {
             return Vec::new();
         }
         let start = Instant::now();
-        let pos = m.position();
-        let states: Vec<_> = m.states().collect();
-        let logits = self.prefill.run(m.gpu(), tokens, pos, &states);
-        m.set_position(pos + tokens.len());
+        let logits = if tokens.len() < SHORT_PREFILL {
+            let (&last, rest) = tokens.split_last().unwrap();
+            rest.iter().for_each(|&t| m.run(t));
+            m.forward(last)
+        } else {
+            let pos = m.position();
+            let states: Vec<_> = m.states().collect();
+            let logits = self.prefill.run(m.gpu(), tokens, pos, &states);
+            m.set_position(pos + tokens.len());
+            logits
+        };
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
             "prefill {} tokens in {secs:.2} s ({:.1} ms/token)",

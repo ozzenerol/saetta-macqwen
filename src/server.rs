@@ -531,6 +531,8 @@ struct Output<'a> {
     part: Part,
     pending: Vec<u8>,
     tool_text: String,
+    /// The tool call started inside the reasoning, before `</think>`.
+    tool_in_reasoning: bool,
     content_started: bool,
     tools: &'a [Value],
     id: &'a str,
@@ -547,6 +549,7 @@ impl<'a> Output<'a> {
             },
             pending: Vec::new(),
             tool_text: String::new(),
+            tool_in_reasoning: false,
             content_started: false,
             tools,
             id,
@@ -561,12 +564,19 @@ impl<'a> Output<'a> {
             self.part = Part::Content;
         } else if token == special.tool_start && self.part != Part::ToolCall {
             self.flush(&mut events, true);
+            self.tool_in_reasoning = self.part == Part::Reasoning;
             self.part = Part::ToolCall;
             self.tool_text.clear();
         } else if token == special.tool_end && self.part == Part::ToolCall {
             self.flush(&mut events, true);
-            events.push(self.tool_call(true));
-            self.part = Part::Content;
+            let event = self.tool_call(true);
+            // mlx_lm leaves the reasoning for a tool call too, but a call
+            // that is only written about in the reasoning stays there.
+            self.part = match event {
+                Event::Reasoning(_) => Part::Reasoning,
+                _ => Part::Content,
+            };
+            events.push(event);
         } else if !tokenizer.is_special(token) {
             self.pending.extend_from_slice(tokenizer.token_bytes(token));
             self.flush(&mut events, false);
@@ -585,9 +595,18 @@ impl<'a> Output<'a> {
     }
 
     /// A tool call event, or the raw text as written when it does not parse.
+    /// Inside the reasoning, the call must also name one of the request's
+    /// tools, else its text goes back to the reasoning: the model sometimes
+    /// writes `<tool_call>` there while thinking about the format.
     fn tool_call(&mut self, closed: bool) -> Event {
         let text = std::mem::take(&mut self.tool_text);
-        match toolcall::parse(&text, self.tools) {
+        let known = |name: &str| self.tools.iter().any(|t| t["function"]["name"] == name);
+        let call = toolcall::parse(&text, self.tools)
+            .filter(|c| !self.tool_in_reasoning || known(&c.name));
+        let end = if closed { "</tool_call>" } else { "" };
+        match call {
+            None if self.tool_in_reasoning => Event::Reasoning(format!("<tool_call>{text}{end}")),
+            None => Event::Content(format!("<tool_call>{text}{end}")),
             Some(call) => {
                 self.calls += 1;
                 Event::ToolCall(ToolCallOut {
@@ -600,8 +619,6 @@ impl<'a> Output<'a> {
                     arguments: chat::python_json(&Value::Object(call.arguments)),
                 })
             }
-            None if closed => Event::Content(format!("<tool_call>{text}</tool_call>")),
-            None => Event::Content(format!("<tool_call>{text}")),
         }
     }
 
