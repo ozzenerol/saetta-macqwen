@@ -80,8 +80,12 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                                    constant RowsAttentionParams &p [[buffer(9)]],
                                    constant TokenParams &tp [[buffer(10)]],
                                    uint2 tg [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
                                    uint simd [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
+    // q of the pass's rows times the scale, qs[(r * 8 + g) * 256 + d]: read
+    // from threadgroup memory, not device memory, on every tile.
+    threadgroup float qs[ROWS_PASS * DEC_GROUP * DEC_DIM];
     // Scores of the pass's rows: sc[r * 8 + g][t].
     threadgroup float sc[ROWS_PASS * DEC_GROUP][SC_STRIDE];
     threadgroup float alpha[ROWS_PASS * DEC_GROUP];
@@ -99,6 +103,13 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
         uint rows = min(ROWS_PASS, p.rows - r0);
         // The pass's last row sees the most tokens.
         uint pass_len = min(pos + r0 + rows, p.capacity);
+        // The last pass may still read qs.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < rows * DEC_GROUP * DEC_DIM; i += 256) {
+            uint r = i / (DEC_GROUP * DEC_DIM), j = i % (DEC_GROUP * DEC_DIM);
+            qs[i] = q[((r0 + r) * p.heads + kv * DEC_GROUP) * DEC_DIM + j] * p.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float m[ROWS_PASS], l[ROWS_PASS];
         simdgroup_float8x8 o[ROWS_PASS][4];
 #pragma clang loop unroll(full)
@@ -137,8 +148,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                         if (r >= rows) {
                             break;
                         }
-                        device const float *qr =
-                            q + ((r0 + r) * p.heads + kv * DEC_GROUP) * DEC_DIM + d;
+                        threadgroup const float *qr = qs + r * DEC_GROUP * DEC_DIM + d;
 #pragma clang loop unroll(full)
                         for (uint i = 0; i < 4; i++) {
                             simdgroup_float8x8 qt;
@@ -171,7 +181,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                 }
                 uint len = min(pos + r0 + r + 1, p.capacity);
                 uint n = start < len ? min(DEC_CHUNK, len - start) : 0;
-                chunk_softmax(sc[r * DEC_GROUP + simd], n, p.scale, m[r], l[r],
+                chunk_softmax(sc[r * DEC_GROUP + simd], n, 1.0f, m[r], l[r],
                               alpha + r * DEC_GROUP, simd, lane);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
