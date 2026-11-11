@@ -13,6 +13,10 @@ use crate::server::Model;
 pub const DEFAULT_LIMIT: usize = 16;
 /// A long prefill takes a snapshot at every multiple of this many tokens.
 pub const DEFAULT_EVERY: usize = 1024;
+/// Of the snapshots one prefill takes on the way, it keeps the first and
+/// the last few, so a long prompt does not push out every other
+/// conversation.
+const KEEP_ON_THE_WAY: usize = 4;
 
 /// A model whose recurrent state can be copied out and put back.
 pub trait Restore {
@@ -104,6 +108,11 @@ impl<S> Snapshots<S> {
         }
     }
 
+    /// Drops the snapshot of exactly these tokens, unless it is pinned.
+    pub fn remove(&mut self, tokens: &[u32]) {
+        self.items.retain(|s| s.pinned || s.tokens != tokens);
+    }
+
     /// The longest snapshot whose tokens start `tokens`.
     pub fn find(&mut self, tokens: &[u32]) -> Option<(usize, &S)> {
         self.clock += 1;
@@ -168,6 +177,8 @@ impl<M: Model + Restore> Model for Cached<M> {
         let start = self.tokens.len();
         let last = start + tokens.len() - 1;
         let mut done = 0;
+        // Lengths of the snapshots taken on the way that were new.
+        let mut taken: Vec<usize> = Vec::new();
         while start + done < last {
             let next_stop = ((start + done) / self.every + 1) * self.every;
             let stop = next_stop.min(last);
@@ -175,7 +186,16 @@ impl<M: Model + Restore> Model for Cached<M> {
             self.model.prefill(chunk);
             self.tokens.extend_from_slice(chunk);
             done = stop - start;
-            self.save(stop == last);
+            if stop == last {
+                self.save(true);
+            } else if !self.snapshots.contains(&self.tokens) {
+                self.save(false);
+                taken.push(stop);
+                if taken.len() > KEEP_ON_THE_WAY {
+                    let len = taken.remove(1);
+                    self.snapshots.remove(&self.tokens[..len]);
+                }
+            }
         }
         if start == last {
             self.save(true);
@@ -325,6 +345,15 @@ mod tests {
         c.step(5);
         c.prefill(&[1, 2]);
         assert_eq!(c.snapshots().lengths(), vec![4, 8, 9, 11, 12]);
+    }
+
+    #[test]
+    fn long_prefill_keeps_the_first_and_last_snapshots() {
+        let mut c = Cached::new(Toy::default(), 16, 4);
+        c.prefill(&tokens(10, 9));
+        c.reset();
+        c.prefill(&tokens(42, 0));
+        assert_eq!(c.snapshots().lengths(), vec![4, 4, 8, 9, 32, 36, 40, 41]);
     }
 
     #[test]

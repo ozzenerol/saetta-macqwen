@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--context N] [--exact-history] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -42,11 +42,9 @@ fn main() -> ExitCode {
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
         #[cfg(target_os = "macos")]
-        ["bench-decode", dir] => report(saetta::attention::bench_decode(
-            Path::new(dir),
-            &[40, 1024, 4096, 8192, 16384, 32768],
-            5,
-        )),
+        ["bench-decode", dir] => bench_decode(dir, None),
+        #[cfg(target_os = "macos")]
+        ["bench-decode", dir, capacity] => bench_decode(dir, Some(capacity)),
         #[cfg(target_os = "macos")]
         ["bench-attention"] => {
             report(saetta::attention::bench(&[1024, 8192, 16384, 32768], 10, 5).map_err(Into::into))
@@ -56,6 +54,26 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Decode at lengths up to the context, 32768 by default. The model is
+/// loaded with room for the context.
+#[cfg(target_os = "macos")]
+fn bench_decode(dir: &str, context: Option<&str>) -> ExitCode {
+    let Some(context) = context.map_or(Some(32768), |c| c.parse::<usize>().ok()) else {
+        eprintln!("bad context");
+        return ExitCode::FAILURE;
+    };
+    let lengths: Vec<usize> = [40, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+        .into_iter()
+        .filter(|&n| n <= context)
+        .collect();
+    report(saetta::attention::bench_decode(
+        Path::new(dir),
+        &lengths,
+        context,
+        5,
+    ))
 }
 
 fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
@@ -96,14 +114,17 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
 struct ServeFlags {
     gpu: bool,
     port: u16,
+    context: usize,
     exact_history: bool,
 }
 
-/// `[--gpu] [--port N] [--exact-history]` after `serve <dir>`.
+/// `[--gpu] [--port N] [--context N] [--exact-history]` after `serve <dir>`.
+/// The context is the tokens the GPU model has room for.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut f = ServeFlags {
         gpu: false,
         port: 8090,
+        context: DEFAULT_CONTEXT,
         exact_history: false,
     };
     let mut it = flags.iter();
@@ -114,6 +135,14 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
                 f.port = value.parse().map_err(|_| format!("bad port {value}"))?;
+            }
+            "--context" => {
+                let value = it.next().ok_or("--context needs a number")?;
+                f.context = value
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or(format!("bad context {value}"))?;
             }
             _ => return Err(format!("unknown flag {flag}")),
         }
@@ -127,6 +156,7 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let ServeFlags {
         gpu,
         port,
+        context,
         exact_history,
     } = flags;
     // The model borrows these for as long as the server runs.
@@ -148,7 +178,9 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
     if gpu {
-        return serve_gpu(config, weights, tokenizer, settings, listener, &what);
+        return serve_gpu(
+            config, weights, tokenizer, settings, listener, &what, context,
+        );
     }
     let model = Model::new(config, weights)?;
     let states = model.new_states();
@@ -174,14 +206,14 @@ fn serve_gpu(
     _: Settings,
     _: TcpListener,
     _: &str,
+    _: usize,
 ) -> Result<(), Box<dyn Error>> {
     Err("--gpu needs macOS".into())
 }
 
-/// Tokens of context the GPU model has room for: 40 KB of keys and values
-/// per token over the 10 attention layers, 1.3 GB in all.
-#[cfg(target_os = "macos")]
-const GPU_CONTEXT: usize = 32768;
+/// The full context of Qwen3.6. The KV cache is allocated for all of it,
+/// but a page of it takes memory only once a token is written there.
+const DEFAULT_CONTEXT: usize = 262144;
 
 #[cfg(target_os = "macos")]
 fn serve_gpu(
@@ -191,14 +223,14 @@ fn serve_gpu(
     settings: Settings,
     listener: TcpListener,
     what: &str,
+    context: usize,
 ) -> Result<(), Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let model =
-        saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
+        saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), context)?;
     let layers = model.deltanet_states();
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
-    let mut prefill =
-        saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, GPU_CONTEXT)?;
+    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, context)?;
     prefill.exact = exact_prefill();
     let served = GpuServed {
         model,
@@ -208,7 +240,7 @@ fn serve_gpu(
     };
     let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
-    eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context)");
+    eprintln!("serving {what} (GPU model, {context} tokens of context)");
     server.serve(listener)?;
     Ok(())
 }

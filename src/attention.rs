@@ -104,27 +104,16 @@ mod mac {
         }
     }
 
-    /// Must match AttentionParams in kernels/layers.metal (the old kernel).
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct OldParams {
-        heads: u32,
-        kv_heads: u32,
-        dim: u32,
-        capacity: u32,
-        scale: f32,
-    }
-
-    /// Times the attention of `layers` full-attention layers for one token
-    /// at each context length, split-K against the old one-group-per-head
-    /// kernel. Each layer has its own cache, so nothing stays in the cache.
+    /// Times the split-K attention of `layers` full-attention layers for one
+    /// token at each context length. Each layer has its own cache, so
+    /// nothing stays in the cache.
     pub fn bench(lengths: &[usize], layers: usize, runs: usize) -> Result<(), String> {
         let gpu = Gpu::new()?;
         let (heads, kv) = (16, 2);
         let capacity = *lengths.iter().max().unwrap();
         let token = kv * DIM;
-        let fill: Vec<f32> = (0..capacity * token)
-            .map(|i| ((i * 7919) % 2000) as f32 / 1000.0 - 1.0)
+        let fill: Vec<half::f16> = (0..capacity * token)
+            .map(|i| half::f16::from_f32(((i * 7919) % 2000) as f32 / 1000.0 - 1.0))
             .collect();
         let caches: Vec<(View, View)> = (0..layers)
             .map(|_| {
@@ -137,51 +126,29 @@ mod mac {
         let q = View::new(gpu.buffer_from(&vec![0.01f32; heads * DIM]));
         let qg = View::new(gpu.buffer_from(&vec![0.5f32; heads * 2 * DIM]));
         let out = View::new(gpu.buffer(heads * DIM * 4));
-        let scores = View::new(gpu.buffer(heads * capacity * 4));
         let att = DecodeAttention::new(&gpu, heads, kv, DIM, capacity);
 
-        let mut new_plan = Plan::new(&gpu);
-        let mut old_plan = Plan::new(&gpu);
-        let old_p = old_plan.constant(&[OldParams {
-            heads: heads as u32,
-            kv_heads: kv as u32,
-            dim: DIM as u32,
-            capacity: capacity as u32,
-            scale: 1.0 / (DIM as f32).sqrt(),
-        }]);
-        let old_params = old_plan.params.clone();
+        let mut plan = Plan::new(&gpu);
         for (k, v) in &caches {
-            att.record(&mut new_plan, &q, k, v, &qg, &out);
-            old_plan.op(
-                "attention",
-                &[&q, k, v, &qg, &out, &scores, &old_p, &old_params],
-                MTLSize::new(heads as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
+            att.record(&mut plan, &q, k, v, &qg, &out);
         }
-        let (new_built, old_built) = (new_plan.build(), old_plan.build());
+        let built = plan.build();
         println!(
-            "attention for one token, {layers} layers, 16 q / 2 kv heads of 256, f32 cache; median of {runs} runs after 1 warm-up:"
+            "attention for one token, {layers} layers, 16 q / 2 kv heads of 256, half cache; median of {runs} runs after 1 warm-up:"
         );
         for &len in lengths {
-            let time = |plan: &Plan, built: &crate::plan::Built| {
-                plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
-                let mut t: Vec<f64> = (0..=runs)
-                    .map(|_| built.run(&gpu).as_secs_f64())
-                    .skip(1)
-                    .collect();
-                t.sort_by(f64::total_cmp);
-                t[runs / 2]
-            };
-            let new = time(&new_plan, &new_built);
-            let old = time(&old_plan, &old_built);
-            let bytes = (layers * len * token * 4 * 2) as f64;
+            plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
+            let mut t: Vec<f64> = (0..=runs)
+                .map(|_| built.run(&gpu).as_secs_f64())
+                .skip(1)
+                .collect();
+            t.sort_by(f64::total_cmp);
+            let time = t[runs / 2];
+            let bytes = (layers * len * token * 2 * 2) as f64;
             println!(
-                "  {len:>6} tokens: split-K {:.3} ms ({:.0} GB/s), old {:.3} ms, {:.1}x",
-                new * 1e3,
-                bytes / new / 1e9,
-                old * 1e3,
-                old / new
+                "  {len:>6} tokens: {:.3} ms ({:.0} GB/s)",
+                time * 1e3,
+                bytes / time / 1e9
             );
         }
         Ok(())
@@ -193,15 +160,17 @@ mod mac {
     pub fn bench_decode(
         dir: &std::path::Path,
         lengths: &[usize],
+        capacity: usize,
         runs: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = crate::config::Config::load(dir)?;
         let weights = crate::weights::Weights::open(dir)?;
         let gpu = Gpu::new()?;
-        let capacity = lengths.iter().max().unwrap() + 1;
         let mut model =
             crate::gpu_model::GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity)?;
-        println!("decode, whole model, logits read back; median of {runs} tokens after 1 warm-up:");
+        println!(
+            "decode, whole model, room for {capacity} tokens, logits read back; median of {runs} tokens after 1 warm-up:"
+        );
         for &len in lengths {
             let mut t: Vec<f64> = (0..=runs)
                 .map(|_| {

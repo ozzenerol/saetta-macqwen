@@ -116,88 +116,20 @@ kernel void rope(device float *x [[buffer(0)]],
     h[i + p.half_dims] = a * s + b * c;
 }
 
-struct AttentionParams {
-    uint heads;
-    uint kv_heads;
-    uint dim;
-    uint capacity;  // tokens the cache and the scores rows hold
-    float scale;
-};
-
 // Copies the token's key and value (`kv_heads * dim` each) into its slot of
-// the cache, one thread per value.
+// the half cache, one thread per value.
 kernel void kv_store(device const float *k [[buffer(0)]],
                      device const float *v [[buffer(1)]],
-                     device float *keys [[buffer(2)]],
-                     device float *values [[buffer(3)]],
+                     device half *keys [[buffer(2)]],
+                     device half *values [[buffer(3)]],
                      constant uint &size [[buffer(4)]],
                      constant TokenParams &t [[buffer(5)]],
                      uint i [[thread_position_in_grid]]) {
     if (i >= size) {
         return;
     }
-    keys[t.position * size + i] = k[i];
-    values[t.position * size + i] = v[i];
-}
-
-// One threadgroup per query head: softmax(q K^T * scale) V over the first
-// kv_len tokens of the cache, times sigmoid(gate). The gate of head h sits
-// at q_and_gate[h * 2 * dim + dim].
-kernel void attention(device const float *q [[buffer(0)]],
-                      device const float *keys [[buffer(1)]],
-                      device const float *values [[buffer(2)]],
-                      device const float *q_and_gate [[buffer(3)]],
-                      device float *out [[buffer(4)]],
-                      device float *scores [[buffer(5)]],
-                      constant AttentionParams &p [[buffer(6)]],
-                      constant TokenParams &tp [[buffer(7)]],
-                      uint h [[threadgroup_position_in_grid]],
-                      uint tid [[thread_position_in_threadgroup]],
-                      uint threads [[threads_per_threadgroup]],
-                      uint simd [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]],
-                      uint simds [[simdgroups_per_threadgroup]]) {
-    threadgroup float tmp[32];
-    uint len = min(tp.kv_len, p.capacity);
-    uint kv = h / (p.heads / p.kv_heads);
-    uint stride = p.kv_heads * p.dim;
-    device const float *qh = q + h * p.dim;
-    device float *sh = scores + h * p.capacity;
-
-    for (uint t = simd; t < len; t += simds) {
-        device const float *k = keys + t * stride + kv * p.dim;
-        float d = 0;
-        for (uint i = lane; i < p.dim; i += 32) {
-            d += qh[i] * k[i];
-        }
-        d = simd_sum(d);
-        if (lane == 0) {
-            sh[t] = d * p.scale;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    float m = -INFINITY;
-    for (uint t = tid; t < len; t += threads) {
-        m = max(m, sh[t]);
-    }
-    m = group_max(m, tmp, simd, lane, simds);
-    float sum = 0;
-    for (uint t = tid; t < len; t += threads) {
-        float e = exp(sh[t] - m);
-        sh[t] = e;
-        sum += e;
-    }
-    sum = group_sum(sum, tmp, simd, lane, simds);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    for (uint i = tid; i < p.dim; i += threads) {
-        float acc = 0;
-        for (uint t = 0; t < len; t++) {
-            acc += sh[t] * values[t * stride + kv * p.dim + i];
-        }
-        out[h * p.dim + i] = acc / sum * sigmoid(q_and_gate[h * 2 * p.dim + p.dim + i]);
-    }
+    keys[t.position * size + i] = half(k[i]);
+    values[t.position * size + i] = half(v[i]);
 }
 
 struct ConvParams {
