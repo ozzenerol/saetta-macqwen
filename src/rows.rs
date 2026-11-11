@@ -575,8 +575,11 @@ mod mac {
             };
             for ctx in [40, 1024, 8192, 32768] {
                 let capacity = (ctx + MAX_ROWS).next_multiple_of(128);
-                let keys = View::new(gpu.buffer_from(&fill(capacity * kv_heads * dim, 1)));
-                let values = View::new(gpu.buffer_from(&fill(capacity * kv_heads * dim, 2)));
+                let half = |v: Vec<f32>| -> Vec<half::f16> {
+                    v.into_iter().map(half::f16::from_f32).collect()
+                };
+                let keys = View::new(gpu.buffer_from(&half(fill(capacity * kv_heads * dim, 1))));
+                let values = View::new(gpu.buffer_from(&half(fill(capacity * kv_heads * dim, 2))));
                 let q = View::new(gpu.buffer_from(&fill(MAX_ROWS * heads * dim, 3)));
                 let qg = View::new(gpu.buffer_from(&fill(MAX_ROWS * heads * 2 * dim, 4)));
                 let out = View::new(gpu.buffer(MAX_ROWS * heads * dim * 4));

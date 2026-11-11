@@ -3,6 +3,8 @@
 # file so two servers (plain and --draft) can be checked for equal output.
 #   ~/llm/mlx/bin/python tools/spec_bench.py --url http://127.0.0.1:8093 --out plain.json
 #   ~/llm/mlx/bin/python tools/spec_bench.py --compare plain.json draft.json
+# With --temperature above 0 it samples with top_k 20 and top_p 0.95 and a
+# fixed seed per run, so two servers that sample alike still match.
 import argparse
 import json
 import statistics
@@ -26,7 +28,7 @@ CASES = {
 }
 
 
-def one_run(url, prompt, tools, max_tokens, run):
+def one_run(url, prompt, tools, max_tokens, run, temperature):
     body = {
         "model": "saetta",
         # A different first line per run, so the prompt cache cannot help.
@@ -34,7 +36,10 @@ def one_run(url, prompt, tools, max_tokens, run):
                      {"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": True,
-        "temperature": 0,
+        "temperature": temperature,
+        "top_k": 20,
+        "top_p": 0.95,
+        "seed": 1000 + run,
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -73,10 +78,10 @@ def one_run(url, prompt, tools, max_tokens, run):
     }
 
 
-def bench(url, runs, max_tokens):
+def bench(url, runs, max_tokens, temperature):
     out = {}
     for name, (prompt, tools) in CASES.items():
-        rs = [one_run(url, prompt, tools, max_tokens, r) for r in range(runs)]
+        rs = [one_run(url, prompt, tools, max_tokens, r, temperature) for r in range(runs)]
         speeds = [r["decode"] for r in rs]
         ttft = statistics.median(r["ttft"] for r in rs)
         print(f"{name}: {rs[0]['tokens']} tokens, decode {statistics.median(speeds):.1f} tok/s "
@@ -109,12 +114,13 @@ def main():
     ap.add_argument("--url", default="http://127.0.0.1:8093")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=256)
+    ap.add_argument("--temperature", type=float, default=0)
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2)
     args = ap.parse_args()
     if args.compare:
         sys.exit(0 if compare(*args.compare) else 1)
-    result = bench(args.url, args.runs, args.tokens)
+    result = bench(args.url, args.runs, args.tokens, args.temperature)
     if args.out:
         json.dump(result, open(args.out, "w"), indent=1)
 

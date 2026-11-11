@@ -20,6 +20,8 @@ mod mac {
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
+    use crate::sample::{Params, Sampler};
+    use crate::sample_gpu::GpuSampler;
     use crate::weights::Weights;
     use metal::{Buffer, MTLSize};
 
@@ -388,8 +390,21 @@ mod mac {
         hidden: View,
         final_hidden: View,
         logits: View,
+        scratch: Scratch,
+        /// Samples the next token from `logits` in the same command buffer.
+        sampler: GpuSampler,
         pub(crate) capacity: usize,
         pub(crate) position: usize,
+    }
+
+    /// The MoE router of the last layer that ran, for debugging.
+    pub struct RouteDebug {
+        /// The router's input, after the post-attention norm.
+        pub normed: Vec<f32>,
+        /// One logit per expert.
+        pub logits: Vec<f32>,
+        pub ids: Vec<u32>,
+        pub weights: Vec<f32>,
     }
 
     impl<'a> GpuModel<'a> {
@@ -430,6 +445,14 @@ mod mac {
                 layer.record(&mut plan, cfg, &x, &scratch, next_norm, next_out);
             }
             lm_head.record(&mut plan, &final_hidden, &logits, false);
+            let sampler = GpuSampler::new(gpu);
+            sampler.record(&mut plan, &logits);
+            let greedy = Params {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 1,
+            };
+            sampler.set(lm_head.rows, &greedy, false);
             let built = plan.build();
 
             Ok(GpuModel {
@@ -445,6 +468,8 @@ mod mac {
                 hidden: x,
                 final_hidden,
                 logits,
+                scratch,
+                sampler,
                 capacity,
                 position: 0,
             })
@@ -491,6 +516,24 @@ mod mac {
             contents::<f32>(&self.logits.buffer, self.cfg.vocab_size).to_vec()
         }
 
+        /// The sampler after the lm_head, whose ring speculative decoding
+        /// shares.
+        pub fn sampler(&self) -> &GpuSampler {
+            &self.sampler
+        }
+
+        /// Runs one token and samples the next on the GPU, the token
+        /// `sampler.sample(logits, p)` would draw; `sampler` goes on after
+        /// that draw. `p` needs `sample_gpu::supports`.
+        pub fn run_sampled(&mut self, token: u32, p: &Params, sampler: &mut Sampler) -> u32 {
+            self.sampler.set(self.cfg.vocab_size, p, false);
+            self.sampler.seed(sampler.state());
+            let position = self.position;
+            self.run(token);
+            *sampler = Sampler::new(self.sampler.rng());
+            self.sampler.token(position + 1)
+        }
+
         /// Runs one token and leaves the results on the GPU.
         pub fn run(&mut self, token: u32) {
             assert!(
@@ -508,6 +551,18 @@ mod mac {
         /// It holds the last token's until the next run.
         pub fn final_hidden(&self) -> &View {
             &self.final_hidden
+        }
+
+        /// The router of the last loaded layer at the last token.
+        pub fn route_debug(&self) -> RouteDebug {
+            let m = &self.scratch.moe;
+            let k = self.cfg.num_experts_per_tok;
+            RouteDebug {
+                normed: contents::<f32>(&m.normed.buffer, self.cfg.hidden_size).to_vec(),
+                logits: contents::<f32>(&m.router.buffer, self.cfg.num_experts).to_vec(),
+                ids: contents::<u32>(&m.ids.buffer, k).to_vec(),
+                weights: contents::<f32>(&m.weights.buffer, k).to_vec(),
+            }
         }
 
         /// The hidden state after the last layer, before the final norm.
@@ -668,6 +723,13 @@ mod mac {
             let gpu = Gpu::new().unwrap();
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
             let mut states = cpu.new_states();
+            // The GPU cache is half; the CPU rounds its keys and values the
+            // same way, so what is left is the f32 arithmetic.
+            for s in &mut states {
+                if let crate::cpu::model::LayerState::Full(c) = s {
+                    c.round_to_half();
+                }
+            }
             let mut cpu_logits = Vec::new();
             let mut gpu_logits = Vec::new();
             for &t in &TOKENS {

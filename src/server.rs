@@ -23,12 +23,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait Model: Send {
     /// Runs the tokens and returns the logits after the last one.
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32>;
+    /// `prefill` that asks `alive` between pieces of a long input and stops
+    /// when it says false. The error is the number of tokens the state holds
+    /// then, all of them from the start of `tokens`' prompt.
+    fn prefill_while(
+        &mut self,
+        tokens: &[u32],
+        _alive: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, usize> {
+        Ok(self.prefill(tokens))
+    }
     /// Runs one token and returns the logits after it.
     fn step(&mut self, token: u32) -> Vec<f32>;
     /// Goes back to at most `len` tokens and returns how many the state
     /// holds now. At 0 the server resets the model.
     fn truncate(&mut self, len: usize) -> usize;
     fn reset(&mut self);
+    /// Goes to the longest state that `prompt` starts with and returns its
+    /// length; `held` is what the state holds now. The default cuts the
+    /// state back to the common prefix; a prompt cache may find more.
+    fn resume(&mut self, held: &[u32], prompt: &[u32]) -> usize {
+        let common = held.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        if common == held.len() {
+            return common;
+        }
+        let keep = self.truncate(common);
+        if keep == 0 {
+            self.reset();
+        }
+        keep
+    }
     /// Runs `pending` and returns the tokens decided after it: tokens the
     /// state already holds, and the next token, which it does not. A model
     /// with a drafter returns several tokens per call.
@@ -171,14 +195,19 @@ impl<M: Model + 'static> Server<M> {
             let mut reasoning = String::new();
             let mut content = String::new();
             let mut calls = Vec::new();
-            let done = self.generate(&request, |event| {
-                match event {
-                    Event::Reasoning(s) => reasoning += &s,
-                    Event::Content(s) => content += &s,
-                    Event::ToolCall(c) => calls.push(c),
-                }
-                true
-            });
+            let watch = out.try_clone()?;
+            let done = self.generate(
+                &request,
+                || client_alive(&watch),
+                |event| {
+                    match event {
+                        Event::Reasoning(s) => reasoning += &s,
+                        Event::Content(s) => content += &s,
+                        Event::ToolCall(c) => calls.push(c),
+                    }
+                    true
+                },
+            );
             let mut message = json!({"role": "assistant", "content": content});
             if !reasoning.is_empty() {
                 message["reasoning_content"] = reasoning.into();
@@ -201,22 +230,27 @@ impl<M: Model + 'static> Server<M> {
         )?;
         let mut calls = 0;
         let mut failed = None;
-        let done = self.generate(&request, |event| {
-            let delta = match event {
-                Event::Reasoning(s) => json!({"reasoning_content": s}),
-                Event::Content(s) => json!({"content": s}),
-                Event::ToolCall(c) => {
-                    let mut call = c.to_json();
-                    call["index"] = calls.into();
-                    calls += 1;
-                    json!({"tool_calls": [call]})
-                }
-            };
-            let sent = send_event(out, &chunk(delta, Value::Null));
-            let ok = sent.is_ok();
-            failed = sent.err();
-            ok
-        });
+        let watch = out.try_clone()?;
+        let done = self.generate(
+            &request,
+            || client_alive(&watch),
+            |event| {
+                let delta = match event {
+                    Event::Reasoning(s) => json!({"reasoning_content": s}),
+                    Event::Content(s) => json!({"content": s}),
+                    Event::ToolCall(c) => {
+                        let mut call = c.to_json();
+                        call["index"] = calls.into();
+                        calls += 1;
+                        json!({"tool_calls": [call]})
+                    }
+                };
+                let sent = send_event(out, &chunk(delta, Value::Null));
+                let ok = sent.is_ok();
+                failed = sent.err();
+                ok
+            },
+        );
         if let Some(e) = failed {
             return Err(e);
         }
@@ -281,8 +315,14 @@ impl<M: Model + 'static> Server<M> {
     }
 
     /// Runs one completion. `emit` returns false to stop early, for example
-    /// when the client has gone.
-    fn generate(&self, r: &ChatRequest, mut emit: impl FnMut(Event) -> bool) -> Done {
+    /// when the client has gone. `alive` is asked every `ALIVE_EVERY` tokens,
+    /// since a tool call sends nothing until it closes.
+    fn generate(
+        &self,
+        r: &ChatRequest,
+        mut alive: impl FnMut() -> bool,
+        mut emit: impl FnMut(Event) -> bool,
+    ) -> Done {
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
         let held = engine.tokens.clone();
         let spliced = match engine.last.take() {
@@ -305,11 +345,30 @@ impl<M: Model + 'static> Server<M> {
                 tool_calls: 0,
             };
         }
-        let (logits, cached) = engine.start(&prompt);
+        let started = engine.start(&prompt, &mut alive);
+        let cached = match started {
+            Ok((_, cached)) | Err((_, cached)) => cached,
+        };
         eprintln!(
             "{}",
             reuse_report(how, &held, &prompt, cached, &self.tokenizer)
         );
+        let logits = match started {
+            Ok((logits, _)) => logits,
+            Err((kept, _)) => {
+                eprintln!(
+                    "client left during the prefill, at {kept} of {} tokens",
+                    prompt.len()
+                );
+                return Done {
+                    prompt_tokens: prompt.len(),
+                    cached_tokens: cached,
+                    completion_tokens: 0,
+                    hit_limit: false,
+                    tool_calls: 0,
+                };
+            }
+        };
         let mut decide = Sampled {
             params: r.sampling,
             sampler: Sampler::new(r.seed),
@@ -345,6 +404,9 @@ impl<M: Model + 'static> Server<M> {
             }
             let events = output.push(token, &self.tokenizer, &self.special);
             if !self.emit_all(events, &mut emit, done) {
+                return Take::Gone;
+            }
+            if done.completion_tokens.is_multiple_of(ALIVE_EVERY) && !alive() {
                 return Take::Gone;
             }
             Take::Go
@@ -388,6 +450,7 @@ impl<M: Model + 'static> Server<M> {
     /// differs.
     fn splice(&self, last: &Turn, held: &[u32], r: &ChatRequest) -> Option<Vec<u32>> {
         const END: &str = "<|im_end|>\n";
+        const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
         let n = last.messages.len();
         if r.messages.len() <= n
             || r.messages[..n] != last.messages[..]
@@ -400,12 +463,22 @@ impl<M: Model + 'static> Server<M> {
             ..r.options
         };
         let upto = chat::render(&r.messages[..=n], &r.tools, &options).ok()?;
-        if !upto.starts_with(&last.prompt_text)
-            || !upto.ends_with(END)
-            || !r.prompt_text.starts_with(&upto)
-        {
+        if !upto.starts_with(&last.prompt_text) || !upto.ends_with(END) {
             return None;
         }
+        // With thinking off, the answer starts with an empty think block that
+        // the template keeps for the last answer only, so the new render has
+        // the answer without it. The state keeps the tokens the model saw.
+        let upto = if r.prompt_text.starts_with(&upto) {
+            upto
+        } else {
+            let base = last.prompt_text.strip_suffix(EMPTY_THINK)?;
+            let upto = format!("{base}{}", &upto[last.prompt_text.len()..]);
+            if !r.prompt_text.starts_with(&upto) {
+                return None;
+            }
+            upto
+        };
         let rest = &r.prompt_text[upto.len() - END.len()..];
         let mut tokens = held.to_vec();
         tokens.extend(self.tokenizer.encode(rest));
@@ -437,26 +510,28 @@ enum Take {
 }
 
 impl<M: Model> Engine<M> {
-    /// Reuses the longest common prefix of the cached tokens and the prompt,
-    /// runs the rest, and returns the logits with the number of reused tokens.
-    fn start(&mut self, prompt: &[u32]) -> (Vec<f32>, usize) {
-        let mut keep = self
-            .tokens
-            .iter()
-            .zip(prompt)
-            .take_while(|(a, b)| a == b)
-            .count();
+    /// Reuses the longest state the model has for the prompt, runs the rest,
+    /// and returns the logits with the number of reused tokens. When the
+    /// client leaves first, the error has the tokens the state holds instead
+    /// of the logits.
+    fn start(
+        &mut self,
+        prompt: &[u32],
+        alive: &mut dyn FnMut() -> bool,
+    ) -> Result<(Vec<f32>, usize), (usize, usize)> {
         // At least one token has to run to get logits.
-        keep = keep.min(prompt.len().saturating_sub(1));
-        if keep < self.tokens.len() {
-            keep = self.model.truncate(keep);
-            if keep == 0 {
-                self.model.reset();
+        let usable = &prompt[..prompt.len().saturating_sub(1)];
+        let keep = self.model.resume(&self.tokens, usable);
+        match self.model.prefill_while(&prompt[keep..], alive) {
+            Ok(logits) => {
+                self.tokens = prompt.to_vec();
+                Ok((logits, keep))
+            }
+            Err(held) => {
+                self.tokens = prompt[..held].to_vec();
+                Err((held, keep))
             }
         }
-        let logits = self.model.prefill(&prompt[keep..]);
-        self.tokens = prompt.to_vec();
-        (logits, keep)
     }
 }
 
@@ -728,6 +803,24 @@ struct Request {
 }
 
 const MAX_BODY: usize = 64 << 20;
+
+/// Tokens between checks that the client is still there.
+const ALIVE_EVERY: usize = 16;
+
+/// False once the client has closed the connection. Clients do not send
+/// anything while they wait for the answer, so a peek that would block
+/// means the connection is open.
+fn client_alive(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let alive = match stream.peek(&mut [0]) {
+        Ok(n) => n > 0,
+        Err(e) => e.kind() == io::ErrorKind::WouldBlock,
+    };
+    let _ = stream.set_nonblocking(false);
+    alive
+}
 
 fn read_request(reader: &mut impl BufRead) -> Result<Request, String> {
     let mut line = String::new();

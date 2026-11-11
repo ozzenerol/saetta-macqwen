@@ -6,10 +6,10 @@
 // for up to ROWS_PASS rows: scores S^T = K Q^T and O = P V in 8x8
 // simdgroup matrices. More rows take more passes.
 //
-// The cache is f32 like attention.metal's, with room for whole chunks
+// The cache is half like attention.metal's, with room for whole chunks
 // (GpuKvCache rounds it up), so a chunk never reaches past it.
 
-constant uint ROWS_PASS = 4;
+constant uint ROWS_PASS = 2;
 // Row stride of the score tile: 128 + 4 floats, so the 8 rows of an 8x8
 // tile load fall in different banks.
 constant uint SC_STRIDE = DEC_CHUNK + 4;
@@ -23,9 +23,18 @@ struct RowsAttentionParams {
     uint chunks;  // per row in part_o and part_ml
 };
 
+// An 8x8 tile of the half cache as floats: this lane's two elements, row
+// f.x and columns f.y, f.y + 1 of frag.
+inline void load_half_tile(thread simdgroup_float8x8 &t, device const half *p, uint stride,
+                           uint2 f) {
+    half2 v = *(device const half2 *)(p + f.x * stride + f.y);
+    t.thread_elements()[0] = float(v.x);
+    t.thread_elements()[1] = float(v.y);
+}
+
 kernel void attention_partial_rows(device const float *q [[buffer(0)]],
-                                   device const float *keys [[buffer(1)]],
-                                   device const float *values [[buffer(2)]],
+                                   device const half *keys [[buffer(1)]],
+                                   device const half *values [[buffer(2)]],
                                    device float *part_o [[buffer(3)]],
                                    device float *part_ml [[buffer(4)]],
                                    constant RowsAttentionParams &p [[buffer(5)]],
@@ -43,6 +52,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
     }
     uint kv = tg.y;
     uint stride = p.kv_heads * DEC_DIM;
+    uint2 f = frag(lane);
     uint chunks = p.chunks;
 
     for (uint r0 = 0; r0 < p.rows; r0 += ROWS_PASS) {
@@ -51,7 +61,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
         // Scores: simdgroup s takes tokens 16s .. 16s + 15, two tiles of 8,
         // for all rows of the pass.
         {
-            device const float *k = keys + (start + 16 * simd) * stride + kv * DEC_DIM;
+            device const half *k = keys + (start + 16 * simd) * stride + kv * DEC_DIM;
             simdgroup_float8x8 s[ROWS_PASS][2];
 #pragma clang loop unroll(full)
             for (uint r = 0; r < ROWS_PASS; r++) {
@@ -64,8 +74,8 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                 simdgroup_float8x8 k0[4], k1[4];
 #pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; i++) {
-                    simdgroup_load(k0[i], k + d + 8 * i, stride);
-                    simdgroup_load(k1[i], k + 8 * stride + d + 8 * i, stride);
+                    load_half_tile(k0[i], k + d + 8 * i, stride, f);
+                    load_half_tile(k1[i], k + 8 * stride + d + 8 * i, stride, f);
                 }
 #pragma clang loop unroll(full)
                 for (uint r = 0; r < ROWS_PASS; r++) {
@@ -129,7 +139,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
         // Values: simdgroup s takes dims 32s .. 32s + 31, four tiles of 8,
         // for all rows of the pass.
         {
-            device const float *v = values + start * stride + kv * DEC_DIM + 32 * simd;
+            device const half *v = values + start * stride + kv * DEC_DIM + 32 * simd;
             simdgroup_float8x8 o[ROWS_PASS][4];
 #pragma clang loop unroll(full)
             for (uint r = 0; r < ROWS_PASS; r++) {
@@ -145,7 +155,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                 for (uint h = 0; h < 2; h++) {
 #pragma clang loop unroll(full)
                     for (uint i = 0; i < 4; i++) {
-                        simdgroup_load(vt[h][i], v + (t + 8 * h) * stride + 8 * i, stride);
+                        load_half_tile(vt[h][i], v + (t + 8 * h) * stride + 8 * i, stride, f);
                     }
                 }
 #pragma clang loop unroll(full)

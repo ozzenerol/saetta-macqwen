@@ -12,7 +12,7 @@ pub use mac::*;
 #[cfg(target_os = "macos")]
 mod mac {
     use crate::gpu::Gpu;
-    use crate::gpu_layers::GpuDeltaNetState;
+    use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache};
     use metal::{Buffer, CommandBuffer, Device, MTLResourceOptions};
     use std::sync::{Arc, Mutex};
 
@@ -75,11 +75,16 @@ mod mac {
                 .new_buffer(self.size, MTLResourceOptions::StorageModePrivate)
         }
 
-        /// A buffer from the pool, or a new one when the pool is empty.
+        /// A buffer from the pool, or a new one when the pool is empty. The
+        /// cache never holds more than the pool, so a new one means a bug;
+        /// it is logged, as it goes past `--cache-mb`.
         fn take(&self) -> GpuSnapshot {
             let buffer = self.free.lock().unwrap().pop();
             GpuSnapshot {
-                buffer: Some(buffer.unwrap_or_else(|| self.new_buffer())),
+                buffer: Some(buffer.unwrap_or_else(|| {
+                    eprintln!("snapshot pool is empty: allocating past the cache limit");
+                    self.new_buffer()
+                })),
                 free: Arc::clone(&self.free),
             }
         }
@@ -126,6 +131,98 @@ mod mac {
                 blit.copy_from_buffer(snapshot.buffer(), offset, buffer, 0, buffer.length());
             }
         })
+    }
+
+    /// A copy of KV rows `from..from + n` of every attention layer, for a
+    /// short detour that writes over a long conversation (cache::Restore).
+    /// The buffers are made for each copy at its size and freed when the
+    /// rows go back or a new copy replaces them.
+    pub struct RowBackup {
+        copy: Option<RowCopy>,
+    }
+
+    struct RowCopy {
+        keys: Vec<Buffer>,
+        values: Vec<Buffer>,
+        start: u64,
+        len: u64,
+    }
+
+    /// Bytes per KV row: buffer length over capacity, for any element type.
+    fn row_bytes(cache: &GpuKvCache) -> u64 {
+        cache.keys.length() / cache.capacity as u64
+    }
+
+    impl RowBackup {
+        pub fn new() -> RowBackup {
+            RowBackup { copy: None }
+        }
+
+        /// Bytes held now.
+        pub fn bytes(&self) -> u64 {
+            self.copy
+                .as_ref()
+                .map_or(0, |c| 2 * c.len * c.keys.len() as u64)
+        }
+
+        /// Copies rows `from..from + n` out of the caches.
+        pub fn save(&mut self, gpu: &Gpu, caches: &[&GpuKvCache], from: usize, n: usize) {
+            assert!(n <= crate::cache::BACKUP_ROWS);
+            self.copy = None;
+            if n == 0 || caches.is_empty() {
+                return;
+            }
+            let row = row_bytes(caches[0]);
+            let (start, len) = (from as u64 * row, n as u64 * row);
+            let new = || {
+                caches
+                    .iter()
+                    .map(|_| {
+                        gpu.device
+                            .new_buffer(len, MTLResourceOptions::StorageModePrivate)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let copy = RowCopy {
+                keys: new(),
+                values: new(),
+                start,
+                len,
+            };
+            gpu.blit(|blit| {
+                for (i, c) in caches.iter().enumerate() {
+                    blit.copy_from_buffer(&c.keys, start, &copy.keys[i], 0, len);
+                    blit.copy_from_buffer(&c.values, start, &copy.values[i], 0, len);
+                }
+            });
+            self.copy = Some(copy);
+        }
+
+        /// Copies the rows back where they came from and frees the copy.
+        /// The buffers stay alive until the GPU is done with them, since the
+        /// command buffer retains them.
+        pub fn restore(&mut self, gpu: &Gpu, caches: &[&GpuKvCache]) {
+            let Some(copy) = self.copy.take() else {
+                return;
+            };
+            gpu.blit(|blit| {
+                for (i, c) in caches.iter().enumerate() {
+                    blit.copy_from_buffer(&copy.keys[i], 0, &c.keys, copy.start, copy.len);
+                    blit.copy_from_buffer(&copy.values[i], 0, &c.values, copy.start, copy.len);
+                }
+            });
+        }
+
+        /// Frees the copy without putting it back.
+        pub fn clear(&mut self) {
+            self.copy = None;
+        }
+    }
+
+    impl Default for RowBackup {
+        fn default() -> RowBackup {
+            RowBackup::new()
+        }
     }
 
     #[cfg(test)]
@@ -196,6 +293,64 @@ mod mac {
             }
             assert!(!same_bits(&off, &want));
             assert!(same_bits(&got, &want), "logits differ after restore");
+        }
+
+        fn caches<'m>(m: &'m GpuModel) -> Vec<&'m GpuKvCache> {
+            m.states()
+                .filter_map(|s| match s {
+                    crate::gpu_model::State::Full(c) => Some(c),
+                    crate::gpu_model::State::Linear(_) => None,
+                })
+                .collect()
+        }
+
+        /// A detour from position 2 writes over KV rows of the prompt; with
+        /// those rows backed up and put back, the prompt's snapshot gives the
+        /// same logits, bit for bit, as running straight.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn row_backup_undoes_a_detour() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let layers = std::env::var("SAETTA_LAYERS").map_or(8, |n| n.parse().unwrap());
+            let mut m = GpuModel::load(&gpu, &cfg, &weights, layers, 64).unwrap();
+            assert!(!caches(&m).is_empty(), "needs an attention layer");
+            let prompt = [
+                760, 6511, 314, 9625, 369, 11, 323, 279, 6511, 314, 9419, 369,
+            ];
+            m.reset();
+            let want = prompt.iter().map(|&t| m.forward(t)).last().unwrap();
+
+            m.reset();
+            for &t in &prompt[..8] {
+                m.run(t);
+            }
+            let pool = SnapshotPool::new(&gpu, &m.deltanet_states(), 1);
+            let (snapshot, copy) = save(&gpu, &pool, &m.deltanet_states());
+            let mut rows = RowBackup::new();
+            rows.save(&gpu, &caches(&m), 2, 6);
+            // reset zeroes the states from the CPU, as GpuServed waits too.
+            copy.wait_until_completed();
+
+            // The detour: back to 2 tokens (a reset stands in for a snapshot
+            // there) and other tokens into rows 2..6.
+            m.reset();
+            for &t in &[prompt[0], prompt[1], 12345, 678, 9012, 3456] {
+                m.run(t);
+            }
+            m.forward(prompt[0]);
+            // Without the rows put back the detour shows.
+            restore(&gpu, &snapshot, &m.deltanet_states());
+            m.set_position(8);
+            let off = prompt[8..].iter().map(|&t| m.forward(t)).last().unwrap();
+            assert!(!same_bits(&off, &want), "the detour changed nothing");
+            rows.restore(&gpu, &caches(&m));
+            assert_eq!(rows.bytes(), 0);
+
+            restore(&gpu, &snapshot, &m.deltanet_states());
+            m.set_position(8);
+            let got = prompt[8..].iter().map(|&t| m.forward(t)).last().unwrap();
+            assert!(same_bits(&got, &want), "logits differ after the detour");
         }
 
         /// Times save and restore of the 30 DeltaNet states of the 35B model,

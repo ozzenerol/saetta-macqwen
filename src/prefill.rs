@@ -17,7 +17,9 @@ mod mac {
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache, Norm};
     use crate::gpu_model::State;
     use crate::moe::Experts;
+    use crate::plan::TokenParams;
     use crate::qmv::{GpuQuant, View};
+    use crate::sample_gpu::GpuSampler;
     use crate::weights::Weights;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
     use std::cell::Cell;
@@ -119,19 +121,20 @@ mod mac {
         gather: u32,
     }
 
-    /// `split` picks the kernel that splits x into two halves, for close
-    /// to f32 results.
-    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
-        let name = match w.bits {
-            5 => "qmm_5bit",
-            8 => "qmm_8bit",
-            b => panic!("no qmm kernel for {b} bits"),
-        };
-        gpu.pipeline(&if split {
-            format!("{name}_split")
+    /// The kernel for more than FEW_MAX rows: with `split`, qmm_<bits>bit_split
+    /// (x split into two halves, close to f32), else qmm_dq_<bits>bit (w
+    /// dequantized to half, as MLX).
+    fn qmm_name(w: &GpuQuant, split: bool) -> String {
+        assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
+        if split {
+            format!("qmm_{}bit_split", w.bits)
         } else {
-            name.to_string()
-        })
+            format!("qmm_dq_{}bit", w.bits)
+        }
+    }
+
+    fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
+        gpu.pipeline(&qmm_name(w, split))
     }
 
     /// y = x W^T for `m` rows of x.
@@ -144,6 +147,19 @@ mod mac {
         m: usize,
         split: bool,
     ) {
+        qmm_with(gpu, enc, w, x, y, m, &qmm_name(w, split));
+    }
+
+    /// qmm with the named large-m kernel.
+    fn qmm_with(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        y: &View,
+        m: usize,
+        kernel: &str,
+    ) {
         assert_eq!(w.experts, 1);
         let shape = MmShape {
             m: m as u32,
@@ -154,7 +170,7 @@ mod mac {
         if m <= FEW_MAX {
             enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
         } else {
-            enc.set_compute_pipeline_state(&qmm_pipeline(gpu, w, split));
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
         }
         set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y, x, x, x]);
@@ -260,15 +276,6 @@ mod mac {
         shared_gate: GpuQuant<'a>,
     }
 
-    /// A half copy of one KV cache, which fast prefill reads.
-    struct HalfKv {
-        keys: Buffer,
-        values: Buffer,
-        /// Tokens copied so far. Decode adds tokens to the f32 cache only,
-        /// so the next prefill copies the rest first.
-        len: Cell<usize>,
-    }
-
     /// Encodes y[i] = half(x[i]) for i < n.
     fn to_half(gpu: &Gpu, enc: &ComputeCommandEncoderRef, x: &View, y: &View, n: usize) {
         if n > 0 {
@@ -293,7 +300,7 @@ mod mac {
         normed: Buffer,
         /// in_proj_qkv or q_proj output, `[chunk, 8192]`
         wide: Buffer,
-        /// conv output, `[chunk, 8192]`
+        /// conv output, `[chunk, 8192]`, or the new keys and values in f32
         mixed: Buffer,
         /// in_proj_z output, or q after norm and rope
         z: Buffer,
@@ -434,12 +441,11 @@ mod mac {
         chunk: usize,
         scratch: Scratch,
         /// Use the split qmm kernels and f32 attention: within f32 rounding
-        /// of decode. With false, half inputs: faster, about 1e-3 off.
+        /// of decode. With false, w and x in half, as MLX: the matmuls are
+        /// about 6 times faster, 1e-3 off. serve runs with false.
         pub exact: bool,
         /// Largest |x| seen at each of `RANGES`, when tracked.
         ranges: Option<Buffer>,
-        /// One per attention layer, in layer order.
-        half_kv: Vec<HalfKv>,
         /// Buffers of `verify`, once `enable_verify` made them.
         verify_rows: Option<VerifyRows>,
         /// Set while `verify` encodes, so the DeltaNet layers write snapshots.
@@ -490,14 +496,12 @@ mod mac {
     ];
 
     impl<'a> Prefill<'a> {
-        /// `chunk` is the number of tokens per dispatch, `capacity` that
-        /// of the KV caches it will fill.
+        /// `chunk` is the number of tokens per dispatch.
         pub fn new(
             gpu: &Gpu,
             cfg: &'a Config,
             weights: &'a Weights,
             chunk: usize,
-            capacity: usize,
         ) -> Result<Prefill<'a>, String> {
             let attention = attention_config(cfg);
             let deltanet = deltanet_config(cfg);
@@ -562,18 +566,7 @@ mod mac {
                 });
             }
             let chunk = chunk.next_multiple_of(TILE);
-            let half_size = capacity * attention.kv_heads * attention.head_dim * 2;
-            let half_kv = layers
-                .iter()
-                .filter(|l| matches!(l.mixer, Mixer::Full(_)))
-                .map(|_| HalfKv {
-                    keys: gpu.buffer(half_size),
-                    values: gpu.buffer(half_size),
-                    len: Cell::new(0),
-                })
-                .collect();
             Ok(Prefill {
-                half_kv,
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
                 cfg,
@@ -696,37 +689,14 @@ mod mac {
             pos: usize,
             state: &State,
         ) {
-            let half = match state {
-                State::Full(cache) => {
-                    assert!(pos + n <= cache.capacity, "KV cache is full");
-                    // attention_rows reads keys in blocks of KEY_BLOCK.
-                    assert!(cache.capacity.is_multiple_of(KEY_BLOCK));
-                    let half = &self.half_kv[self.attention_index(l)];
-                    // A reset or a truncation may have moved back.
-                    half.len.set(half.len.get().min(pos));
-                    if !self.exact {
-                        let size = self.attention.kv_heads * self.attention.head_dim;
-                        let done = half.len.get();
-                        for (f32s, halves) in
-                            [(&cache.keys, &half.keys), (&cache.values, &half.values)]
-                        {
-                            to_half(
-                                gpu,
-                                enc,
-                                &at(f32s, done * size),
-                                &at_half(halves, done * size),
-                                (pos - done) * size,
-                            );
-                        }
-                        half.len.set(pos + n);
-                    }
-                    Some(half)
-                }
-                State::Linear(_) => None,
-            };
+            if let State::Full(cache) = state {
+                assert!(pos + n <= cache.capacity, "KV cache is full");
+                // attention_rows reads keys in blocks of KEY_BLOCK.
+                assert!(cache.capacity.is_multiple_of(KEY_BLOCK));
+            }
             for start in (0..n).step_by(self.chunk) {
                 let t = self.chunk.min(n - start);
-                self.encode_chunk(gpu, enc, l, x, start, t, pos + start, state, half);
+                self.encode_chunk(gpu, enc, l, x, start, t, pos + start, state);
             }
         }
 
@@ -746,7 +716,11 @@ mod mac {
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
             let conv = (c.kernel - 1) * channels * 4;
             let recurrent = c.v_heads * c.v_dim * c.k_dim * 4;
-            let linear = self.layers.len() - self.half_kv.len();
+            let linear = self
+                .layers
+                .iter()
+                .filter(|l| matches!(l.mixer, Mixer::Linear(_)))
+                .count();
             self.verify_rows = Some(VerifyRows {
                 rows,
                 conv: (0..linear).map(|_| gpu.buffer(rows * conv)).collect(),
@@ -761,7 +735,17 @@ mod mac {
         /// every row the final-norm hidden state, the logits, the argmax and
         /// the DeltaNet state after it, for speculative decoding. Use the
         /// exact kernels so rows match decode. Needs `enable_verify`.
-        pub fn verify(&self, gpu: &Gpu, tokens: &[u32], pos: usize, states: &[State]) -> Verify {
+        /// With `sampler`, also samples every row into its ring slot
+        /// (row i at position pos + i fills slot pos + i + 1), against the
+        /// drafts set in the ring.
+        pub fn verify(
+            &self,
+            gpu: &Gpu,
+            tokens: &[u32],
+            pos: usize,
+            states: &[State],
+            sampler: Option<&GpuSampler>,
+        ) -> Verify {
             let v = self.verify_rows.as_ref().expect("enable_verify first");
             let n = tokens.len();
             assert!(n > 0 && n <= v.rows, "verify takes 1 to {} tokens", v.rows);
@@ -788,6 +772,24 @@ mod mac {
                 set_views(enc, 0, &[&logits, &whole(&v.argmax)]);
                 params(enc, 2, &(self.lm_head.rows as u32));
                 groups(enc, (n, 1), 1024);
+                if let Some(s) = sampler {
+                    let vocab = self.lm_head.rows;
+                    let rows: Vec<TokenParams> = (0..n)
+                        .map(|i| TokenParams::new(0, (pos + i) as u32))
+                        .collect();
+                    let tp = gpu.buffer_from(&rows);
+                    for i in 0..n {
+                        let row = View {
+                            buffer: logits.buffer.clone(),
+                            offset: logits.offset + (i * vocab * 4) as u64,
+                        };
+                        let params = View {
+                            buffer: tp.clone(),
+                            offset: (i * size_of::<TokenParams>()) as u64,
+                        };
+                        s.encode(gpu, enc, &row, &params);
+                    }
+                }
             });
             self.snapshot_run.set(false);
             Verify {
@@ -817,14 +819,6 @@ mod mac {
                     }
                 }
             });
-        }
-
-        /// Which attention layer `l` is.
-        fn attention_index(&self, l: usize) -> usize {
-            self.layers[..l]
-                .iter()
-                .filter(|l| matches!(l.mixer, Mixer::Full(_)))
-                .count()
         }
 
         /// The logits of the last of the `n` hidden states in `x`.
@@ -867,7 +861,6 @@ mod mac {
             t: usize,
             pos: usize,
             state: &State,
-            half: Option<&HalfKv>,
         ) {
             let layer = &self.layers[l];
             let s = &self.scratch;
@@ -897,17 +890,9 @@ mod mac {
                         });
                     self.encode_deltanet(gpu, enc, w, st, &normed, &mixer_out, t, snaps)
                 }
-                (Mixer::Full(w), State::Full(cache)) => self.encode_attention(
-                    gpu,
-                    enc,
-                    w,
-                    cache,
-                    half.unwrap(),
-                    &normed,
-                    &mixer_out,
-                    t,
-                    pos,
-                ),
+                (Mixer::Full(w), State::Full(cache)) => {
+                    self.encode_attention(gpu, enc, w, cache, &normed, &mixer_out, t, pos)
+                }
                 _ => panic!("layer {l}: state does not match the layer type"),
             }
             dispatch_1d(
@@ -1002,7 +987,6 @@ mod mac {
             enc: &ComputeCommandEncoderRef,
             w: &AttentionWeights,
             cache: &GpuKvCache,
-            half: &HalfKv,
             x: &View,
             out: &View,
             t: usize,
@@ -1013,10 +997,7 @@ mod mac {
             let d = c.head_dim;
             let kv_size = c.kv_heads * d;
             let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
-            let (keys, values) = (
-                at(&cache.keys, pos * kv_size),
-                at(&cache.values, pos * kv_size),
-            );
+            let (keys, values) = (whole(&s.mixed), at(&s.mixed, t * kv_size));
             qmm(gpu, enc, &w.q, x, &q_and_gate, t, self.exact);
             qmm(gpu, enc, &w.k, x, &keys, t, self.exact);
             qmm(gpu, enc, &w.v, x, &values, t, self.exact);
@@ -1049,20 +1030,29 @@ mod mac {
                 );
             }
 
+            to_half(
+                gpu,
+                enc,
+                &keys,
+                &at_half(&cache.keys, pos * kv_size),
+                t * kv_size,
+            );
+            to_half(
+                gpu,
+                enc,
+                &values,
+                &at_half(&cache.values, pos * kv_size),
+                t * kv_size,
+            );
+            let cached = [whole(&cache.keys), whole(&cache.values)];
             if self.exact {
                 enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows"));
-                set_views(enc, 0, &[&q, &whole(&cache.keys), &whole(&cache.values)]);
+                set_views(enc, 0, &[&q, &cached[0], &cached[1]]);
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
-                let (hk, hv) = (
-                    at_half(&half.keys, pos * kv_size),
-                    at_half(&half.values, pos * kv_size),
-                );
-                to_half(gpu, enc, &keys, &hk, t * kv_size);
-                to_half(gpu, enc, &values, &hv, t * kv_size);
                 enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows_half"));
-                set_views(enc, 0, &[&q_half, &whole(&half.keys), &whole(&half.values)]);
+                set_views(enc, 0, &[&q_half, &cached[0], &cached[1]]);
             }
             set_views(enc, 3, &[&q_and_gate, &y]);
             let p = AttentionParams {
@@ -1188,9 +1178,9 @@ mod mac {
         (0..n).map(|i| ((i * 7919 + 13) % 150_000) as u32).collect()
     }
 
-    /// SAETTA_FAST=1 picks the half-input prefill kernels.
-    pub fn fast_from_env() -> bool {
-        std::env::var("SAETTA_FAST").is_ok_and(|v| v == "1")
+    /// SAETTA_EXACT=1 picks the exact prefill kernels over the fast ones.
+    pub fn exact_from_env() -> bool {
+        std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1")
     }
 
     /// Layer states for prefill without a `GpuModel`, for tests and
@@ -1237,7 +1227,7 @@ mod mac {
         let weights = Weights::open(dir)?;
         let gpu = Gpu::new()?;
         let capacity = tokens.next_multiple_of(KEY_BLOCK);
-        let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk, capacity)?;
+        let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
         prefill.exact = exact;
         let prompt = test_tokens(tokens);
         let owned = OwnedState::new_all(&gpu, &cfg, capacity);
@@ -1287,12 +1277,17 @@ mod mac {
             let w = GpuQuant::new(&gpu, &weights.quantized(module, &cfg.quantization)?);
             let x = View::new(gpu.buffer_from(&vec![0.01f32; m * w.cols]));
             let y = View::new(gpu.buffer(m * w.rows * 4));
-            for split in [false, true] {
+            let b = w.bits;
+            for name in [
+                format!("qmm_dq_{b}bit"),
+                format!("qmm_{b}bit"),
+                format!("qmm_{b}bit_split"),
+            ] {
                 let mut times: Vec<f64> = (0..=runs)
                     .map(|_| {
                         gpu.run(|enc| {
                             for _ in 0..5 {
-                                qmm(&gpu, enc, &w, &x, &y, m, split);
+                                qmm_with(&gpu, enc, &w, &x, &y, m, &name);
                             }
                         })
                         .as_secs_f64()
@@ -1303,7 +1298,7 @@ mod mac {
                 times.sort_by(f64::total_cmp);
                 let flops = 2.0 * (m * w.rows * w.cols) as f64;
                 println!(
-                    "qmm {}x{} {}-bit, m {m}, split {split}: median {:.2} ms, {:.1} TFLOP/s ({runs} runs)",
+                    "{name} {}x{} {}-bit, m {m}: median {:.2} ms, {:.1} TFLOP/s ({runs} runs)",
                     w.rows,
                     w.cols,
                     w.bits,
@@ -1380,11 +1375,19 @@ mod mac {
             }
         }
 
-        /// With the split kernels, prefill is within f32 rounding of the CPU.
+        /// With the split kernels and the CPU rounding its KV cache to half
+        /// as well, prefill is within f32 rounding of the CPU (1e-6 to 1e-4
+        /// up to layer 19 of this prompt). The two round slightly different
+        /// keys, so now and then a key lands on the next half value, and a
+        /// token at a near tie of the router picks another expert: 3e-3 for
+        /// one token at layer 20, which attention and the DeltaNet states
+        /// spread from there (median token 2.2e-3, worst 1.6e-2 and states 8e-3
+        /// by layer 37). A layout or slot bug is off by order 1, so bounds
+        /// at twice that still catch it.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 2e-5, 1e-4);
+            check_prefill(true, 5e-3, 1e-2);
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1414,12 +1417,19 @@ mod mac {
             let model = Model::new(&cfg, &weights).unwrap();
             let tokens = test_tokens(45);
             let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
-            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 20, capacity).unwrap();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 20).unwrap();
             prefill.exact = exact;
             let parts = [&tokens[..29], &tokens[29..]];
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
+            // The GPU cache is half; the CPU rounds its keys and values the
+            // same way.
+            for s in &mut cpu_states {
+                if let LayerState::Full(c) = s {
+                    c.round_to_half();
+                }
+            }
             let gpu_states = OwnedState::new_all(&gpu, &cfg, capacity);
             let mut cpu_x: Vec<Vec<Vec<f32>>> = parts
                 .iter()
@@ -1469,8 +1479,14 @@ mod mac {
                     }
                     (LayerState::Full(c), OwnedState::Full(g)) => {
                         let n = c.keys().len();
-                        let k = rel_rms(contents::<f32>(&g.keys, n), c.keys());
-                        let v = rel_rms(contents::<f32>(&g.values, n), c.values());
+                        let f32s = |b: &Buffer| -> Vec<f32> {
+                            contents::<half::f16>(b, n)
+                                .iter()
+                                .map(|v| v.to_f32())
+                                .collect()
+                        };
+                        let k = rel_rms(&f32s(&g.keys), c.keys());
+                        let v = rel_rms(&f32s(&g.values), c.values());
                         k.max(v)
                     }
                     _ => panic!("layer {l}: state types differ"),
@@ -1478,10 +1494,13 @@ mod mac {
                 println!(
                     "layer {l}: hidden rel rms {err:.2e}, median token {median:.2e}, state {state:.2e}"
                 );
-                // The half path may pick another expert at a near tie for a
-                // token, as bf16 MLX does, so only the median token counts.
-                let (hidden, state_bound) = if exact { (err, bound) } else { (median, 0.1) };
-                assert!(hidden < bound && state < state_bound, "layer {l}");
+                // A token may pick another expert at a near tie (see the
+                // tests above), so the median token counts.
+                let state_bound = if exact { 2e-2 } else { 0.1 };
+                assert!(median < bound && state < state_bound, "layer {l}");
+                if exact {
+                    assert!(err < 3e-2, "layer {l}");
+                }
             }
 
             let norm = weights
@@ -1507,7 +1526,7 @@ mod mac {
 
         /// Prefill into a GpuModel's states, then decode with it: the logits
         /// match a GpuModel fed every token one at a time. Covers prefill
-        /// after decode tokens too (the half KV copy catching up).
+        /// after decode tokens too, in the same KV cache.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn decode_after_prefill_matches_gpu_model() {
@@ -1517,7 +1536,7 @@ mod mac {
             let n = cfg.num_layers();
             let mut by_token = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
             let mut with_prefill = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
-            let prefill = Prefill::new(&gpu, &cfg, &weights, 64, capacity).unwrap();
+            let prefill = Prefill::new(&gpu, &cfg, &weights, 64).unwrap();
             assert!(prefill.exact);
             let tokens = test_tokens(50);
             // prefill 30, decode 5, prefill 10, decode 5
@@ -1549,7 +1568,10 @@ mod mac {
                     argmax(&got),
                     argmax(&want)
                 );
-                assert!(err < 1e-4);
+                // Prefill and decode round slightly different keys to half,
+                // which can flip a near tie of the router (2e-3 to 3e-2 on
+                // these tokens; 1e-6 with an f32 cache). A bug is order 1.
+                assert!(err < 5e-2);
                 assert_eq!(argmax(&got), argmax(&want));
             }
         }
@@ -1566,14 +1588,14 @@ mod mac {
             let n = cfg.num_layers();
             let mut decode = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
             let mut spec = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
-            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 64, capacity).unwrap();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 64).unwrap();
             prefill.enable_verify(&gpu, 5);
             let tokens = test_tokens(26);
             let (prompt, draft) = tokens[..25].split_at(20);
 
             prefill.run(&gpu, prompt, 0, &spec.states().collect::<Vec<_>>());
             spec.set_position(20);
-            let v = prefill.verify(&gpu, draft, 20, &spec.states().collect::<Vec<_>>());
+            let v = prefill.verify(&gpu, draft, 20, &spec.states().collect::<Vec<_>>(), None);
             let logits = contents::<f32>(&v.logits.buffer, draft.len() * cfg.vocab_size);
             for &t in prompt {
                 decode.forward(t);
@@ -1588,7 +1610,8 @@ mod mac {
                     v.argmax[i],
                     argmax(&want[i])
                 );
-                assert!(err < 1e-4);
+                // As in decode_after_prefill_matches_gpu_model.
+                assert!(err < 5e-2);
                 assert_eq!(v.argmax[i], argmax(&want[i]));
             }
             assert_eq!(v.argmax[0], argmax(got_row(logits, 0, cfg.vocab_size)));
@@ -1604,7 +1627,7 @@ mod mac {
             let got = spec.forward(tokens[25]);
             let err = rel_rms(&got, &want);
             println!("after restore of row 2: logits rel rms {err:.2e}");
-            assert!(err < 1e-4);
+            assert!(err < 5e-2);
             assert_eq!(argmax(&got), argmax(&want));
         }
 
@@ -1648,9 +1671,9 @@ mod mac {
                 .iter()
                 .map(|w| u32::from_le_bytes(*w))
                 .collect();
-            let exact = !fast_from_env();
+            let exact = exact_from_env();
             let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
-            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024, capacity).unwrap();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
             prefill.exact = exact;
             prefill.track_ranges(&gpu);
             let owned = OwnedState::new_all(&gpu, &cfg, capacity);
@@ -1683,7 +1706,7 @@ mod mac {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let t0 = Instant::now();
-            let p = Prefill::new(&gpu, &cfg, &weights, 2048, 4096).unwrap();
+            let p = Prefill::new(&gpu, &cfg, &weights, 2048).unwrap();
             println!("new: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
             let owned = OwnedState::new_all(&gpu, &cfg, 4096);
             let states: Vec<State> = owned.iter().map(|s| s.state()).collect();

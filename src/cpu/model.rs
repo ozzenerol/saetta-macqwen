@@ -168,6 +168,11 @@ pub struct LayerOutput {
 }
 
 impl<'a> Layer<'a> {
+    /// The MoE router matrix, for debugging.
+    pub fn router(&self) -> &Matrix<'a> {
+        &self.router
+    }
+
     fn load(cfg: &'a Config, weights: &'a Weights, index: usize) -> Result<Layer<'a>, String> {
         let prefix = format!("{PREFIX}.layers.{index}");
         Layer::load_at(cfg, weights, &prefix, cfg.layer_types[index])

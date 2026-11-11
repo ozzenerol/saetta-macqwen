@@ -17,6 +17,7 @@ pub const KERNELS: &str = concat!(
     include_str!("../kernels/model.metal"),
     include_str!("../kernels/prefill.metal"),
     include_str!("../kernels/sample.metal"),
+    include_str!("../kernels/qmm.metal"),
 );
 
 #[cfg(target_os = "macos")]
@@ -58,6 +59,11 @@ mod mac {
         queue: CommandQueue,
         library: Library,
         pipelines: RefCell<HashMap<String, ComputePipelineState>>,
+        /// The buffers `buffer_no_copy` made, by page range. The decode
+        /// model and the prefill wrap the same weights; with one buffer per
+        /// range, switching between them does not make Metal change which
+        /// 20 GB is resident, which took about 250 ms each way.
+        no_copy: RefCell<HashMap<(usize, usize), Buffer>>,
     }
 
     /// A file mapped into memory and wrapped as a GPU buffer without a copy.
@@ -85,6 +91,7 @@ mod mac {
                 queue,
                 library,
                 pipelines: RefCell::new(HashMap::new()),
+                no_copy: RefCell::new(HashMap::new()),
             })
         }
 
@@ -128,19 +135,29 @@ mod mac {
         /// a copy. The buffer starts at the page that holds `bytes[0]`; the
         /// returned offset is where `bytes` starts inside it.
         ///
+        /// The same page range gives the same buffer, which the `Gpu` keeps.
+        ///
         /// # Safety
-        /// `bytes` must lie in an mmap that outlives the buffer, so the whole
-        /// pages around it are mapped.
+        /// `bytes` must lie in an mmap that outlives the `Gpu`, so the whole
+        /// pages around it stay mapped and a later mmap cannot reuse the
+        /// range under a kept buffer.
         pub unsafe fn buffer_no_copy(&self, bytes: &[u8]) -> (Buffer, u64) {
             let start = bytes.as_ptr() as usize;
             let page_start = start / PAGE * PAGE;
             let page_end = (start + bytes.len()).div_ceil(PAGE) * PAGE;
-            let buffer = self.device.new_buffer_with_bytes_no_copy(
-                page_start as *const std::ffi::c_void,
-                (page_end - page_start) as u64,
-                OPTIONS,
-                None,
-            );
+            let buffer = self
+                .no_copy
+                .borrow_mut()
+                .entry((page_start, page_end))
+                .or_insert_with(|| {
+                    self.device.new_buffer_with_bytes_no_copy(
+                        page_start as *const std::ffi::c_void,
+                        (page_end - page_start) as u64,
+                        OPTIONS,
+                        None,
+                    )
+                })
+                .clone();
             (buffer, (start - page_start) as u64)
         }
 
