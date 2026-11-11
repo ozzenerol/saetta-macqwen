@@ -540,6 +540,9 @@ mod mac {
         verify_rows: Option<VerifyRows>,
         /// Set while `verify` encodes, so the DeltaNet layers write snapshots.
         snapshot_run: Cell<bool>,
+        /// Set while `verify` encodes: its rows run on the exact kernels
+        /// whatever `exact` says, so they match decode.
+        force_exact: Cell<bool>,
         /// Set by `profile`: only the stages up to this index in STAGES run.
         only: Cell<Option<usize>>,
     }
@@ -698,6 +701,7 @@ mod mac {
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
                 only: Cell::new(None),
+                force_exact: Cell::new(false),
                 cfg,
                 attention,
                 deltanet,
@@ -826,7 +830,7 @@ mod mac {
                     let half = &self.half_kv[self.attention_index(l)];
                     // A reset or a truncation may have moved back.
                     half.len.set(half.len.get().min(pos));
-                    if !self.exact {
+                    if !self.exact_now() {
                         let size = self.attention.kv_heads * self.attention.head_dim;
                         let done = half.len.get();
                         for (f32s, halves) in
@@ -864,12 +868,17 @@ mod mac {
             y: &View,
             m: usize,
         ) {
-            if self.exact || m <= FEW_MAX || !dense_qmm2() {
-                return qmm(gpu, enc, w, x, y, m, self.exact);
+            if self.exact_now() || m <= FEW_MAX || !dense_qmm2() {
+                return qmm(gpu, enc, w, x, y, m, self.exact_now());
             }
             let x_half = whole(&self.scratch.x_half);
             to_half(gpu, enc, x, &x_half, m * w.cols);
             crate::qmm::encode(enc, gpu, crate::qmm::DEFAULT, w, &x_half, y, m);
+        }
+
+        /// `exact`, or true while `verify` runs.
+        fn exact_now(&self) -> bool {
+            self.exact || self.force_exact.get()
         }
 
         /// Whether the dispatches of `stage` run: all do unless `profile`
@@ -965,8 +974,9 @@ mod mac {
 
         /// Runs `tokens` at positions `pos ..` as `run` does, and keeps for
         /// every row the final-norm hidden state, the logits, the argmax and
-        /// the DeltaNet state after it, for speculative decoding. Use the
-        /// exact kernels so rows match decode. Needs `enable_verify`.
+        /// the DeltaNet state after it, for speculative decoding. Runs on the
+        /// exact kernels even when `exact` is false, so rows match decode.
+        /// Needs `enable_verify`.
         /// With `sampler`, also samples every row into its ring slot
         /// (row i at position pos + i fills slot pos + i + 1), against the
         /// drafts set in the ring.
@@ -987,6 +997,7 @@ mod mac {
             let hidden = whole(&v.hidden);
             let logits = whole(&v.logits);
             self.snapshot_run.set(true);
+            self.force_exact.set(true);
             gpu.run(|enc| {
                 self.encode_embed(gpu, enc, &ids, &x, n);
                 for (l, state) in states.iter().enumerate() {
@@ -1024,6 +1035,7 @@ mod mac {
                 }
             });
             self.snapshot_run.set(false);
+            self.force_exact.set(false);
             Verify {
                 hidden,
                 logits,
@@ -1382,12 +1394,12 @@ mod mac {
                 }
                 return;
             }
-            let kernel = if self.exact {
+            let kernel = if self.exact_now() {
                 "attention_rows"
             } else {
                 attention_half_kernel()
             };
-            if self.exact {
+            if self.exact_now() {
                 enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q, &whole(&cache.keys), &whole(&cache.values)]);
             } else {
@@ -1446,7 +1458,7 @@ mod mac {
             if self.on("router") {
                 // Routing stays close to f32 so it picks the experts decode
                 // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
-                if !self.exact && fast_router() {
+                if !self.exact_now() && fast_router() {
                     self.mm(gpu, enc, &layer.router, normed, &router, t);
                 } else {
                     qmm(gpu, enc, &layer.router, normed, &router, t, true);
@@ -1468,7 +1480,7 @@ mod mac {
             }
 
             // Fast mode runs the experts on qmm2, with its tile size.
-            let tile_rows = if self.exact {
+            let tile_rows = if self.exact_now() {
                 TILE
             } else {
                 crate::qmm::tile_rows()
@@ -1515,7 +1527,7 @@ mod mac {
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
             let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
             if self.on("experts gate, up") {
-                if self.exact {
+                if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
                     qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
                 } else {
@@ -1534,7 +1546,7 @@ mod mac {
                 self.record(gpu, enc, 4, &eg, t * top_k * e.size());
             }
             if self.on("experts down") {
-                if self.exact {
+                if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, true);
                 } else {
                     to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
