@@ -26,8 +26,21 @@
 - C5 All 40 layers and the logits on the CPU, greedy generation, compared with `mlx_lm.server` greedy output.
 - C6 Metal versions of the Gated DeltaNet step, full attention and RMSNorm, checked against the CPU layers.
 
+- C7 GPU prefill: chunks of tokens per dispatch, quantized matrix-matrix kernel, chunked Gated DeltaNet.
+
+## Track D: prompt cache
+
+- D1 state snapshots and the prompt cache, as in docs/CACHE.md (src/cache.rs).
+
+## Track E: speculative decoding
+
+- E1 MTP layer on the CPU (src/mtp.rs) and draft-and-verify (src/speculative.rs); acceptance rate on qh-like prompts.
+
+## Track F: quality gate
+
+- F1 `saetta eval`: perplexity, long context and tool calls against MLX.
+
 ## Later
 
 - B5 One command buffer per token for the whole model, fused small ops, GPU router
 - MTP weights and speculative decoding
-- D1 state snapshots and the prompt cache, as in docs/CACHE.md
