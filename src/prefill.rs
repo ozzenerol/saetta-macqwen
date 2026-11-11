@@ -2110,7 +2110,18 @@ mod mac {
                 } else {
                     median
                 };
-                assert!(hidden < bound && state < bound * 1.25, "layer {l}");
+                // The state of an attention layer over a quantized cache is
+                // its codes: a key that moved with the hidden state lands on
+                // the next code, one step (1.9e-2 of the rms at 8 bits)
+                // away, so it gets twice the room (8 bits, layer 15: 2.5e-2
+                // while the median token is 5.3e-3).
+                let full = matches!(cpu_states[l], LayerState::Full(_));
+                let state_bound = if full && bits != KvBits::Half {
+                    bound * 2.5
+                } else {
+                    bound * 1.25
+                };
+                assert!(hidden < bound && state < state_bound, "layer {l}");
             }
 
             let norm = weights
