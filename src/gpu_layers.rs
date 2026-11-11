@@ -15,6 +15,7 @@ mod mac {
     use crate::cpu::deltanet::DeltaNetConfig;
     use crate::cpu::model::{attention_config, deltanet_config};
     use crate::gpu::Gpu;
+    use crate::kv_quant::{KvBits, QuantRows};
     use crate::plan::Plan;
     use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
@@ -154,13 +155,17 @@ mod mac {
         ))
     }
 
-    /// The keys (after norm and rope) and values on the GPU as half, each
-    /// token `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p`
-    /// goes in slot `p`. A page of the buffers takes memory only once
-    /// something is written there, so the full context costs nothing up front.
+    /// The keys (after norm and rope) and values on the GPU, each token
+    /// `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p` goes in
+    /// slot `p`. A page of the buffers takes memory only once something is
+    /// written there, so the full context costs nothing up front.
     pub struct GpuKvCache {
+        /// Half values, or with `quant` the codes (src/kv_quant.rs).
         pub keys: Buffer,
         pub values: Buffer,
+        /// The quantized keys and values, with their scales and biases.
+        pub quant: Option<(QuantRows, QuantRows)>,
+        pub bits: KvBits,
         decode: DecodeAttention,
         pub capacity: usize,
     }
@@ -170,16 +175,51 @@ mod mac {
     pub const KV_ALIGN: usize = 128;
 
     impl GpuKvCache {
-        /// Room for at least `capacity` tokens, rounded up to `KV_ALIGN`.
+        /// A half cache with room for at least `capacity` tokens, rounded up
+        /// to `KV_ALIGN`.
         pub fn new(gpu: &Gpu, cfg: &AttentionConfig, capacity: usize) -> GpuKvCache {
+            GpuKvCache::with_bits(gpu, cfg, capacity, KvBits::Half)
+        }
+
+        pub fn with_bits(
+            gpu: &Gpu,
+            cfg: &AttentionConfig,
+            capacity: usize,
+            bits: KvBits,
+        ) -> GpuKvCache {
             let capacity = capacity.next_multiple_of(KV_ALIGN);
-            let token = cfg.kv_heads * cfg.head_dim * 2;
+            let values = cfg.kv_heads * cfg.head_dim;
+            let decode = DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity);
+            if bits == KvBits::Half {
+                return GpuKvCache {
+                    keys: gpu.buffer(capacity * values * 2),
+                    values: gpu.buffer(capacity * values * 2),
+                    quant: None,
+                    bits,
+                    decode,
+                    capacity,
+                };
+            }
+            let k = QuantRows::new(gpu, bits, values, capacity);
+            let v = QuantRows::new(gpu, bits, values, capacity);
             GpuKvCache {
-                keys: gpu.buffer(capacity * token),
-                values: gpu.buffer(capacity * token),
-                decode: DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity),
+                keys: k.data.clone(),
+                values: v.data.clone(),
+                quant: Some((k, v)),
+                bits,
+                decode,
                 capacity,
             }
+        }
+
+        /// Every buffer of the cache; each holds `capacity` rows of equal
+        /// size, token `p` in row `p`.
+        pub fn buffers(&self) -> Vec<&Buffer> {
+            let mut out = vec![&self.keys, &self.values];
+            if let Some((k, v)) = &self.quant {
+                out.extend([&k.scales, &k.biases, &v.scales, &v.biases]);
+            }
+            out
         }
     }
 
@@ -234,16 +274,37 @@ mod mac {
         /// layer output, and the token's key and value go into `cache` at
         /// its position.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, cache: &GpuKvCache) {
-            let c = &self.cfg;
-            let d = c.head_dim;
             let [q_and_gate, q, k, v, attn] =
                 [&self.q_and_gate, &self.q, &self.k, &self.v, &self.out].map(whole);
 
             self.q_proj.record(plan, x, &q_and_gate, false);
             self.k_proj.record(plan, x, &k, true);
             self.v_proj.record(plan, x, &v, true);
+            self.record_store(plan, cache);
+            assert!(
+                cache.quant.is_none(),
+                "decode attention over a quantized KV cache needs track B's kernels"
+            );
 
             let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+            cache
+                .decode
+                .record(plan, &q, &keys, &values, &q_and_gate, &attn);
+
+            self.o_proj.record(plan, &attn, out, false);
+        }
+
+        /// q norm and RoPE into q, k norm and RoPE, then the key and value
+        /// into the cache slot of the token: as half in one op, or quantized
+        /// from k and v, which the op writes back in place.
+        pub(crate) fn record_store(&self, plan: &mut Plan, cache: &GpuKvCache) {
+            let c = &self.cfg;
+            let d = c.head_dim;
+            let [q_and_gate, q, k, v] = [&self.q_and_gate, &self.q, &self.k, &self.v].map(whole);
+            let (keys, values, kernel) = match &cache.quant {
+                None => (whole(&cache.keys), whole(&cache.values), "attention_prep"),
+                Some(_) => (k.clone(), v.clone(), "attention_prep_float"),
+            };
             let p = plan.constant(&[PrepParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -254,7 +315,7 @@ mod mac {
             }]);
             let params = plan.params.clone();
             plan.op(
-                "attention_prep",
+                kernel,
                 &[
                     &q_and_gate,
                     &k,
@@ -270,12 +331,10 @@ mod mac {
                 size(c.heads + c.kv_heads, 1),
                 size(d, 1),
             );
-
-            cache
-                .decode
-                .record(plan, &q, &keys, &values, &q_and_gate, &attn);
-
-            self.o_proj.record(plan, &attn, out, false);
+            if let Some((kq, vq)) = &cache.quant {
+                kq.record(plan, &k);
+                vq.record(plan, &v);
+            }
         }
     }
 
@@ -601,6 +660,84 @@ mod mac {
             );
         }
 
+        /// The keys and values a quantized cache stores, from the decode
+        /// path, against the CPU layer's: within the quantization step, and
+        /// nearly all of them the codes the CPU picks.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn quantized_store_matches_cpu() {
+            use crate::kv_quant::{dequantize, round_trip};
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let prefix = "language_model.model.layers.3";
+            let layer = GpuAttention::load(&gpu, &cfg, &weights, prefix).unwrap();
+            let x = View::new(gpu.buffer(cfg.hidden_size * 4));
+            let p = format!("{prefix}.self_attn");
+            let v = |n: &str| weights.tensor(&format!("{p}.{n}")).unwrap().to_f32();
+            let (q_norm, k_norm) = (v("q_norm.weight"), v("k_norm.weight"));
+            let m = |n: &str| quant(&weights, &cfg, &format!("{p}.{n}"));
+            let w = AttentionWeights {
+                q_proj: m("q_proj"),
+                k_proj: m("k_proj"),
+                v_proj: m("v_proj"),
+                o_proj: m("o_proj"),
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+            };
+            let c = attention_config(&cfg);
+            // The rounding error of a group of 64 is about step / sqrt(12),
+            // with the step range / 255 or range / 15: 5.5e-3 and 0.1 of the
+            // rms of the values.
+            for (bits, bound) in [(KvBits::Eight, 8e-3), (KvBits::Four, 0.15)] {
+                let cache = GpuKvCache::with_bits(&gpu, &layer.cfg, 64, bits);
+                let mut plan = Plan::new(&gpu);
+                let [q_and_gate, k, vv] =
+                    [&layer.q_and_gate, &layer.k, &layer.v].map(|b| View::new(b.clone()));
+                layer.q_proj.record(&mut plan, &x, &q_and_gate, false);
+                layer.k_proj.record(&mut plan, &x, &k, true);
+                layer.v_proj.record(&mut plan, &x, &vv, true);
+                layer.record_store(&mut plan, &cache);
+                let built = plan.build();
+                let mut cpu_cache = KvCache::default();
+                for t in 0..TOKENS {
+                    let input = input(&weights, prefix, t, cfg.rms_norm_eps);
+                    attention(&c, &w, &input, &mut cpu_cache);
+                    write(&x.buffer, &input);
+                    plan.set_params(TokenParams::new(0, t as u32));
+                    built.run(&gpu);
+                }
+                let (kq, vq) = cache.quant.as_ref().unwrap();
+                let groups = TOKENS * kq.per_token;
+                let words = groups * bits.words_per_group();
+                let read = |q: &crate::kv_quant::QuantRows| {
+                    dequantize(
+                        crate::gpu::contents::<u32>(&q.data, words),
+                        crate::gpu::contents::<half::f16>(&q.scales, groups),
+                        crate::gpu::contents::<half::f16>(&q.biases, groups),
+                        bits,
+                    )
+                };
+                for (name, got, want) in [
+                    ("keys", read(kq), cpu_cache.keys()),
+                    ("values", read(vq), cpu_cache.values()),
+                ] {
+                    let err = rel_rms(&got, want);
+                    let same = round_trip(want, bits)
+                        .iter()
+                        .zip(&got)
+                        .filter(|(a, b)| a == b)
+                        .count();
+                    println!(
+                        "{bits:?} {name}: rel rms {err:.2e} against f32, {same} of {} as the CPU stores them",
+                        got.len()
+                    );
+                    assert!(err < bound, "{bits:?} {name}");
+                    assert!(same * 100 >= got.len() * 99, "{bits:?} {name}");
+                }
+            }
+        }
+
+        /// The GPU layer over a half cache against the CPU one.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn attention_matches_cpu() {

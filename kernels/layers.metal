@@ -345,15 +345,18 @@ struct PrepParams {
 // Attention before the scores, in one op: q norm and RoPE into q, k norm
 // and RoPE into the cache slot of the token, v copied into its slot.
 // Threadgroups 0..heads are query heads, the next kv_heads are key/value
-// heads; `dim` threads each (dim <= 1024).
+// heads; `dim` threads each (dim <= 1024). With SLOT false, keys and values
+// are the one-token k and v instead, written in place (each thread writes
+// only what it read), for kv_quantize to take into a quantized cache.
+template <typename T, bool SLOT>
 kernel void attention_prep(device const float *q_and_gate [[buffer(0)]],
                            device const float *k [[buffer(1)]],
                            device const float *v [[buffer(2)]],
                            device const float *q_norm [[buffer(3)]],
                            device const float *k_norm [[buffer(4)]],
                            device float *q_out [[buffer(5)]],
-                           device half *keys [[buffer(6)]],
-                           device half *values [[buffer(7)]],
+                           device T *keys [[buffer(6)]],
+                           device T *values [[buffer(7)]],
                            constant PrepParams &p [[buffer(8)]],
                            constant TokenParams &t [[buffer(9)]],
                            uint g [[threadgroup_position_in_grid]],
@@ -365,7 +368,7 @@ kernel void attention_prep(device const float *q_and_gate [[buffer(0)]],
     threadgroup float head[1024];
     bool is_q = g < p.heads;
     uint j = is_q ? g : g - p.heads;
-    uint slot = t.position * p.kv_heads * p.dim + j * p.dim;
+    uint slot = (SLOT ? t.position * p.kv_heads * p.dim : 0) + j * p.dim;
 
     float x = is_q ? q_and_gate[j * 2 * p.dim + i] : k[j * p.dim + i];
     float inv = norm_scale(x * x, p.dim, p.eps, tmp, simd, lane, simds);
@@ -386,7 +389,13 @@ kernel void attention_prep(device const float *q_and_gate [[buffer(0)]],
     if (is_q) {
         q_out[j * p.dim + i] = x;
     } else {
-        keys[slot + i] = half(x);
-        values[slot + i] = half(v[j * p.dim + i]);
+        T value = T(v[j * p.dim + i]);
+        keys[slot + i] = T(x);
+        values[slot + i] = value;
     }
 }
+
+template [[host_name("attention_prep")]] kernel decltype(attention_prep<half, true>)
+    attention_prep<half, true>;
+template [[host_name("attention_prep_float")]] kernel decltype(attention_prep<float, false>)
+    attention_prep<float, false>;

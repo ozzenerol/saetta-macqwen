@@ -136,16 +136,25 @@ mod mac {
         copy: Option<RowCopy>,
     }
 
+    /// Rows `from..from + n` of each buffer of each cache, in the order of
+    /// `GpuKvCache::buffers`.
     struct RowCopy {
-        keys: Vec<Buffer>,
-        values: Vec<Buffer>,
-        start: u64,
-        len: u64,
+        parts: Vec<Buffer>,
+        from: usize,
+        n: usize,
     }
 
-    /// Bytes per KV row: buffer length over capacity, for any element type.
-    fn row_bytes(cache: &GpuKvCache) -> u64 {
-        cache.keys.length() / cache.capacity as u64
+    /// Bytes per row of one cache buffer: its length over the capacity.
+    fn row_bytes(buffer: &Buffer, cache: &GpuKvCache) -> u64 {
+        buffer.length() / cache.capacity as u64
+    }
+
+    /// Each cache buffer with its row size, in a fixed order.
+    fn parts<'c>(caches: &[&'c GpuKvCache]) -> Vec<(&'c Buffer, u64)> {
+        caches
+            .iter()
+            .flat_map(|c| c.buffers().into_iter().map(move |b| (b, row_bytes(b, c))))
+            .collect()
     }
 
     impl RowBackup {
@@ -157,7 +166,7 @@ mod mac {
         pub fn bytes(&self) -> u64 {
             self.copy
                 .as_ref()
-                .map_or(0, |c| 2 * c.len * c.keys.len() as u64)
+                .map_or(0, |c| c.parts.iter().map(|b| b.length()).sum())
         }
 
         /// Copies rows `from..from + n` out of the caches.
@@ -167,30 +176,24 @@ mod mac {
             if n == 0 || caches.is_empty() {
                 return;
             }
-            let row = row_bytes(caches[0]);
-            let (start, len) = (from as u64 * row, n as u64 * row);
-            let new = || {
-                caches
-                    .iter()
-                    .map(|_| {
-                        gpu.device
-                            .new_buffer(len, MTLResourceOptions::StorageModePrivate)
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let copy = RowCopy {
-                keys: new(),
-                values: new(),
-                start,
-                len,
-            };
+            let parts = parts(caches);
+            let copies: Vec<Buffer> = parts
+                .iter()
+                .map(|(_, row)| {
+                    gpu.device
+                        .new_buffer(n as u64 * row, MTLResourceOptions::StorageModePrivate)
+                })
+                .collect();
             gpu.blit(|blit| {
-                for (i, c) in caches.iter().enumerate() {
-                    blit.copy_from_buffer(&c.keys, start, &copy.keys[i], 0, len);
-                    blit.copy_from_buffer(&c.values, start, &copy.values[i], 0, len);
+                for ((buffer, row), copy) in parts.iter().zip(&copies) {
+                    blit.copy_from_buffer(buffer, from as u64 * row, copy, 0, n as u64 * row);
                 }
             });
-            self.copy = Some(copy);
+            self.copy = Some(RowCopy {
+                parts: copies,
+                from,
+                n,
+            });
         }
 
         /// Copies the rows back where they came from and frees the copy.
@@ -200,10 +203,11 @@ mod mac {
             let Some(copy) = self.copy.take() else {
                 return;
             };
+            let parts = parts(caches);
             gpu.blit(|blit| {
-                for (i, c) in caches.iter().enumerate() {
-                    blit.copy_from_buffer(&copy.keys[i], 0, &c.keys, copy.start, copy.len);
-                    blit.copy_from_buffer(&copy.values[i], 0, &c.values, copy.start, copy.len);
+                for ((buffer, row), saved) in parts.iter().zip(&copy.parts) {
+                    let (start, len) = (copy.from as u64 * row, copy.n as u64 * row);
+                    blit.copy_from_buffer(saved, 0, buffer, start, len);
                 }
             });
         }

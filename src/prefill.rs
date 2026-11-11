@@ -985,19 +985,31 @@ mod mac {
                 );
             }
 
-            to_half(
-                gpu,
-                enc,
-                &keys,
-                &at_half(&cache.keys, pos * kv_size),
-                t * kv_size,
-            );
-            to_half(
-                gpu,
-                enc,
-                &values,
-                &at_half(&cache.values, pos * kv_size),
-                t * kv_size,
+            match &cache.quant {
+                None => {
+                    to_half(
+                        gpu,
+                        enc,
+                        &keys,
+                        &at_half(&cache.keys, pos * kv_size),
+                        t * kv_size,
+                    );
+                    to_half(
+                        gpu,
+                        enc,
+                        &values,
+                        &at_half(&cache.values, pos * kv_size),
+                        t * kv_size,
+                    );
+                }
+                Some((kq, vq)) => {
+                    kq.encode(gpu, enc, &keys, pos, t);
+                    vq.encode(gpu, enc, &values, pos, t);
+                }
+            }
+            assert!(
+                cache.quant.is_none(),
+                "prefill attention over a quantized KV cache is not written yet"
             );
             let cached = [whole(&cache.keys), whole(&cache.values)];
             if self.exact {
