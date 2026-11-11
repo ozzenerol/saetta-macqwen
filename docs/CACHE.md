@@ -45,7 +45,7 @@ A snapshot is one 65.9 MB buffer, made when it is saved and freed when the cache
 
 ## KV cache formats
 
-The KV cache of each attention layer is allocated once for the whole context (`serve --context N`, default 262144). A page of it takes memory only when a token is written there, and it is not given back while the server runs.
+The KV cache of each attention layer starts at 32768 tokens, doubles as a conversation needs more, up to `serve --context N` (default 262144), and shrinks again once the prompt cache no longer needs the rows; [MEMORY.md](MEMORY.md) has the details.
 
 Bytes per token over the 10 attention layers, keys and values of 2 heads of 256:
 
