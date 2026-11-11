@@ -4,7 +4,7 @@
 
 use half::bf16;
 
-use super::attention::{AttentionConfig, AttentionWeights, KvCache, attention};
+use super::attention::{AttentionConfig, AttentionWeights, KvCache, attention_at};
 use super::deltanet::{DeltaNetConfig, DeltaNetState, DeltaNetWeights, deltanet};
 use super::matrix::Matrix;
 use super::moe::{Mlp, expert, mix, mlp, route};
@@ -70,12 +70,27 @@ impl<'a> Model<'a> {
 
     /// Runs one token through all layers and returns the logits.
     pub fn forward(&self, token: u32, states: &mut [LayerState]) -> Result<Vec<f32>, String> {
+        Ok(self.logits(&self.forward_hidden(token, states)?))
+    }
+
+    /// Runs one token through all layers and returns the hidden state after
+    /// the final norm.
+    pub fn forward_hidden(
+        &self,
+        token: u32,
+        states: &mut [LayerState],
+    ) -> Result<Vec<f32>, String> {
         let mut x = self.embed(token);
         for (layer, state) in self.layers.iter().zip(states) {
             x = layer.step(&x, state)?.hidden;
         }
         rms_norm(&mut x, &self.norm, self.cfg.rms_norm_eps);
-        Ok(self.lm_head.matvec(&x))
+        Ok(x)
+    }
+
+    /// `lm_head` on a hidden state that is already normed.
+    pub fn logits(&self, normed: &[f32]) -> Vec<f32> {
+        self.lm_head.matvec(normed)
     }
 
     /// Greedy decoding: feeds `prompt`, then picks the most likely token
@@ -155,6 +170,18 @@ pub struct LayerOutput {
 impl<'a> Layer<'a> {
     fn load(cfg: &'a Config, weights: &'a Weights, index: usize) -> Result<Layer<'a>, String> {
         let prefix = format!("{PREFIX}.layers.{index}");
+        Layer::load_at(cfg, weights, &prefix, cfg.layer_types[index])
+    }
+
+    /// Loads a layer of type `kind` from the tensors under `prefix`, such as
+    /// `language_model.mtp.layers.0`.
+    pub fn load_at(
+        cfg: &'a Config,
+        weights: &'a Weights,
+        prefix: &str,
+        kind: LayerType,
+    ) -> Result<Layer<'a>, String> {
+        let prefix = prefix.to_string();
         let matrix = |name: &str| -> Result<Matrix<'a>, String> {
             let module = format!("{prefix}.{name}");
             Ok(Matrix::quant(
@@ -172,7 +199,7 @@ impl<'a> Layer<'a> {
             })
         };
 
-        let mixer = match cfg.layer_types[index] {
+        let mixer = match kind {
             LayerType::LinearAttention => Mixer::Linear {
                 cfg: deltanet_config(cfg),
                 matrices: Box::new([
@@ -219,6 +246,26 @@ impl<'a> Layer<'a> {
 
     /// `h = x + mixer(norm(x))`, then `h + moe(norm(h))`.
     pub fn step(&self, x: &[f32], state: &mut LayerState) -> Result<LayerOutput, String> {
+        self.run(x, state, None)
+    }
+
+    /// `step` with the RoPE position of a full attention layer given instead
+    /// of taken from its cache length.
+    pub fn step_at(
+        &self,
+        x: &[f32],
+        state: &mut LayerState,
+        pos: usize,
+    ) -> Result<LayerOutput, String> {
+        self.run(x, state, Some(pos))
+    }
+
+    fn run(
+        &self,
+        x: &[f32],
+        state: &mut LayerState,
+        pos: Option<usize>,
+    ) -> Result<LayerOutput, String> {
         let eps = self.cfg.rms_norm_eps;
         let mut normed = x.to_vec();
         rms_norm(&mut normed, &self.input_norm, eps);
@@ -260,7 +307,8 @@ impl<'a> Layer<'a> {
                     q_norm: &v[0],
                     k_norm: &v[1],
                 };
-                attention(cfg, &w, &normed, cache)
+                let pos = pos.unwrap_or(cache.len());
+                attention_at(cfg, &w, &normed, cache, pos)
             }
             _ => {
                 return Err(format!(

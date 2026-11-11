@@ -71,8 +71,20 @@ pub fn attention(
     x: &[f32],
     cache: &mut KvCache,
 ) -> Vec<f32> {
-    let d = cfg.head_dim;
     let pos = cache.len;
+    attention_at(cfg, w, x, cache, pos)
+}
+
+/// `attention` with the RoPE position given instead of taken from the cache
+/// length.
+pub fn attention_at(
+    cfg: &AttentionConfig,
+    w: &AttentionWeights,
+    x: &[f32],
+    cache: &mut KvCache,
+    pos: usize,
+) -> Vec<f32> {
+    let d = cfg.head_dim;
 
     let q_and_gate = w.q_proj.matvec(x);
     let mut q = Vec::with_capacity(cfg.heads * d);
