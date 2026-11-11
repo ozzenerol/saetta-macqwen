@@ -436,8 +436,10 @@ const MTP_WINDOW: usize = 32;
 const PREFILL_CHUNK: usize = 1024;
 
 #[cfg(target_os = "macos")]
+/// Fast prefill unless SAETTA_EXACT=1: track F's eval found it within
+/// 0.04% of the f32 perplexity, closer than MLX in bf16.
 fn exact_prefill() -> bool {
-    !saetta::prefill::fast_from_env()
+    saetta::prefill::exact_from_env()
 }
 
 // The server uses the model from one thread at a time, behind its engine
