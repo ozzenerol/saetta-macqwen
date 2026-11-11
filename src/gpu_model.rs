@@ -193,16 +193,14 @@ mod mac {
                 self.shared_gate.rows,
                 true,
             );
+            // The barrier before shared_down also covers route_top_k, so the
+            // routed experts' first op can run alongside it.
             self.shared_down.record(plan, &s.shared_h, &s.shared, false);
-            self.experts.record(
-                plan,
-                &s.normed,
-                &s.ids,
-                &s.weights,
-                cfg.num_experts_per_tok,
-                &s.experts_h,
-                &s.routed,
-            );
+            let k = cfg.num_experts_per_tok;
+            self.experts
+                .record_gate_up(plan, &s.normed, &s.ids, k, &s.experts_h, true);
+            self.experts
+                .record_down(plan, &s.experts_h, &s.ids, &s.weights, k, &s.routed);
             elementwise(
                 plan,
                 "moe_mix",
