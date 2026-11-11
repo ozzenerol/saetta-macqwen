@@ -17,6 +17,7 @@ pub mod prefill;
 pub mod qmv;
 pub mod quant;
 pub mod sample;
+pub mod sample_gpu;
 pub mod server;
 pub mod speculative;
 pub mod tokenizer;
