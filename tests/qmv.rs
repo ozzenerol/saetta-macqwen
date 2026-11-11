@@ -4,6 +4,7 @@
 
 use saetta::config::Config;
 use saetta::gpu::{Gpu, contents};
+use saetta::plan::Plan;
 use saetta::qmv::{GpuQuant, View};
 use saetta::quant;
 use saetta::weights::Weights;
@@ -50,7 +51,9 @@ fn matches_cpu_on_real_matrices() {
         let x = input(m.cols);
         let xb = View::new(gpu.buffer_from(&x));
         let yb = View::new(gpu.buffer(m.rows * 4));
-        gpu.run(|enc| m.encode(&gpu, enc, &xb, &yb));
+        let mut plan = Plan::new(&gpu);
+        m.record(&mut plan, &xb, &yb, false);
+        plan.run_serial();
         let y = contents::<f32>(&yb.buffer, m.rows);
 
         let w = quant::dequantize(

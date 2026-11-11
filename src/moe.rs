@@ -7,9 +7,10 @@ pub use mac::*;
 mod mac {
     use crate::config::Quantization;
     use crate::gpu::Gpu;
-    use crate::qmv::{GpuQuant, View, set_views};
+    use crate::plan::Plan;
+    use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
-    use metal::{ComputeCommandEncoderRef, MTLSize};
+    use metal::MTLSize;
 
     /// Must match MOE_ROWS and MOE_SIMDS in the kernel.
     const ROWS_PER_SIMD: usize = 1;
@@ -30,9 +31,18 @@ mod mac {
             quant: &Quantization,
             layer: &str,
         ) -> Result<Experts<'a>, String> {
+            Experts::load(weights, quant, layer, |q| GpuQuant::new(gpu, q))
+        }
+
+        fn load(
+            weights: &'a Weights,
+            quant: &Quantization,
+            layer: &str,
+            make: impl Fn(&crate::weights::QuantTensor<'a>) -> GpuQuant<'a>,
+        ) -> Result<Experts<'a>, String> {
             let load = |name: &str| -> Result<GpuQuant<'a>, String> {
                 let q = weights.quantized(&format!("{layer}.mlp.switch_mlp.{name}"), quant)?;
-                Ok(GpuQuant::new(gpu, &q))
+                Ok(make(&q))
             };
             let e = Experts {
                 gate: load("gate_proj")?,
@@ -46,7 +56,31 @@ mod mac {
             assert_eq!((e.down.rows, e.down.cols), (e.gate.cols, e.gate.rows));
             Ok(e)
         }
+    }
 
+    impl Experts<'static> {
+        /// Copies of experts `ids` only, numbered 0.. in that order. See
+        /// `GpuQuant::subset`.
+        pub fn subset(
+            gpu: &Gpu,
+            weights: &Weights,
+            quant: &Quantization,
+            layer: &str,
+            ids: &[usize],
+        ) -> Result<Experts<'static>, String> {
+            let load = |name: &str| -> Result<GpuQuant<'static>, String> {
+                let q = weights.quantized(&format!("{layer}.mlp.switch_mlp.{name}"), quant)?;
+                Ok(GpuQuant::subset(gpu, &q, ids))
+            };
+            Ok(Experts {
+                gate: load("gate_proj")?,
+                up: load("up_proj")?,
+                down: load("down_proj")?,
+            })
+        }
+    }
+
+    impl Experts<'_> {
         /// The hidden size of one expert (rows of gate and up).
         pub fn size(&self) -> usize {
             self.gate.rows
@@ -57,14 +91,13 @@ mod mac {
             count * (self.gate.bytes() + self.up.bytes() + self.down.bytes())
         }
 
-        /// Encodes y = sum of weights[i] * expert(ids[i], x) for i < count, in
-        /// two dispatches. `ids` holds u32, `weights` f32, and `h` is scratch
-        /// for count * size() f32 values. `x` and `y` have the model width.
+        /// Records y = sum of weights[i] * expert(ids[i], x) for i < count,
+        /// as two ops. `ids` holds u32, `weights` f32, and `h` is scratch for
+        /// count * size() f32 values. `x` and `y` have the model width.
         #[allow(clippy::too_many_arguments)]
-        pub fn encode(
+        pub fn record(
             &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
+            plan: &mut Plan,
             x: &View,
             ids: &View,
             weights: &View,
@@ -72,53 +105,48 @@ mod mac {
             h: &View,
             y: &View,
         ) {
-            self.encode_gate_up(gpu, enc, x, ids, count, h);
-            self.encode_down(gpu, enc, h, ids, weights, count, y);
+            self.record_gate_up(plan, x, ids, count, h);
+            self.record_down(plan, h, ids, weights, count, y);
         }
 
         /// h[i] = silu(gate[ids[i]] x) * up[ids[i]] x for i < count.
-        pub fn encode_gate_up(
+        pub fn record_gate_up(
             &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
+            plan: &mut Plan,
             x: &View,
             ids: &View,
             count: usize,
             h: &View,
         ) {
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_gate_up_5bit"));
-            self.gate.set_buffers(enc, 0);
-            self.up.set_buffers(enc, 3);
-            set_views(enc, 6, &[x, h]);
-            let shape = [self.gate.rows as u32, self.gate.cols as u32, count as u32];
-            enc.set_bytes(8, 12, shape.as_ptr().cast());
-            set_views(enc, 9, &[ids]);
-            enc.dispatch_thread_groups(
-                MTLSize::new(row_groups(self.gate.rows), count as u64, 1),
+            let (g, u) = (&self.gate, &self.up);
+            let shape = plan.constant(&[g.rows as u32, g.cols as u32, count as u32]);
+            plan.op(
+                "moe_gate_up_5bit",
+                &[
+                    &g.words, &g.scales, &g.biases, &u.words, &u.scales, &u.biases, x, h, &shape,
+                    ids,
+                ],
+                MTLSize::new(row_groups(g.rows), count as u64, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),
             );
         }
 
         /// y = sum of weights[i] * down[ids[i]] h[i] for i < count.
-        #[allow(clippy::too_many_arguments)]
-        pub fn encode_down(
+        pub fn record_down(
             &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
+            plan: &mut Plan,
             h: &View,
             ids: &View,
             weights: &View,
             count: usize,
             y: &View,
         ) {
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_down_5bit"));
-            self.down.set_buffers(enc, 0);
-            set_views(enc, 3, &[h, y]);
-            let shape = [self.down.rows as u32, self.down.cols as u32, count as u32];
-            enc.set_bytes(5, 12, shape.as_ptr().cast());
-            set_views(enc, 6, &[ids, weights]);
-            enc.dispatch_thread_groups(
-                MTLSize::new(row_groups(self.down.rows), 1, 1),
+            let d = &self.down;
+            let shape = plan.constant(&[d.rows as u32, d.cols as u32, count as u32]);
+            plan.op(
+                "moe_down_5bit",
+                &[&d.words, &d.scales, &d.biases, h, y, &shape, ids, weights],
+                MTLSize::new(row_groups(d.rows), 1, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),
             );
         }
@@ -140,21 +168,24 @@ mod mac {
         let config = crate::config::Config::load(dir)?;
         let weights = Weights::open(dir)?;
         let gpu = Gpu::new()?;
+        // Only the 8 used experts of each layer, copied: about 690 MB in all,
+        // the same bytes one token reads.
         let layers: Vec<Experts> = (0..config.num_layers())
             .map(|l| {
-                Experts::new(
+                let used = bench_ids(l).map(|e| e as usize);
+                Experts::subset(
                     &gpu,
                     &weights,
                     &config.quantization,
                     &format!("language_model.model.layers.{l}"),
+                    &used,
                 )
             })
             .collect::<Result<_, _>>()?;
         let hidden = layers[0].gate.cols;
         let x = View::new(gpu.buffer_from(&vec![0.01f32; hidden]));
-        let ids: Vec<View> = (0..layers.len())
-            .map(|l| View::new(gpu.buffer_from(&bench_ids(l))))
-            .collect();
+        let slots = View::new(gpu.buffer_from(&[0u32, 1, 2, 3, 4, 5, 6, 7]));
+        let ids: Vec<&View> = vec![&slots; layers.len()];
         let w = View::new(gpu.buffer_from(&[0.125f32; 8]));
         let h = View::new(gpu.buffer(8 * layers[0].size() * 4));
         let y = View::new(gpu.buffer(hidden * 4));
@@ -175,20 +206,18 @@ mod mac {
             per_layer / 1e6
         );
         for (part, (label, bytes)) in parts.iter().enumerate() {
+            let mut plan = Plan::new(&gpu);
+            for (layer, ids) in layers.iter().zip(&ids) {
+                if part != 2 {
+                    layer.record_gate_up(&mut plan, &x, ids, 8, &h);
+                }
+                if part != 1 {
+                    layer.record_down(&mut plan, &h, ids, &w, 8, &y);
+                }
+            }
+            let built = plan.build();
             let mut times: Vec<f64> = (0..=runs)
-                .map(|_| {
-                    gpu.run(|enc| {
-                        for (layer, ids) in layers.iter().zip(&ids) {
-                            if part != 2 {
-                                layer.encode_gate_up(&gpu, enc, &x, ids, 8, &h);
-                            }
-                            if part != 1 {
-                                layer.encode_down(&gpu, enc, &h, ids, &w, 8, &y);
-                            }
-                        }
-                    })
-                    .as_secs_f64()
-                })
+                .map(|_| built.run(&gpu).as_secs_f64())
                 .skip(1)
                 .collect();
             times.sort_by(f64::total_cmp);

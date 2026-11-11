@@ -6,8 +6,9 @@ pub use mac::*;
 #[cfg(target_os = "macos")]
 mod mac {
     use crate::gpu::Gpu;
+    use crate::plan::Plan;
     use crate::weights::{QuantTensor, Tensor};
-    use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+    use metal::{Buffer, MTLSize};
     use std::marker::PhantomData;
 
     /// Must match QMV_ROWS and QMV_SIMDS in the kernel.
@@ -15,6 +16,7 @@ mod mac {
     const SIMDS: usize = 2;
 
     /// A GPU buffer and the byte offset where the data starts in it.
+    #[derive(Clone)]
     pub struct View {
         pub buffer: Buffer,
         pub offset: u64,
@@ -62,44 +64,57 @@ mod mac {
             }
         }
 
+        /// Copies experts `ids` of a stacked tensor into new buffers, in that
+        /// order. Benchmarks use it: binding every layer's full expert stacks
+        /// asks Metal to keep about 20 GB resident.
+        pub fn subset(gpu: &Gpu, q: &QuantTensor, ids: &[usize]) -> GpuQuant<'static> {
+            assert_eq!(q.params.group_size, 64);
+            let experts = q.weight.shape[0];
+            let pick = |t: &Tensor| {
+                let per = t.bytes.len() / experts;
+                let bytes: Vec<u8> = ids
+                    .iter()
+                    .flat_map(|&e| &t.bytes[e * per..(e + 1) * per])
+                    .copied()
+                    .collect();
+                View::new(gpu.buffer_from(&bytes))
+            };
+            GpuQuant {
+                words: pick(&q.weight),
+                scales: pick(&q.scales),
+                biases: pick(&q.biases),
+                experts: ids.len(),
+                rows: q.out_features(),
+                cols: q.in_features(),
+                bits: q.params.bits,
+                copies: 3,
+                weights: PhantomData,
+            }
+        }
+
         /// The bytes the kernel reads from one matrix (one expert).
         pub fn bytes(&self) -> usize {
             self.rows * self.cols * self.bits as usize / 8 + self.rows * (self.cols / 64) * 4
         }
 
-        /// Encodes y = W x. `x` holds `cols` f32 values, `y` gets `rows`.
-        pub fn encode(&self, gpu: &Gpu, enc: &ComputeCommandEncoderRef, x: &View, y: &View) {
+        /// Records y = W x. `x` holds `cols` f32 values, `y` gets `rows`.
+        /// `parallel` marks it independent of the op recorded before it.
+        pub fn record(&self, plan: &mut Plan, x: &View, y: &View, parallel: bool) {
             assert_eq!(self.experts, 1, "stacked experts go through moe");
-            let name = match self.bits {
+            let kernel = match self.bits {
                 5 => "qmv_5bit",
                 8 => "qmv_8bit",
                 b => panic!("no qmv kernel for {b} bits"),
             };
-            enc.set_compute_pipeline_state(&gpu.pipeline(name));
-            self.set_buffers(enc, 0);
-            set_views(enc, 3, &[x, y]);
-            let shape = [self.rows as u32, self.cols as u32];
-            enc.set_bytes(5, 8, shape.as_ptr().cast());
-            let rows_per_group = ROWS_PER_SIMD * SIMDS;
-            let groups = self.rows.div_ceil(rows_per_group);
-            enc.dispatch_thread_groups(
-                MTLSize::new(groups as u64, 1, 1),
-                MTLSize::new(32 * SIMDS as u64, 1, 1),
-            );
-        }
-    }
-
-    impl GpuQuant<'_> {
-        /// Binds words, scales and biases at indices `first` to `first + 2`.
-        pub fn set_buffers(&self, enc: &ComputeCommandEncoderRef, first: u64) {
-            set_views(enc, first, &[&self.words, &self.scales, &self.biases]);
-        }
-    }
-
-    /// Binds `views` at consecutive buffer indices from `first`.
-    pub fn set_views(enc: &ComputeCommandEncoderRef, first: u64, views: &[&View]) {
-        for (i, v) in views.iter().enumerate() {
-            enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
+            let shape = plan.constant(&[self.rows as u32, self.cols as u32]);
+            let buffers = [&self.words, &self.scales, &self.biases, x, y, &shape];
+            let grid = MTLSize::new(self.rows.div_ceil(ROWS_PER_SIMD * SIMDS) as u64, 1, 1);
+            let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
+            if parallel {
+                plan.op_parallel(kernel, &buffers, grid, threads);
+            } else {
+                plan.op(kernel, &buffers, grid, threads);
+            }
         }
     }
 
@@ -134,15 +149,13 @@ mod mac {
             let m = GpuQuant::new(&gpu, &q);
             let x = View::new(gpu.buffer_from(&vec![0.5f32; m.cols]));
             let y = View::new(gpu.buffer(m.rows * 4));
+            let mut plan = Plan::new(&gpu);
+            for _ in 0..reps {
+                m.record(&mut plan, &x, &y, false);
+            }
+            let built = plan.build();
             let mut times: Vec<f64> = (0..=runs)
-                .map(|_| {
-                    gpu.run(|enc| {
-                        for _ in 0..reps {
-                            m.encode(&gpu, enc, &x, &y);
-                        }
-                    })
-                    .as_secs_f64()
-                })
+                .map(|_| built.run(&gpu).as_secs_f64())
                 .skip(1)
                 .collect();
             times.sort_by(f64::total_cmp);

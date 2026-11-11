@@ -6,6 +6,7 @@ use half::bf16;
 use saetta::config::Config;
 use saetta::gpu::{Gpu, contents};
 use saetta::moe::Experts;
+use saetta::plan::Plan;
 use saetta::qmv::View;
 use saetta::quant;
 use saetta::weights::{QuantTensor, Weights};
@@ -72,7 +73,9 @@ fn matches_cpu_on_layer_0() {
     let wb = View::new(gpu.buffer_from(&w));
     let hb = View::new(gpu.buffer(8 * experts.size() * 4));
     let yb = View::new(gpu.buffer(hidden * 4));
-    gpu.run(|enc| experts.encode(&gpu, enc, &xb, &idb, &wb, 8, &hb, &yb));
+    let mut plan = Plan::new(&gpu);
+    experts.record(&mut plan, &xb, &idb, &wb, 8, &hb, &yb);
+    plan.run_serial();
     let y = contents::<f32>(&yb.buffer, hidden);
 
     let module = |name: &str| {
