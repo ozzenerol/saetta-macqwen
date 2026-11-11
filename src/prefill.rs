@@ -1933,6 +1933,30 @@ mod mac {
             }
         }
 
+        /// verify gives the same rows with `exact` false as with true.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn verify_is_exact_in_fast_mode() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let n = cfg.num_layers();
+            let tokens = test_tokens(26);
+            let (prompt, draft) = tokens[..25].split_at(20);
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 64, 64).unwrap();
+            prefill.enable_verify(&gpu, 5);
+            let mut rows = Vec::new();
+            for exact in [true, false] {
+                let mut model = GpuModel::load(&gpu, &cfg, &weights, n, 64).unwrap();
+                prefill.exact = true;
+                prefill.run(&gpu, prompt, 0, &model.states().collect::<Vec<_>>());
+                model.set_position(20);
+                prefill.exact = exact;
+                let v = prefill.verify(&gpu, draft, 20, &model.states().collect::<Vec<_>>(), None);
+                rows.push(contents::<f32>(&v.logits.buffer, draft.len() * cfg.vocab_size).to_vec());
+            }
+            assert!(rows[0] == rows[1]);
+        }
+
         /// Fast prefill of 1100 tokens in chunks of 1024 against exact
         /// prefill, which check_prefill holds to the CPU. A 1024-token chunk
         /// gives about 32 rows per expert, so this covers the large-m and
