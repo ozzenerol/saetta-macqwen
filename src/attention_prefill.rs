@@ -14,7 +14,17 @@ pub struct FlashParams {
 }
 
 /// The kernels: attention_faN takes N tokens of one kv head per threadgroup.
-pub const KERNELS: [&str; 2] = ["attention_fa8", "attention_fa4"];
+/// attention_fx_T_R_D takes T tokens per threadgroup, R per simdgroup, and
+/// splits the head dims over D simdgroups.
+pub const KERNELS: [&str; 7] = [
+    "attention_fa8",
+    "attention_fa4",
+    "attention_fx_4_1_2",
+    "attention_fx_8_1_2",
+    "attention_fx_8_2_2",
+    "attention_fx_4_2_2",
+    "attention_fx_8_2_1",
+];
 /// The one prefill uses.
 pub const DEFAULT: &str = "attention_fa8";
 /// The cache capacity must be a multiple of this (FA_BK).
@@ -52,10 +62,19 @@ mod mac {
             p.kv_heads * 8,
             "{kernel} needs 8 q heads per kv head"
         );
-        let tokens: u64 = kernel
-            .strip_prefix("attention_fa")
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("no prefill attention kernel {kernel}"));
+        // (tokens per threadgroup, simdgroups)
+        let (tokens, simds): (u64, u64) = if let Some(n) = kernel.strip_prefix("attention_fa") {
+            let n = n
+                .parse()
+                .unwrap_or_else(|_| panic!("no prefill attention kernel {kernel}"));
+            (n, n)
+        } else if let Some(rest) = kernel.strip_prefix("attention_fx_") {
+            let v: Vec<u64> = rest.split('_').filter_map(|x| x.parse().ok()).collect();
+            assert_eq!(v.len(), 3, "no prefill attention kernel {kernel}");
+            (v[0], v[0] / v[1] * v[2])
+        } else {
+            panic!("no prefill attention kernel {kernel}")
+        };
         enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
         for (i, v) in [q, keys, values, q_and_gate, out].iter().enumerate() {
             enc.set_buffer(i as u64, Some(&v.buffer), v.offset);
@@ -67,7 +86,7 @@ mod mac {
         );
         enc.dispatch_thread_groups(
             MTLSize::new((p.tokens as u64).div_ceil(tokens), p.kv_heads as u64, 1),
-            MTLSize::new(32 * tokens, 1, 1),
+            MTLSize::new(32 * simds, 1, 1),
         );
     }
 
@@ -160,7 +179,7 @@ mod mac {
                         .1
                     };
                     run();
-                    (0..3).map(|_| run()).fold(f64::INFINITY, f64::min)
+                    (0..2).map(|_| run()).fold(f64::INFINITY, f64::min)
                 };
                 let (tm, tl) = (time(mid), time(last));
                 println!(
