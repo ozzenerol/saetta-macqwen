@@ -101,8 +101,8 @@ mod mac {
                 );
                 Norm::rows(1, hidden, eps, &pre_embedding).record(&mut plan, &cat, &cat, false);
                 fc.record(&mut plan, &cat, &x, false);
-                layer.record(&mut plan, cfg, &x, &scratch);
-                Norm::rows(1, hidden, eps, &norm).record(&mut plan, &x, &output, false);
+                layer.record_input_norm(&mut plan, cfg, &x, &scratch);
+                layer.record(&mut plan, cfg, &x, &scratch, &norm, &output);
                 plan
             };
             let mut plan = layer_plan();

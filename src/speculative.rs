@@ -394,6 +394,12 @@ mod gpu {
             self.mtp.step(h, token)
         }
 
+        /// `mtp_step` without the draft, for entries nothing drafts from.
+        fn mtp_record(&mut self, h: &View, position: usize, token: u32) {
+            self.mtp_positions.push(position);
+            self.mtp.record(h, token);
+        }
+
         /// Records the prompt's last tokens in the MTP cache. `rows` holds
         /// the normed hidden states of `tokens`, which ran at positions
         /// `pos ..`; `last` must hold the state at `pos - 1` when `pos > 0`.
@@ -407,13 +413,13 @@ mod gpu {
             for r in start..n {
                 if r == 0 {
                     let last = self.last.clone();
-                    self.mtp_step(&last, pos - 1, tokens[0]);
+                    self.mtp_record(&last, pos - 1, tokens[0]);
                 } else {
                     let at = View {
                         buffer: staged.buffer.clone(),
                         offset: ((r - 1) * h * 4) as u64,
                     };
-                    self.mtp_step(&at, pos + r - 1, tokens[r]);
+                    self.mtp_record(&at, pos + r - 1, tokens[r]);
                 }
             }
             write(&self.last, &rows[(n - 1) * h..n * h]);
@@ -464,7 +470,7 @@ mod gpu {
             let pos = model.position();
             if pos > 0 {
                 let last = self.last.clone();
-                self.mtp_step(&last, pos - 1, token);
+                self.mtp_record(&last, pos - 1, token);
             }
             let logits = model.forward(token);
             copy(model.final_hidden(), &self.last, self.hidden);
@@ -553,7 +559,7 @@ mod gpu {
             self.mtp.truncate(mark + 1);
             self.mtp_positions.truncate(mark + 1);
             for (i, &d) in drafts[..accepted].iter().enumerate() {
-                self.mtp_step(&v.hidden_row(i), base + i, d);
+                self.mtp_record(&v.hidden_row(i), base + i, d);
             }
             copy(&v.hidden_row(accepted), &self.last, self.hidden);
 

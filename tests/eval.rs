@@ -122,3 +122,200 @@ fn gate_passes_same_model_and_fails_a_different_one() {
     assert!(!gate(&mut off, &reference, &opts(false, 64, true)).unwrap());
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// GPU against MLX float32 at a few long positions, after the first k
+/// layers, for the k in SAETTA_BISECT_LAYERS (for example "40,20,10").
+/// Needs the data from tools/eval_bisect.py. Run under ~/saetta/timed.sh:
+///   cargo test --release --test eval gpu_bisect -- --ignored --nocapture
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn gpu_bisect() {
+    use saetta::config::Config;
+    use saetta::eval::kl_divergence;
+    use saetta::gpu::Gpu;
+    use saetta::gpu_model::GpuModel;
+    use saetta::weights::Weights;
+
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let dir = home.join("llm/saetta-models/Qwen3.6-35B-A3B-5bit");
+    let eval = home.join("saetta/eval");
+    let bisect = eval.join("bisect");
+    let index: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(bisect.join("index.json")).unwrap()).unwrap();
+    let positions: Vec<usize> = index["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_u64().unwrap() as usize)
+        .collect();
+    let (length, shift) = (
+        index["length"].as_u64().unwrap() as usize,
+        index["shift"].as_u64().unwrap() as usize,
+    );
+    let read = |path: PathBuf| -> Vec<f32> {
+        let bytes = fs::read(path).unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
+            .collect()
+    };
+    let long: Vec<u32> = fs::read(eval.join("long_tokens.bin"))
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| u32::from_le_bytes(b))
+        .collect();
+    let layers: Vec<usize> = std::env::var("SAETTA_BISECT_LAYERS")
+        .unwrap_or("40".into())
+        .split(',')
+        .map(|k| k.trim().parse().unwrap())
+        .collect();
+
+    let cfg = Config::load(&dir).unwrap();
+    let weights = Weights::open(&dir).unwrap();
+    let gpu = Gpu::new().unwrap();
+    let hidden = cfg.hidden_size;
+    for &k in &layers {
+        let mut model = GpuModel::load(&gpu, &cfg, &weights, k, length + 1).unwrap();
+        for (name, start) in [("a", 0), ("b", shift)] {
+            let tokens = &long[start..start + length];
+            let mlx_hidden = read(bisect.join(format!("{name}_hidden.bin")));
+            let mlx_logits = read(bisect.join(format!("{name}_logits.bin")));
+            model.reset();
+            for (pos, &token) in tokens.iter().enumerate() {
+                let Some(slot) = positions.iter().position(|&p| p == pos) else {
+                    model.run(token);
+                    continue;
+                };
+                let logits = model.forward(token);
+                let ours = model.hidden();
+                let at = ((k - 1) * positions.len() + slot) * hidden;
+                let theirs = &mlx_hidden[at..at + hidden];
+                let err: f64 = ours
+                    .iter()
+                    .zip(theirs)
+                    .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                    .sum();
+                let norm: f64 = theirs.iter().map(|&b| (b as f64).powi(2)).sum();
+                let mut line = format!(
+                    "layers {k:2} seq {name} position {pos} (text {}): hidden rel err {:.2e}",
+                    pos + start,
+                    (err / norm).sqrt()
+                );
+                if k == cfg.num_layers() {
+                    let vocab = cfg.vocab_size;
+                    let kl = kl_divergence(&mlx_logits[slot * vocab..(slot + 1) * vocab], &logits);
+                    line += &format!(", logits KL {kl:.2e}");
+                }
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// The first k layers on the GPU and on the CPU, token by token over the
+/// first 4097 long tokens, with the hidden states compared at every position
+/// from 3900 on, and the CPU against MLX at the bisect positions. k is
+/// SAETTA_BISECT_LAYERS (one number). Run under ~/saetta/timed.sh:
+///   cargo test --release --test eval gpu_vs_cpu -- --ignored --nocapture
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn gpu_vs_cpu() {
+    use saetta::config::Config;
+    use saetta::cpu::model::Model as CpuModel;
+    use saetta::gpu::Gpu;
+    use saetta::gpu_model::GpuModel;
+    use saetta::weights::Weights;
+
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let dir = home.join("llm/saetta-models/Qwen3.6-35B-A3B-5bit");
+    let eval = home.join("saetta/eval");
+    let read = |path: PathBuf| -> Vec<f32> {
+        let bytes = fs::read(path).unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
+            .collect()
+    };
+    let long: Vec<u32> = fs::read(eval.join("long_tokens.bin"))
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| u32::from_le_bytes(b))
+        .collect();
+    let positions = [3994, 3995, 3996, 4094, 4095, 4096];
+    let mlx = read(eval.join("bisect/a_hidden.bin"));
+    let k: usize = std::env::var("SAETTA_BISECT_LAYERS")
+        .unwrap_or("2".into())
+        .parse()
+        .unwrap();
+    let rel = |a: &[f32], b: &[f32]| -> f64 {
+        let err: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| ((x - y) as f64).powi(2))
+            .sum();
+        let norm: f64 = b.iter().map(|&y| (y as f64).powi(2)).sum();
+        (err / norm).sqrt()
+    };
+
+    let cfg = Config::load(&dir).unwrap();
+    let weights = Weights::open(&dir).unwrap();
+    let gpu = Gpu::new().unwrap();
+    let mut on_gpu = GpuModel::load(&gpu, &cfg, &weights, k, 4100).unwrap();
+    let cpu = CpuModel::new(&cfg, &weights).unwrap();
+    let mut states: Vec<_> = (0..k).map(|i| cpu.new_state(i)).collect();
+    let hidden = cfg.hidden_size;
+    let mut worst = 0.0f64;
+    for (pos, &token) in long[..4097].iter().enumerate() {
+        on_gpu.run(token);
+        let mut x = cpu.embed(token);
+        let mut experts = Vec::new();
+        for (i, state) in states.iter_mut().enumerate() {
+            let out = cpu.layer(i).step(&x, state).unwrap();
+            x = out.hidden;
+            experts = out.experts;
+        }
+        let g = on_gpu.hidden();
+        let d = rel(&g, &x);
+        worst = worst.max(d);
+        if let Some(slot) = positions.iter().position(|&p| p == pos) {
+            let at = ((k - 1) * positions.len() + slot) * hidden;
+            let m = &mlx[at..at + hidden];
+            println!(
+                "position {pos}: GPU vs CPU {d:.2e}, CPU vs MLX {:.2e}, GPU vs MLX {:.2e}",
+                rel(&x, m),
+                rel(&g, m)
+            );
+        } else if pos >= 3900 && d > 1e-5 {
+            println!("position {pos}: GPU vs CPU {d:.2e}");
+        }
+        if d > 1e-3 {
+            println!("  CPU experts of layer {} at {pos}: {experts:?}", k - 1);
+            let r = on_gpu.route_debug();
+            let cpu_logits = cpu.layer(k - 1).router().matvec(&r.normed);
+            let mut rank: Vec<usize> = (0..cpu_logits.len()).collect();
+            rank.sort_by(|&a, &b| cpu_logits[b].total_cmp(&cpu_logits[a]));
+            println!("  GPU ids {:?} weights {:?}", r.ids, r.weights);
+            println!("  CPU matvec on the GPU's router input, best 10 (id, CPU logit, GPU logit):");
+            for &e in &rank[..10] {
+                println!("    {e:3} {:.7} {:.7}", cpu_logits[e], r.logits[e]);
+            }
+            let worst = cpu_logits
+                .iter()
+                .zip(&r.logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("  router logits, GPU vs CPU on the same input: worst abs diff {worst:.2e}");
+        }
+    }
+    println!("worst GPU vs CPU over all positions: {worst:.2e}");
+}
