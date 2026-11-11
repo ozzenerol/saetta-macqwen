@@ -1325,11 +1325,17 @@ mod mac {
             }
         }
 
-        /// With the split kernels, prefill is within f32 rounding of the CPU.
+        /// With the split kernels and the CPU rounding its KV cache to half
+        /// as well, the median token is within f32 rounding of the CPU (1e-6
+        /// to 1e-4 over the layers). The two round slightly different keys,
+        /// so now and then a key lands on the next half value, and a token
+        /// at a near tie of the router picks another expert (3e-3 for one
+        /// token at layer 20 of this prompt). So the median is bounded
+        /// tightly, the worst token and the states loosely.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 3e-3, 5e-4);
+            check_prefill(true, 2e-4, 1e-2);
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1365,6 +1371,13 @@ mod mac {
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
+            // The GPU cache is half; the CPU rounds its keys and values the
+            // same way.
+            for s in &mut cpu_states {
+                if let LayerState::Full(c) = s {
+                    c.round_to_half();
+                }
+            }
             let gpu_states = OwnedState::new_all(&gpu, &cfg, capacity);
             let mut cpu_x: Vec<Vec<Vec<f32>>> = parts
                 .iter()
@@ -1429,10 +1442,13 @@ mod mac {
                 println!(
                     "layer {l}: hidden rel rms {err:.2e}, median token {median:.2e}, state {state:.2e}"
                 );
-                // The half path may pick another expert at a near tie for a
-                // token, as bf16 MLX does, so only the median token counts.
-                let (hidden, state_bound) = if exact { (err, bound) } else { (median, 0.1) };
-                assert!(hidden < bound && state < state_bound, "layer {l}");
+                // A token may pick another expert at a near tie (see the
+                // tests above), so the median token counts.
+                let state_bound = if exact { 1e-2 } else { 0.1 };
+                assert!(median < bound && state < state_bound, "layer {l}");
+                if exact {
+                    assert!(err < 1e-2, "layer {l}");
+                }
             }
 
             let norm = weights
@@ -1500,7 +1516,10 @@ mod mac {
                     argmax(&got),
                     argmax(&want)
                 );
-                assert!(err < 1e-4);
+                // Prefill and decode round slightly different keys to half,
+                // which can flip a near tie of the router (5e-3 on these
+                // tokens; 1e-6 with an f32 cache).
+                assert!(err < 2e-2);
                 assert_eq!(argmax(&got), argmax(&want));
             }
         }
@@ -1539,7 +1558,8 @@ mod mac {
                     v.argmax[i],
                     argmax(&want[i])
                 );
-                assert!(err < 1e-4);
+                // As in decode_after_prefill_matches_gpu_model.
+                assert!(err < 2e-2);
                 assert_eq!(v.argmax[i], argmax(&want[i]));
             }
             assert_eq!(v.argmax[0], argmax(got_row(logits, 0, cfg.vocab_size)));
@@ -1555,7 +1575,7 @@ mod mac {
             let got = spec.forward(tokens[25]);
             let err = rel_rms(&got, &want);
             println!("after restore of row 2: logits rel rms {err:.2e}");
-            assert!(err < 1e-4);
+            assert!(err < 2e-2);
             assert_eq!(argmax(&got), argmax(&want));
         }
 

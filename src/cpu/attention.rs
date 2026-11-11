@@ -33,9 +33,17 @@ pub struct KvCache {
     keys: Vec<f32>,
     values: Vec<f32>,
     len: usize,
+    /// Round keys and values to f16 as they are stored, as the GPU cache
+    /// does, so the two can be compared tightly.
+    half: bool,
 }
 
 impl KvCache {
+    /// Rounds the keys and values stored from now on to f16.
+    pub fn round_to_half(&mut self) {
+        self.half = true;
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -103,6 +111,12 @@ pub fn attention_at(
     for head in k.chunks_exact_mut(d) {
         rms_norm(head, w.k_norm, cfg.eps);
         rope(head, cfg.rope_dims, pos, cfg.rope_theta);
+    }
+    let mut v = v;
+    if cache.half {
+        for x in k.iter_mut().chain(v.iter_mut()) {
+            *x = half::f16::from_f32(*x).to_f32();
+        }
     }
     cache.keys.extend_from_slice(&k);
     cache.values.extend_from_slice(&v);

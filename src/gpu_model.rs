@@ -667,6 +667,13 @@ mod mac {
             let gpu = Gpu::new().unwrap();
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
             let mut states = cpu.new_states();
+            // The GPU cache is half; the CPU rounds its keys and values the
+            // same way, so what is left is the f32 arithmetic.
+            for s in &mut states {
+                if let crate::cpu::model::LayerState::Full(c) = s {
+                    c.round_to_half();
+                }
+            }
             let mut cpu_logits = Vec::new();
             let mut gpu_logits = Vec::new();
             for &t in &TOKENS {
@@ -678,9 +685,7 @@ mod mac {
                 let (c, g) = (argmax(&cpu_logits), argmax(&gpu_logits));
                 let err = rel_rms(&gpu_logits, &cpu_logits);
                 println!("token {i}: cpu {c}, gpu {g}, rel rms {err:.2e}");
-                // The KV cache is half: rounding K and V to 11 bits of
-                // mantissa gives about 1.2e-4 here, f32 about 5e-5.
-                assert!(err < 2e-4);
+                assert!(err < 1e-4);
                 assert_eq!(c, g, "token {i}");
                 cpu_logits = cpu.forward(c, &mut states).unwrap();
                 gpu_logits = model.forward(c);
