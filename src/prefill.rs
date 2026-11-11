@@ -1436,6 +1436,7 @@ mod mac {
                     KvBits::Eight => "attention_rows_q8",
                     _ => "attention_rows_q4",
                 },
+                (Some(_), false) if attention_half_kernel() == "gemm" => "gemm",
                 (Some((kq, _)), false) => match kq.bits {
                     KvBits::Eight => "attention_rows2_half_q8",
                     _ => "attention_rows2_half_q4",
@@ -1448,7 +1449,8 @@ mod mac {
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
                 q_half
             };
-            // The kernel match picks these only over a half cache.
+            // The kernel match picks flash only over a half cache; gemm reads
+            // a quantized one in place.
             if kernel.starts_with("attention_fa") || kernel == "gemm" {
                 let p = crate::attention_prefill::FlashParams {
                     heads: c.heads as u32,
@@ -1460,7 +1462,7 @@ mod mac {
                 let (k, v) = (whole(&cache.keys), whole(&cache.values));
                 match &self.gemm {
                     Some(gemm) if kernel == "gemm" => {
-                        gemm.encode(enc, gpu, &q_in, &k, &v, &q_and_gate, &y, p)
+                        gemm.encode(enc, gpu, &q_in, &k, &v, cache.quant.as_ref(), &q_and_gate, &y, p)
                     }
                     _ => crate::attention_prefill::encode(
                         enc, gpu, kernel, &q_in, &k, &v, &q_and_gate, &y, p,
@@ -1982,6 +1984,18 @@ mod mac {
             check_prefill(false, 0.12, 0.1, KvBits::Half);
         }
 
+        /// Fast prefill (gemm attention reading the codes in place) over an
+        /// 8-bit and a 4-bit KV cache, with the fast bounds times
+        /// kv_quant::test_slack.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn fast_quantized_prefill_matches_token_by_token() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_prefill(false, 0.12, 0.1, bits);
+            }
+        }
+
         /// 166 tokens in two calls (150 then 16) with chunks of 128 rounded
         /// from 100, so the first call runs a 128-row chunk on the large-m
         /// kernels and a 22-row one on qmm_few: the hidden state after each layer and every layer state
@@ -2131,8 +2145,12 @@ mod mac {
                 "attention_fa8",
                 "attention_fa4",
                 "prefill_ag_scores",
+                "prefill_ag_scores_q8",
+                "prefill_ag_scores_q4",
                 "prefill_ag_softmax",
                 "prefill_ag_pv",
+                "prefill_ag_pv_q8",
+                "prefill_ag_pv_q4",
                 "prefill_ag_final",
             ] {
                 gpu.pipeline(name);

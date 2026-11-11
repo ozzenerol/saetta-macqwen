@@ -35,6 +35,7 @@ mod mac {
     use super::*;
     use crate::attention_prefill::{encode_rows2, spread, FlashParams};
     use crate::gpu::{contents, Gpu};
+    use crate::kv_quant::{KvBits, QuantRows};
     use crate::qmv::View;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
@@ -70,6 +71,8 @@ mod mac {
         /// The same as attention_prefill::encode on the same buffers: q
         /// half [tokens][heads][256], keys and values the half cache from
         /// position 0 with the chunk's rows written, q_and_gate f32, out f32.
+        /// With `quant`, the keys and values are read from those 8- or 4-bit
+        /// rows instead and `keys` and `values` are not read.
         #[allow(clippy::too_many_arguments)]
         pub fn encode(
             &self,
@@ -78,6 +81,7 @@ mod mac {
             q: &View,
             keys: &View,
             values: &View,
+            quant: Option<&(QuantRows, QuantRows)>,
             q_and_gate: &View,
             out: &View,
             f: FlashParams,
@@ -108,6 +112,31 @@ mod mac {
                 whole(&self.l),
                 whole(&self.alpha),
             );
+            let suffix = match quant.map(|(k, _)| k.bits) {
+                None => "",
+                Some(KvBits::Eight) => "_q8",
+                Some(KvBits::Four) => "_q4",
+                Some(b) => panic!("no gemm attention for {b:?} rows"),
+            };
+            let (scores, pv) = (
+                gpu.pipeline(&format!("prefill_ag_scores{suffix}")),
+                gpu.pipeline(&format!("prefill_ag_pv{suffix}")),
+            );
+            // The codes, scales and biases of keys and values; the half
+            // kernels do not read these slots, so they get the half cache.
+            let parts = |r: &QuantRows| [whole(&r.data), whole(&r.scales), whole(&r.biases)];
+            let (kq, vq) = match quant {
+                Some((k, v)) => (parts(k), parts(v)),
+                None => (
+                    [keys.clone(), keys.clone(), keys.clone()],
+                    [values.clone(), values.clone(), values.clone()],
+                ),
+            };
+            let set_at = |first: u64, views: &[View; 3]| {
+                for (i, v) in views.iter().enumerate() {
+                    enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
+                }
+            };
             for j0 in (0..end).step_by(KEYS) {
                 let n = KEYS.min(end - j0);
                 let params = Params {
@@ -120,9 +149,10 @@ mod mac {
                     n: n as u32,
                     scale: f.scale,
                 };
-                enc.set_compute_pipeline_state(&gpu.pipeline("prefill_ag_scores"));
+                enc.set_compute_pipeline_state(&scores);
                 set(&[q, keys, &s]);
                 bytes(3, &params);
+                set_at(4, &kq);
                 enc.dispatch_thread_groups(
                     MTLSize::new(n.div_ceil(64) as u64, row_tiles, kv),
                     MTLSize::new(128, 1, 1),
@@ -136,9 +166,10 @@ mod mac {
                     MTLSize::new(256, 1, 1),
                 );
 
-                enc.set_compute_pipeline_state(&gpu.pipeline("prefill_ag_pv"));
+                enc.set_compute_pipeline_state(&pv);
                 set(&[&p, values, &o, &alpha]);
                 bytes(4, &params);
+                set_at(5, &vq);
                 enc.dispatch_thread_groups(
                     MTLSize::new((DIM / 64) as u64, row_tiles, kv),
                     MTLSize::new(128, 1, 1),
@@ -209,7 +240,7 @@ mod mac {
                 let run = || {
                     gpu.run_timed(metal::MTLDispatchType::Serial, |enc| {
                         if gemm_kernel {
-                            gemm.encode(enc, &gpu, &q, &k, &v, &g, &got, p);
+                            gemm.encode(enc, &gpu, &q, &k, &v, None, &g, &got, p);
                         } else {
                             encode_rows2(enc, &gpu, &q, &k, &v, &g, &want, p);
                         }

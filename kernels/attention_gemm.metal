@@ -7,7 +7,10 @@
 //                       in half, and the factor alpha the old output gets
 //   prefill_ag_pv       O = alpha O + P V, in 64 x 64 tiles
 // then prefill_ag_final writes y = O / l * sigmoid(gate). Key j is visible
-// to the row of token i when j <= pos + i.
+// to the row of token i when j <= pos + i. The _q8 and _q4 kernels read
+// an 8- or 4-bit cache (kv_quant.metal) in place: the codes, scales and
+// biases go in the buffers after the params, and the half cache buffer is
+// not read.
 
 constant uint PREFILL_AG_KEYS = 1024;  // keys per block, the S row stride
 constant uint PREFILL_AG_D = 256;      // head dim
@@ -44,12 +47,29 @@ inline ulong prefill_ag_kv_row(constant AttGemmParams &p, uint g, uint j) {
     return (ulong(j) * p.kv_heads + g) * PREFILL_AG_D;
 }
 
+// Dims dim .. dim + 3 of key (or value) j of kv head g: from the half
+// cache h, or with BITS 8 or 4 from the codes in place.
+template <uint BITS>
+inline half4 prefill_ag_kv4(device const half *h, device const uint *codes,
+                            device const half *scales, device const half *biases,
+                            constant AttGemmParams &p, uint g, uint j, uint dim) {
+    if (BITS == 16) {
+        return *(device const half4 *)(h + prefill_ag_kv_row(p, g, j) + dim);
+    }
+    uint group = (j * p.kv_heads + g) * (PREFILL_AG_D / 64) + dim / 64;
+    return half4(kv_load4<BITS>(codes, scales, biases, group, dim % 64));
+}
+
 // S[g][r][jj] (unscaled) for rows tg.y * 64 .., block keys tg.x * 64 ..
 // Tiles no row sees are skipped; the softmax never reads them.
+template <uint BITS>
 kernel void prefill_ag_scores(device const half *q [[buffer(0)]],
                               device const half *keys [[buffer(1)]],
                               device float *s [[buffer(2)]],
                               constant AttGemmParams &p [[buffer(3)]],
+                              device const uint *codes [[buffer(4)]],
+                              device const half *scales [[buffer(5)]],
+                              device const half *biases [[buffer(6)]],
                               uint3 tg [[threadgroup_position_in_grid]],
                               uint tid [[thread_index_in_threadgroup]],
                               uint simd [[simdgroup_index_in_threadgroup]]) {
@@ -66,7 +86,7 @@ kernel void prefill_ag_scores(device const half *q [[buffer(0)]],
     bool q_ok = r0 + lr < p.rows;
     bool k_ok = k0 + lr < p.n;
     device const half *qp = q + (q_ok ? prefill_ag_q_row(p, g, r0 + lr) : 0) + lc;
-    device const half *kp = keys + (k_ok ? prefill_ag_kv_row(p, g, p.j0 + k0 + lr) : 0) + lc;
+    uint key = p.j0 + k0 + lr;
     threadgroup half4 *qd = (threadgroup half4 *)(qt + lr * PREFILL_AG_LD + lc);
     threadgroup half4 *kd = (threadgroup half4 *)(kt + lr * PREFILL_AG_LD + lc);
 
@@ -80,7 +100,8 @@ kernel void prefill_ag_scores(device const half *q [[buffer(0)]],
     for (uint d0 = 0; d0 < PREFILL_AG_D; d0 += PREFILL_AG_BK) {
         for (uint i = 0; i < 4; i++) {
             qd[i] = q_ok ? ((device const half4 *)(qp + d0))[i] : half4(0);
-            kd[i] = k_ok ? ((device const half4 *)(kp + d0))[i] : half4(0);
+            kd[i] = k_ok ? prefill_ag_kv4<BITS>(keys, codes, scales, biases, p, g, key, d0 + lc + 4 * i)
+                         : half4(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma clang loop unroll(full)
@@ -165,11 +186,15 @@ kernel void prefill_ag_softmax(device const float *s [[buffer(0)]],
 
 // O[g][r][d] = alpha[r] O + P V for rows tg.y * 64 .., dims tg.x * 64 ..
 // alpha 0 (the first block) ignores the old O, which is not set yet.
+template <uint BITS>
 kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
                           device const half *values [[buffer(1)]],
                           device float *o [[buffer(2)]],
                           device const float *alpha [[buffer(3)]],
                           constant AttGemmParams &p [[buffer(4)]],
+                          device const uint *codes [[buffer(5)]],
+                          device const half *scales [[buffer(6)]],
+                          device const half *biases [[buffer(7)]],
                           uint3 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]],
                           uint simd [[simdgroup_index_in_threadgroup]]) {
@@ -205,9 +230,10 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
             pd[i] = ((device const half4 *)(pp + k0))[i];
         }
         bool v_ok = k0 + vr < p.n;
-        device const half4 *vp = (device const half4 *)(values + (v_ok ? prefill_ag_kv_row(p, g, p.j0 + k0 + vr) : 0) + d0 + vc);
         for (uint i = 0; i < 4; i++) {
-            vd[i] = v_ok ? vp[i] : half4(0);
+            vd[i] = v_ok ? prefill_ag_kv4<BITS>(values, codes, scales, biases, p, g, p.j0 + k0 + vr,
+                                                d0 + vc + 4 * i)
+                         : half4(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma clang loop unroll(full)
@@ -245,6 +271,13 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
         }
     }
 }
+
+template [[host_name("prefill_ag_scores")]] kernel decltype(prefill_ag_scores<16>) prefill_ag_scores<16>;
+template [[host_name("prefill_ag_scores_q8")]] kernel decltype(prefill_ag_scores<8>) prefill_ag_scores<8>;
+template [[host_name("prefill_ag_scores_q4")]] kernel decltype(prefill_ag_scores<4>) prefill_ag_scores<4>;
+template [[host_name("prefill_ag_pv")]] kernel decltype(prefill_ag_pv<16>) prefill_ag_pv<16>;
+template [[host_name("prefill_ag_pv_q8")]] kernel decltype(prefill_ag_pv<8>) prefill_ag_pv<8>;
+template [[host_name("prefill_ag_pv_q4")]] kernel decltype(prefill_ag_pv<4>) prefill_ag_pv<4>;
 
 // y[token][head][d] = O / l * sigmoid(gate), thread id = (d, r, g).
 kernel void prefill_ag_final(device const float *o [[buffer(0)]],
