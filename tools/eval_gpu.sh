@@ -1,6 +1,6 @@
 #!/bin/bash
 # The whole quality gate on the GPU model: perplexity, the 32k-token prompt
-# through prefill, its first 8192 tokens one at a time,
+# through prefill, its first 16384 tokens one at a time,
 # and the tool calls through saetta serve --gpu, against the MLX data in
 # ~/saetta/eval (tools/eval_ref.py, tools/eval_tools.py --record).
 # The 40-layer GPU model does not fit next to mlx_lm.server, so it must be stopped.
@@ -25,8 +25,9 @@ fi
 
 $bin eval "$model" "$ref" --gpu --long 32768
 logits=$?
-# One token at a time, for the perplexity over the long prompt.
-$bin eval "$model" "$ref" --gpu --long 8192 --decode --no-ppl || logits=1
+# One token at a time, for the perplexity over the long prompt. 16 checkpoints,
+# so that one top-1 near-tie still leaves 94% (8 would leave 88%).
+$bin eval "$model" "$ref" --gpu --long 16384 --decode --no-ppl || logits=1
 
 $bin serve "$model" --gpu --port $port 2>serve.log &
 server=$!
