@@ -300,6 +300,21 @@ fn gpu_vs_cpu() {
         }
         if d > 1e-3 {
             println!("  CPU experts of layer {} at {pos}: {experts:?}", k - 1);
+            let r = on_gpu.route_debug();
+            let cpu_logits = cpu.layer(k - 1).router().matvec(&r.normed);
+            let mut rank: Vec<usize> = (0..cpu_logits.len()).collect();
+            rank.sort_by(|&a, &b| cpu_logits[b].total_cmp(&cpu_logits[a]));
+            println!("  GPU ids {:?} weights {:?}", r.ids, r.weights);
+            println!("  CPU matvec on the GPU's router input, best 10 (id, CPU logit, GPU logit):");
+            for &e in &rank[..10] {
+                println!("    {e:3} {:.7} {:.7}", cpu_logits[e], r.logits[e]);
+            }
+            let worst = cpu_logits
+                .iter()
+                .zip(&r.logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("  router logits, GPU vs CPU on the same input: worst abs diff {worst:.2e}");
         }
     }
     println!("worst GPU vs CPU over all positions: {worst:.2e}");
