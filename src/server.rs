@@ -185,14 +185,19 @@ impl<M: Model + 'static> Server<M> {
             let mut reasoning = String::new();
             let mut content = String::new();
             let mut calls = Vec::new();
-            let done = self.generate(&request, |event| {
-                match event {
-                    Event::Reasoning(s) => reasoning += &s,
-                    Event::Content(s) => content += &s,
-                    Event::ToolCall(c) => calls.push(c),
-                }
-                true
-            });
+            let watch = out.try_clone()?;
+            let done = self.generate(
+                &request,
+                || client_alive(&watch),
+                |event| {
+                    match event {
+                        Event::Reasoning(s) => reasoning += &s,
+                        Event::Content(s) => content += &s,
+                        Event::ToolCall(c) => calls.push(c),
+                    }
+                    true
+                },
+            );
             let mut message = json!({"role": "assistant", "content": content});
             if !reasoning.is_empty() {
                 message["reasoning_content"] = reasoning.into();
@@ -215,22 +220,27 @@ impl<M: Model + 'static> Server<M> {
         )?;
         let mut calls = 0;
         let mut failed = None;
-        let done = self.generate(&request, |event| {
-            let delta = match event {
-                Event::Reasoning(s) => json!({"reasoning_content": s}),
-                Event::Content(s) => json!({"content": s}),
-                Event::ToolCall(c) => {
-                    let mut call = c.to_json();
-                    call["index"] = calls.into();
-                    calls += 1;
-                    json!({"tool_calls": [call]})
-                }
-            };
-            let sent = send_event(out, &chunk(delta, Value::Null));
-            let ok = sent.is_ok();
-            failed = sent.err();
-            ok
-        });
+        let watch = out.try_clone()?;
+        let done = self.generate(
+            &request,
+            || client_alive(&watch),
+            |event| {
+                let delta = match event {
+                    Event::Reasoning(s) => json!({"reasoning_content": s}),
+                    Event::Content(s) => json!({"content": s}),
+                    Event::ToolCall(c) => {
+                        let mut call = c.to_json();
+                        call["index"] = calls.into();
+                        calls += 1;
+                        json!({"tool_calls": [call]})
+                    }
+                };
+                let sent = send_event(out, &chunk(delta, Value::Null));
+                let ok = sent.is_ok();
+                failed = sent.err();
+                ok
+            },
+        );
         if let Some(e) = failed {
             return Err(e);
         }
@@ -295,8 +305,14 @@ impl<M: Model + 'static> Server<M> {
     }
 
     /// Runs one completion. `emit` returns false to stop early, for example
-    /// when the client has gone.
-    fn generate(&self, r: &ChatRequest, mut emit: impl FnMut(Event) -> bool) -> Done {
+    /// when the client has gone. `alive` is asked every `ALIVE_EVERY` tokens,
+    /// since a tool call sends nothing until it closes.
+    fn generate(
+        &self,
+        r: &ChatRequest,
+        mut alive: impl FnMut() -> bool,
+        mut emit: impl FnMut(Event) -> bool,
+    ) -> Done {
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
         let held = engine.tokens.clone();
         let spliced = match engine.last.take() {
@@ -359,6 +375,9 @@ impl<M: Model + 'static> Server<M> {
             }
             let events = output.push(token, &self.tokenizer, &self.special);
             if !self.emit_all(events, &mut emit, done) {
+                return Take::Gone;
+            }
+            if done.completion_tokens.is_multiple_of(ALIVE_EVERY) && !alive() {
                 return Take::Gone;
             }
             Take::Go
@@ -731,6 +750,24 @@ struct Request {
 }
 
 const MAX_BODY: usize = 64 << 20;
+
+/// Tokens between checks that the client is still there.
+const ALIVE_EVERY: usize = 16;
+
+/// False once the client has closed the connection. Clients do not send
+/// anything while they wait for the answer, so a peek that would block
+/// means the connection is open.
+fn client_alive(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let alive = match stream.peek(&mut [0]) {
+        Ok(n) => n > 0,
+        Err(e) => e.kind() == io::ErrorKind::WouldBlock,
+    };
+    let _ = stream.set_nonblocking(false);
+    alive
+}
 
 fn read_request(reader: &mut impl BufRead) -> Result<Request, String> {
     let mut line = String::new();
