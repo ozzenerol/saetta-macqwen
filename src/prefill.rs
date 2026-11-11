@@ -452,9 +452,10 @@ mod mac {
         std::env::var("SAETTA_SHARED_GU").map_or(true, |v| v != "0")
     }
 
-    /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
+    /// The fast path runs the router on the fast kernels too (about 70 ms
+    /// less per 2k chunk than qmm_split), unless SAETTA_ROUTER_FAST=0.
     fn fast_router() -> bool {
-        std::env::var("SAETTA_ROUTER_FAST").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_ROUTER_FAST").map_or(true, |v| v != "0")
     }
 
     /// SAETTA_CONV=1 runs the DeltaNet conv on conv_rows, one thread per
@@ -1640,8 +1641,8 @@ mod mac {
             .map(whole);
             let fast = !self.exact_now();
             if self.on("router") {
-                // Routing stays close to f32 so it picks the experts decode
-                // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
+                // In half like the other matrices: the quality gate held. With
+                // SAETTA_ROUTER_FAST=0 it stays close to f32, as decode.
                 if fast && fast_router() {
                     self.mm(gpu, enc, &layer.router, normed, &router, t);
                 } else {
