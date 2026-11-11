@@ -722,6 +722,8 @@ mod gpu {
                 }
                 _ => false,
             };
+            // The verify writes a KV row for every token it runs.
+            model.reserve(base + tokens.len());
             let states: Vec<_> = model.states().collect();
             let sampler = on_gpu.then(|| model.sampler());
             let v = prefill.verify(self.gpu, &tokens, base, &states, sampler);

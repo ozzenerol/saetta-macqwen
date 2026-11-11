@@ -16,6 +16,7 @@ mod mac {
     use crate::gpu::{Gpu, contents, dispatch_1d};
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache, Norm};
     use crate::gpu_model::State;
+    use crate::kv_quant::KvBits;
     use crate::moe::Experts;
     use crate::plan::TokenParams;
     use crate::qmv::{GpuQuant, View};
@@ -1391,7 +1392,7 @@ mod mac {
             self.encode_attention_rows(gpu, enc, w, cache, out, t, pos);
         }
 
-        /// The new keys and values into the half cache, attention over the
+        /// The new keys and values into the cache (half, or quantized), attention over the
         /// cache for the `t` new queries, and o_proj.
         #[allow(clippy::too_many_arguments)]
         fn encode_attention_rows(
@@ -1410,8 +1411,16 @@ mod mac {
             let kv_size = c.kv_heads * d;
             let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
             let (keys, values) = (whole(&s.mixed), at(&s.mixed, t * kv_size));
-            for (new, cached) in [(&keys, &cache.keys), (&values, &cache.values)] {
-                to_half(gpu, enc, new, &at_half(cached, pos * kv_size), t * kv_size);
+            match &cache.quant {
+                None => {
+                    for (new, cached) in [(&keys, &cache.keys), (&values, &cache.values)] {
+                        to_half(gpu, enc, new, &at_half(cached, pos * kv_size), t * kv_size);
+                    }
+                }
+                Some((kq, vq)) => {
+                    kq.encode(gpu, enc, &keys, pos, t);
+                    vq.encode(gpu, enc, &values, pos, t);
+                }
             }
             if !self.on("attention") {
                 if self.on("attention o_proj") {
@@ -1419,45 +1428,76 @@ mod mac {
                 }
                 return;
             }
-            let cached = [whole(&cache.keys), whole(&cache.values)];
-            let kernel = if self.exact_now() {
-                "attention_rows"
-            } else {
-                attention_half_kernel()
+            let exact = self.exact_now();
+            let kernel = match (&cache.quant, exact) {
+                (None, true) => "attention_rows",
+                (None, false) => attention_half_kernel(),
+                (Some((kq, _)), true) => match kq.bits {
+                    KvBits::Eight => "attention_rows_q8",
+                    _ => "attention_rows_q4",
+                },
+                (Some((kq, _)), false) => match kq.bits {
+                    KvBits::Eight => "attention_rows2_half_q8",
+                    _ => "attention_rows2_half_q4",
+                },
             };
-            if self.exact_now() {
-                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
-                set_views(enc, 0, &[&q, &cached[0], &cached[1]]);
+            let q_in = if exact {
+                q.clone()
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
-                if kernel.starts_with("attention_fa") || kernel == "gemm" {
-                    let p = crate::attention_prefill::FlashParams {
-                        heads: c.heads as u32,
-                        kv_heads: c.kv_heads as u32,
-                        pos: pos as u32,
-                        tokens: t as u32,
-                        scale: 1.0 / (d as f32).sqrt(),
-                    };
-                    let (k, v) = (&cached[0], &cached[1]);
-                    match &self.gemm {
-                        Some(gemm) if kernel == "gemm" => {
-                            gemm.encode(enc, gpu, &q_half, k, v, &q_and_gate, &y, p)
-                        }
-                        _ => crate::attention_prefill::encode(
-                            enc, gpu, kernel, &q_half, k, v, &q_and_gate, &y, p,
-                        ),
+                q_half
+            };
+            // The kernel match picks these only over a half cache.
+            if kernel.starts_with("attention_fa") || kernel == "gemm" {
+                let p = crate::attention_prefill::FlashParams {
+                    heads: c.heads as u32,
+                    kv_heads: c.kv_heads as u32,
+                    pos: pos as u32,
+                    tokens: t as u32,
+                    scale: 1.0 / (d as f32).sqrt(),
+                };
+                let (k, v) = (whole(&cache.keys), whole(&cache.values));
+                match &self.gemm {
+                    Some(gemm) if kernel == "gemm" => {
+                        gemm.encode(enc, gpu, &q_in, &k, &v, &q_and_gate, &y, p)
                     }
-                    self.record(gpu, enc, 2, &y, t * c.heads * d);
-                    if self.on("attention o_proj") {
-                        self.mm(gpu, enc, &w.o, &y, out, t);
-                    }
-                    return;
+                    _ => crate::attention_prefill::encode(
+                        enc, gpu, kernel, &q_in, &k, &v, &q_and_gate, &y, p,
+                    ),
                 }
-                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
-                set_views(enc, 0, &[&q_half, &cached[0], &cached[1]]);
+                self.record(gpu, enc, 2, &y, t * c.heads * d);
+                if self.on("attention o_proj") {
+                    self.mm(gpu, enc, &w.o, &y, out, t);
+                }
+                return;
             }
-            set_views(enc, 3, &[&q_and_gate, &y]);
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
+            // A quantized cache is read in place (kernels/attention_rows_q.metal).
+            let next = match &cache.quant {
+                None => {
+                    set_views(enc, 0, &[&q_in, &whole(&cache.keys), &whole(&cache.values)]);
+                    3
+                }
+                Some((kq, vq)) => {
+                    let w = |b: &Buffer| whole(b);
+                    set_views(
+                        enc,
+                        0,
+                        &[
+                            &q_in,
+                            &w(&kq.data),
+                            &w(&vq.data),
+                            &w(&kq.scales),
+                            &w(&kq.biases),
+                            &w(&vq.scales),
+                            &w(&vq.biases),
+                        ],
+                    );
+                    7
+                }
+            };
+            set_views(enc, next, &[&q_and_gate, &y]);
             let p = AttentionParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -1465,9 +1505,13 @@ mod mac {
                 tokens: t as u32,
                 scale: 1.0 / (d as f32).sqrt(),
             };
-            params(enc, 5, &p);
+            params(enc, next + 2, &p);
             // Heads of one kv head per threadgroup.
-            let heads = if kernel.ends_with('8') { 8 } else { 4 };
+            let heads = if kernel == "attention_rows2_half8" {
+                8
+            } else {
+                4
+            };
             assert!((c.heads / c.kv_heads).is_multiple_of(heads));
             groups(enc, (t.div_ceil(8), c.heads / heads), 32 * heads);
             self.record(gpu, enc, 2, &y, t * c.heads * d);
@@ -1639,6 +1683,16 @@ mod mac {
 
     impl OwnedState {
         pub fn new_all(gpu: &Gpu, cfg: &Config, capacity: usize) -> Vec<OwnedState> {
+            OwnedState::with_bits(gpu, cfg, capacity, KvBits::Half)
+        }
+
+        /// As `new_all`, with the KV caches stored as `bits`.
+        pub fn with_bits(
+            gpu: &Gpu,
+            cfg: &Config,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Vec<OwnedState> {
             let capacity = capacity.next_multiple_of(KEY_BLOCK);
             cfg.layer_types
                 .iter()
@@ -1646,9 +1700,12 @@ mod mac {
                     LayerType::LinearAttention => {
                         OwnedState::Linear(GpuDeltaNetState::new(gpu, &deltanet_config(cfg)))
                     }
-                    LayerType::FullAttention => {
-                        OwnedState::Full(GpuKvCache::new(gpu, &attention_config(cfg), capacity))
-                    }
+                    LayerType::FullAttention => OwnedState::Full(GpuKvCache::with_bits(
+                        gpu,
+                        &attention_config(cfg),
+                        capacity,
+                        bits,
+                    )),
                 })
                 .collect()
         }
@@ -1669,6 +1726,7 @@ mod mac {
         chunk: usize,
         runs: usize,
         exact: bool,
+        bits: KvBits,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Config::load(dir)?;
         let weights = Weights::open(dir)?;
@@ -1677,7 +1735,7 @@ mod mac {
         let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
         prefill.exact = exact;
         let prompt = test_tokens(tokens);
-        let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+        let owned = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
         let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
         let mut times: Vec<f64> = (0..=runs)
             .map(|_| {
@@ -1695,7 +1753,7 @@ mod mac {
             .collect();
         times.sort_by(f64::total_cmp);
         println!(
-            "prefill {tokens} tokens, chunk {}, exact {exact}, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
+            "prefill {tokens} tokens, chunk {}, exact {exact}, {bits:?} KV, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
             prefill.chunk,
             times[0],
             tokens as f64 / times[0],
@@ -1888,7 +1946,22 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 5e-3, 1e-2);
+            check_prefill(true, 5e-3, 1e-2, KvBits::Half);
+        }
+
+        /// Prefill over an 8-bit and a 4-bit KV cache against the CPU storing
+        /// its cache the same way and reading it through half. The codes match
+        /// the CPU's for the same input (tests/kv_quant.rs); here the inputs
+        /// differ by f32 rounding, so a value now and then lands on the next
+        /// code, and the bounds are the half cache's times
+        /// kv_quant::test_slack (8 bits: logits 1.3e-2, median token 2e-3).
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn quantized_prefill_matches_token_by_token() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_prefill(true, 5e-3, 1e-2, bits);
+            }
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1906,7 +1979,7 @@ mod mac {
             // the median token peaks at 6.1e-2 (layer 26), state 7.4e-2,
             // logits 4.2e-2. MLX in bf16 is off by 1.6e-2 at layer 3.
             // Bounds are about twice what was measured.
-            check_prefill(false, 0.12, 0.1);
+            check_prefill(false, 0.12, 0.1, KvBits::Half);
         }
 
         /// 166 tokens in two calls (150 then 16) with chunks of 128 rounded
@@ -1914,7 +1987,9 @@ mod mac {
         /// kernels and a 22-row one on qmm_few: the hidden state after each layer and every layer state
         /// must be within `bound` of the CPU fed one token at a time, the
         /// logits within `logits_bound`, with the same argmax.
-        fn check_prefill(exact: bool, bound: f32, logits_bound: f32) {
+        fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) {
+            let slack = crate::kv_quant::test_slack(bits);
+            let (bound, logits_bound) = (bound * slack, logits_bound * slack);
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
@@ -1926,14 +2001,14 @@ mod mac {
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
-            // The GPU cache is half; the CPU rounds its keys and values the
-            // same way.
+            // The CPU stores its keys and values as the GPU cache does, and
+            // reads a quantized one through half as prefill does.
             for s in &mut cpu_states {
                 if let LayerState::Full(c) = s {
-                    c.round_to_half();
+                    c.round_to_as_half(bits);
                 }
             }
-            let gpu_states = OwnedState::new_all(&gpu, &cfg, capacity);
+            let gpu_states = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
             let mut cpu_x: Vec<Vec<Vec<f32>>> = parts
                 .iter()
                 .map(|p| p.iter().map(|&t| model.embed(t)).collect())
@@ -1988,8 +2063,21 @@ mod mac {
                                 .map(|v| v.to_f32())
                                 .collect()
                         };
-                        let k = rel_rms(&f32s(&g.keys), c.keys());
-                        let v = rel_rms(&f32s(&g.values), c.values());
+                        let dequantized = |q: &crate::kv_quant::QuantRows| {
+                            let groups = n / crate::kv_quant::GROUP;
+                            crate::kv_quant::dequantize(
+                                contents::<u32>(&q.data, groups * q.bits.words_per_group()),
+                                contents::<half::f16>(&q.scales, groups),
+                                contents::<half::f16>(&q.biases, groups),
+                                q.bits,
+                            )
+                        };
+                        let (keys, values) = match &g.quant {
+                            None => (f32s(&g.keys), f32s(&g.values)),
+                            Some((k, v)) => (dequantized(k), dequantized(v)),
+                        };
+                        let k = rel_rms(&keys, c.keys());
+                        let v = rel_rms(&values, c.values());
                         k.max(v)
                     }
                     _ => panic!("layer {l}: state types differ"),
@@ -1999,7 +2087,15 @@ mod mac {
                 );
                 // The half path may pick another expert at a near tie for a
                 // token, as bf16 MLX does, so only the median token counts.
-                let hidden = if exact { err } else { median };
+                // So does a quantized cache: a key on the next code moves a
+                // few tokens far more than the rest (8 bits, layer 14: rms
+                // 2.2e-2, median 5.1e-3), and F's KL gate covers the whole.
+                // `bound` has the slack of a quantized cache in it.
+                let hidden = if exact && bits == KvBits::Half {
+                    err
+                } else {
+                    median
+                };
                 assert!(hidden < bound && state < bound * 1.25, "layer {l}");
             }
 

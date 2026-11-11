@@ -15,18 +15,12 @@ mod mac {
     use crate::cpu::deltanet::DeltaNetConfig;
     use crate::cpu::model::{attention_config, deltanet_config};
     use crate::gpu::Gpu;
+    use crate::kv_quant::{KvBits, QuantRows};
     use crate::plan::Plan;
     use crate::qmv::{GpuQuant, View};
+    use crate::rows;
     use crate::weights::Weights;
     use metal::{Buffer, MTLSize};
-
-    /// A view `floats` values into `buffer`.
-    fn at(buffer: &Buffer, floats: usize) -> View {
-        View {
-            buffer: buffer.clone(),
-            offset: (floats * 4) as u64,
-        }
-    }
 
     fn whole(buffer: &Buffer) -> View {
         View::new(buffer.clone())
@@ -113,29 +107,57 @@ mod mac {
     struct ResidualParams {
         dim: u32,
         eps: f32,
+        logit_stride: u32,
     }
 
     /// Records `x += y; out = rms_norm(x) * w` as one op, for buffers
     /// `[x, y, w, out]` of `dim` values.
     pub fn add_norm(plan: &mut Plan, buffers: [&View; 4], dim: usize, eps: f32) {
-        residual(plan, "add_norm", &buffers, dim, eps);
+        residual(plan, "add_norm", &buffers, 1, dim, eps, 0);
+    }
+
+    /// `add_norm` over `rows` rows of x, y and out.
+    pub fn add_norm_rows(plan: &mut Plan, buffers: [&View; 4], rows: usize, dim: usize, eps: f32) {
+        residual(plan, "add_norm", &buffers, rows, dim, eps, 0);
     }
 
     /// Records `x += sigmoid(shared_logit[0]) * shared + routed;
     /// out = rms_norm(x) * w` as one op, for buffers
     /// `[x, shared_logit, shared, routed, w, out]`.
     pub fn mix_norm(plan: &mut Plan, buffers: [&View; 6], dim: usize, eps: f32) {
-        residual(plan, "mix_norm", &buffers, dim, eps);
+        residual(plan, "mix_norm", &buffers, 1, dim, eps, 0);
     }
 
-    fn residual(plan: &mut Plan, kernel: &str, buffers: &[&View], dim: usize, eps: f32) {
+    /// `mix_norm` over `rows` rows of x, shared, routed and out; row r's
+    /// shared logit is `shared_logit[r * logit_stride]`.
+    pub fn mix_norm_rows(
+        plan: &mut Plan,
+        buffers: [&View; 6],
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        logit_stride: usize,
+    ) {
+        residual(plan, "mix_norm", &buffers, rows, dim, eps, logit_stride);
+    }
+
+    fn residual(
+        plan: &mut Plan,
+        kernel: &str,
+        buffers: &[&View],
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        logit_stride: usize,
+    ) {
         let p = plan.constant(&[ResidualParams {
             dim: dim as u32,
             eps,
+            logit_stride: logit_stride as u32,
         }]);
         let mut all = buffers.to_vec();
         all.push(&p);
-        plan.op(kernel, &all, size(1, 1), size(dim.min(1024), 1));
+        plan.op(kernel, &all, size(rows, 1), size(dim.min(1024), 1));
     }
 
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
@@ -154,15 +176,22 @@ mod mac {
         ))
     }
 
-    /// The keys (after norm and rope) and values on the GPU as half, each
-    /// token `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p`
-    /// goes in slot `p`. A page of the buffers takes memory only once
-    /// something is written there, so the full context costs nothing up front.
+    /// The keys (after norm and rope) and values on the GPU, each token
+    /// `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p` goes in
+    /// slot `p`. Metal makes the whole of a buffer resident once a kernel
+    /// uses it, so a cache starts small and `grow`s with the context.
     pub struct GpuKvCache {
+        /// Half values, or with `quant` the codes (src/kv_quant.rs).
         pub keys: Buffer,
         pub values: Buffer,
+        /// The quantized keys and values, with their scales and biases.
+        pub quant: Option<(QuantRows, QuantRows)>,
+        pub bits: KvBits,
         decode: DecodeAttention,
         pub capacity: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
     }
 
     /// The capacity is a multiple of this: the decode attention chunk, and a
@@ -170,16 +199,95 @@ mod mac {
     pub const KV_ALIGN: usize = 128;
 
     impl GpuKvCache {
-        /// Room for at least `capacity` tokens, rounded up to `KV_ALIGN`.
+        /// A half cache with room for at least `capacity` tokens, rounded up
+        /// to `KV_ALIGN`.
         pub fn new(gpu: &Gpu, cfg: &AttentionConfig, capacity: usize) -> GpuKvCache {
+            GpuKvCache::with_bits(gpu, cfg, capacity, KvBits::Half)
+        }
+
+        pub fn with_bits(
+            gpu: &Gpu,
+            cfg: &AttentionConfig,
+            capacity: usize,
+            bits: KvBits,
+        ) -> GpuKvCache {
             let capacity = capacity.next_multiple_of(KV_ALIGN);
-            let token = cfg.kv_heads * cfg.head_dim * 2;
-            GpuKvCache {
-                keys: gpu.buffer(capacity * token),
-                values: gpu.buffer(capacity * token),
-                decode: DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity),
-                capacity,
+            let values = cfg.kv_heads * cfg.head_dim;
+            let decode = DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity);
+            if bits == KvBits::Half {
+                return GpuKvCache {
+                    keys: gpu.buffer(capacity * values * 2),
+                    values: gpu.buffer(capacity * values * 2),
+                    quant: None,
+                    bits,
+                    decode,
+                    capacity,
+                    heads: cfg.heads,
+                    kv_heads: cfg.kv_heads,
+                    head_dim: cfg.head_dim,
+                };
             }
+            let k = QuantRows::new(gpu, bits, values, capacity);
+            let v = QuantRows::new(gpu, bits, values, capacity);
+            GpuKvCache {
+                keys: k.data.clone(),
+                values: v.data.clone(),
+                quant: Some((k, v)),
+                bits,
+                decode,
+                capacity,
+                heads: cfg.heads,
+                kv_heads: cfg.kv_heads,
+                head_dim: cfg.head_dim,
+            }
+        }
+
+        /// Every buffer of the cache; each holds `capacity` rows of equal
+        /// size, token `p` in row `p`.
+        pub fn buffers(&self) -> Vec<&Buffer> {
+            let mut out = vec![&self.keys, &self.values];
+            if let Some((k, v)) = &self.quant {
+                out.extend([&k.scales, &k.biases, &v.scales, &v.biases]);
+            }
+            out
+        }
+
+        /// Moves to new buffers with room for at least `capacity` tokens and
+        /// copies every old row over: the prompt cache may still use rows
+        /// past the position (another branch, or a backup put back). Plans
+        /// recorded with the old buffers must be recorded again. Both sets
+        /// of buffers are held during the copy.
+        pub fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+            let capacity = capacity.next_multiple_of(KV_ALIGN);
+            assert!(capacity >= self.capacity);
+            let old = self.capacity as u64;
+            let moved: Vec<Buffer> = self
+                .buffers()
+                .iter()
+                .map(|b| gpu.buffer((b.length() / old) as usize * capacity))
+                .collect();
+            gpu.blit(|blit| {
+                for (from, to) in self.buffers().iter().zip(&moved) {
+                    blit.copy_from_buffer(from, 0, to, 0, from.length());
+                }
+            })
+            .wait_until_completed();
+            // In the order of `buffers`.
+            let mut moved = moved.into_iter();
+            let mut next = || moved.next().unwrap();
+            self.keys = next();
+            self.values = next();
+            if let Some((k, v)) = &mut self.quant {
+                k.data = self.keys.clone();
+                v.data = self.values.clone();
+                k.scales = next();
+                k.biases = next();
+                v.scales = next();
+                v.biases = next();
+            }
+            self.decode =
+                DecodeAttention::new(gpu, self.heads, self.kv_heads, self.head_dim, capacity);
+            self.capacity = capacity;
         }
     }
 
@@ -234,16 +342,41 @@ mod mac {
         /// layer output, and the token's key and value go into `cache` at
         /// its position.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, cache: &GpuKvCache) {
-            let c = &self.cfg;
-            let d = c.head_dim;
             let [q_and_gate, q, k, v, attn] =
                 [&self.q_and_gate, &self.q, &self.k, &self.v, &self.out].map(whole);
 
             self.q_proj.record(plan, x, &q_and_gate, false);
             self.k_proj.record(plan, x, &k, true);
             self.v_proj.record(plan, x, &v, true);
+            self.record_store(plan, cache);
+            match &cache.quant {
+                Some((keys, values)) => {
+                    cache
+                        .decode
+                        .record_quant(plan, &q, keys, values, &q_and_gate, &attn)
+                }
+                None => {
+                    let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+                    cache
+                        .decode
+                        .record(plan, &q, &keys, &values, &q_and_gate, &attn);
+                }
+            }
 
-            let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+            self.o_proj.record(plan, &attn, out, false);
+        }
+
+        /// q norm and RoPE into q, k norm and RoPE, then the key and value
+        /// into the cache slot of the token: as half in one op, or quantized
+        /// from k and v, which the op writes back in place.
+        pub(crate) fn record_store(&self, plan: &mut Plan, cache: &GpuKvCache) {
+            let c = &self.cfg;
+            let d = c.head_dim;
+            let [q_and_gate, q, k, v] = [&self.q_and_gate, &self.q, &self.k, &self.v].map(whole);
+            let (keys, values, kernel) = match &cache.quant {
+                None => (whole(&cache.keys), whole(&cache.values), "attention_prep"),
+                Some(_) => (k.clone(), v.clone(), "attention_prep_float"),
+            };
             let p = plan.constant(&[PrepParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -254,7 +387,7 @@ mod mac {
             }]);
             let params = plan.params.clone();
             plan.op(
-                "attention_prep",
+                kernel,
                 &[
                     &q_and_gate,
                     &k,
@@ -270,12 +403,105 @@ mod mac {
                 size(c.heads + c.kv_heads, 1),
                 size(d, 1),
             );
+            if let Some((kq, vq)) = &cache.quant {
+                kq.record(plan, &k);
+                vq.record(plan, &v);
+            }
+        }
+    }
 
-            cache
-                .decode
-                .record(plan, &q, &keys, &values, &q_and_gate, &attn);
+    /// The attention buffers of `MAX_ROWS` tokens, shared by all attention
+    /// layers.
+    pub struct AttentionRowsScratch {
+        attention: rows::AttentionRows,
+        q_and_gate: Buffer,
+        q: Buffer,
+        k: Buffer,
+        v: Buffer,
+        out: Buffer,
+    }
 
-            self.o_proj.record(plan, &attn, out, false);
+    impl AttentionRowsScratch {
+        /// For caches of `capacity` tokens and verifies of up to `rows`.
+        pub fn new(gpu: &Gpu, cfg: &Config, capacity: usize, rows: usize) -> AttentionRowsScratch {
+            let a = attention_config(cfg);
+            let size = a.heads * a.head_dim * 4 * rows::MAX_ROWS;
+            let kv = a.kv_heads * a.head_dim * 4 * rows::MAX_ROWS;
+            AttentionRowsScratch {
+                attention: rows::AttentionRows::new(gpu, a.heads, a.kv_heads, capacity, rows),
+                q_and_gate: gpu.buffer(2 * size),
+                q: gpu.buffer(size),
+                k: gpu.buffer(kv),
+                v: gpu.buffer(kv),
+                out: gpu.buffer(size),
+            }
+        }
+    }
+
+    impl GpuAttention<'_> {
+        /// Records `m` tokens at once: `x` and `out` are `[m, hidden]`, and
+        /// row r takes its position from `params[r]` (TokenParams views),
+        /// so it sees the keys of rows before it. Each weight and each chunk
+        /// of the cache is read once for all rows.
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_rows(
+            &self,
+            plan: &mut Plan,
+            m: usize,
+            x: &View,
+            out: &View,
+            cache: &GpuKvCache,
+            scratch: &AttentionRowsScratch,
+            params: &[View],
+        ) {
+            assert!(params.len() >= m);
+            let c = &self.cfg;
+            let d = c.head_dim;
+            let s = scratch;
+            let [q_and_gate, q, k, v, attn] = [&s.q_and_gate, &s.q, &s.k, &s.v, &s.out].map(whole);
+            rows::record_proj(plan, &self.q_proj, m, x, &q_and_gate, false);
+            rows::record_proj(plan, &self.k_proj, m, x, &k, true);
+            rows::record_proj(plan, &self.v_proj, m, x, &v, true);
+
+            let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+            let p = plan.constant(&[PrepParams {
+                heads: c.heads as u32,
+                kv_heads: c.kv_heads as u32,
+                dim: d as u32,
+                half_dims: (c.rope_dims / 2) as u32,
+                log2_theta: c.rope_theta.log2(),
+                eps: c.eps,
+            }]);
+            let (qs, kv) = (c.heads * d, c.kv_heads * d);
+            let row = |b: &View, r: usize, floats: usize| View {
+                buffer: b.buffer.clone(),
+                offset: b.offset + (r * floats * 4) as u64,
+            };
+            // Each row's key and value go in at its own position, so the
+            // rows' preps are independent of each other.
+            for (r, row_params) in params.iter().enumerate().take(m) {
+                let buffers = [
+                    &row(&q_and_gate, r, 2 * qs),
+                    &row(&k, r, kv),
+                    &row(&v, r, kv),
+                    &self.q_norm,
+                    &self.k_norm,
+                    &row(&q, r, qs),
+                    &keys,
+                    &values,
+                    &p,
+                    row_params,
+                ];
+                let (grid, group) = (size(c.heads + c.kv_heads, 1), size(d, 1));
+                if r == 0 {
+                    plan.op("attention_prep", &buffers, grid, group);
+                } else {
+                    plan.op_parallel("attention_prep", &buffers, grid, group);
+                }
+            }
+            s.attention
+                .record(plan, m, &q, &keys, &values, &q_and_gate, &attn, params);
+            rows::record_proj(plan, &self.o_proj, m, &attn, out, false);
         }
     }
 
@@ -313,6 +539,18 @@ mod mac {
         eps: f32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RowsStepParams {
+        k_heads: u32,
+        v_heads: u32,
+        v_dim: u32,
+        kernel_size: u32,
+        eps: f32,
+        rows: u32,
+        snapshots: u32,
+    }
+
     /// Gated DeltaNet: projections, conv1d, q/k L2 norm, the delta rule,
     /// the gated RMSNorm and the output projection.
     pub struct GpuDeltaNet<'a> {
@@ -342,8 +580,11 @@ mod mac {
             prefix: &str,
         ) -> Result<GpuDeltaNet<'a>, String> {
             let c = deltanet_config(cfg);
-            if c.k_dim != 128 || c.v_dim > 256 {
-                return Err("deltanet_step is written for k_dim 128 and v_dim up to 256".into());
+            if c.k_dim != 128 || c.v_dim != 128 || c.v_heads != 2 * c.k_heads {
+                return Err(
+                    "deltanet_step is written for k_dim and v_dim 128, two value heads per key head"
+                        .into(),
+                );
             }
             let p = format!("{prefix}.linear_attn");
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
@@ -395,11 +636,11 @@ mod mac {
                 size(256, 1),
             );
 
-            let (q, k, v) = (
-                at(&self.mixed, 0),
-                at(&self.mixed, key_size),
-                at(&self.mixed, 2 * key_size),
-            );
+            let at = |floats: usize| View {
+                buffer: self.mixed.clone(),
+                offset: (floats * 4) as u64,
+            };
+            let (q, k, v) = (at(0), at(key_size), at(2 * key_size));
             let p = plan.constant(&[StepParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
@@ -427,6 +668,173 @@ mod mac {
             );
 
             self.out_proj.record(plan, &y, out, false);
+        }
+
+        /// Records `m` tokens one after the other, as `m` calls of `record`
+        /// would: `x` and `out` are `[m, hidden]`. With `snaps`, the states
+        /// after each row go there too (`GpuDeltaNetSnaps::restore`).
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_rows(
+            &self,
+            plan: &mut Plan,
+            m: usize,
+            x: &View,
+            out: &View,
+            state: &GpuDeltaNetState,
+            scratch: &DeltaNetRowsScratch,
+            snaps: Option<&GpuDeltaNetSnaps>,
+        ) {
+            assert!(snaps.is_none_or(|s| m <= s.rows));
+            let c = &self.cfg;
+            let DeltaNetRowsScratch {
+                qkv,
+                z,
+                a,
+                b,
+                y,
+                mixed,
+            } = scratch;
+            rows::record_proj(plan, &self.in_proj_qkv, m, x, qkv, false);
+            rows::record_proj(plan, &self.in_proj_z, m, x, z, true);
+            rows::record_proj(plan, &self.in_proj_b, m, x, b, true);
+            rows::record_proj(plan, &self.in_proj_a, m, x, a, true);
+
+            let p = plan.constant(&[RowsStepParams {
+                k_heads: c.k_heads as u32,
+                v_heads: c.v_heads as u32,
+                v_dim: c.v_dim as u32,
+                kernel_size: c.kernel as u32,
+                eps: c.eps,
+                rows: m as u32,
+                snapshots: snaps.is_some() as u32,
+            }]);
+            let (conv, recurrent) = (whole(&state.conv), whole(&state.recurrent));
+            // Without snapshots the last two buffers are never written.
+            let (conv_snaps, state_snaps) = match snaps {
+                Some(s) => (whole(&s.conv), whole(&s.recurrent)),
+                None => (conv.clone(), recurrent.clone()),
+            };
+            let simds = DN_SIMDS.load(std::sync::atomic::Ordering::Relaxed);
+            if simds == 0 {
+                plan.op(
+                    "deltanet_rows",
+                    &[
+                        qkv,
+                        &self.conv1d,
+                        &conv,
+                        a,
+                        b,
+                        &self.a_log,
+                        &self.dt_bias,
+                        &recurrent,
+                        z,
+                        &self.norm,
+                        y,
+                        &p,
+                        &conv_snaps,
+                        &state_snaps,
+                    ],
+                    size(c.k_heads, 1),
+                    size(1024, 1),
+                );
+            } else {
+                let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
+                plan.op(
+                    "deltanet_conv_rows",
+                    &[qkv, &self.conv1d, &conv, mixed, &p, &conv_snaps],
+                    size(channels.div_ceil(256), 1),
+                    size(256, 1),
+                );
+                plan.op(
+                    &format!("deltanet_step_rows_{simds}"),
+                    &[
+                        mixed,
+                        a,
+                        b,
+                        &self.a_log,
+                        &self.dt_bias,
+                        &recurrent,
+                        z,
+                        &self.norm,
+                        y,
+                        &p,
+                        &state_snaps,
+                    ],
+                    size(c.v_heads, 1),
+                    size(32 * simds, 1),
+                );
+            }
+
+            rows::record_proj(plan, &self.out_proj, m, y, out, false);
+        }
+    }
+
+    /// The projections and step outputs of `MAX_ROWS` tokens, shared by
+    /// all DeltaNet layers.
+    pub struct DeltaNetRowsScratch {
+        qkv: View,
+        z: View,
+        a: View,
+        b: View,
+        y: View,
+        mixed: View,
+    }
+
+    /// Simdgroups per value head of deltanet_step_rows (8, 16 or 32); 0
+    /// records the fused deltanet_rows instead.
+    pub static DN_SIMDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
+    impl DeltaNetRowsScratch {
+        pub fn new(gpu: &Gpu, cfg: &Config) -> DeltaNetRowsScratch {
+            let c = deltanet_config(cfg);
+            let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
+            let values = c.v_heads * c.v_dim;
+            let v = |floats: usize| View::new(gpu.buffer(rows::MAX_ROWS * floats * 4));
+            DeltaNetRowsScratch {
+                qkv: v(channels),
+                z: v(values),
+                a: v(c.v_heads),
+                b: v(c.v_heads),
+                y: v(values),
+                mixed: v(channels),
+            }
+        }
+    }
+
+    /// The DeltaNet state after each of up to `rows` tokens of one layer.
+    pub struct GpuDeltaNetSnaps {
+        pub rows: usize,
+        conv: Buffer,
+        recurrent: Buffer,
+    }
+
+    impl GpuDeltaNetSnaps {
+        /// About 2 MB per row.
+        pub fn new(gpu: &Gpu, cfg: &DeltaNetConfig, rows: usize) -> GpuDeltaNetSnaps {
+            let state = GpuDeltaNetState::new(gpu, cfg);
+            let size = |b: &Buffer| rows * b.length() as usize;
+            GpuDeltaNetSnaps {
+                rows,
+                conv: gpu.buffer(size(&state.conv)),
+                recurrent: gpu.buffer(size(&state.recurrent)),
+            }
+        }
+
+        /// Records copying the state after row `row` into `state`.
+        pub fn record_restore(&self, plan: &mut Plan, row: usize, state: &GpuDeltaNetState) {
+            for (from, to) in [
+                (&self.conv, &state.conv),
+                (&self.recurrent, &state.recurrent),
+            ] {
+                let n = to.length() as usize / 4;
+                // copy_u32 has no bounds check.
+                assert!(n.is_multiple_of(256));
+                let src = View {
+                    buffer: from.clone(),
+                    offset: (row * n * 4) as u64,
+                };
+                crate::gpu_model::elementwise(plan, "copy_u32", &[&src, &whole(to)], n, true);
+            }
         }
     }
 
@@ -601,6 +1009,168 @@ mod mac {
             );
         }
 
+        /// TOKENS tokens as one `record_rows` against one `record` per
+        /// token: outputs, and a restore to each row against the state after
+        /// that token.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn deltanet_rows_match_tokens() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let prefix = "language_model.model.layers.0";
+            let layer = GpuDeltaNet::load(&gpu, &cfg, &weights, prefix).unwrap();
+            let n = cfg.hidden_size;
+            let inputs: Vec<Vec<f32>> = (0..TOKENS)
+                .map(|t| input(&weights, prefix, t, cfg.rms_norm_eps))
+                .collect();
+
+            let state = GpuDeltaNetState::new(&gpu, &layer.cfg);
+            let x = View::new(gpu.buffer(n * 4));
+            let out = View::new(gpu.buffer(n * 4));
+            let mut plan = Plan::new(&gpu);
+            layer.record(&mut plan, &x, &out, &state);
+            let built = plan.build();
+            let mut want = Vec::new();
+            let mut states = Vec::new();
+            for input in &inputs {
+                write(&x.buffer, input);
+                built.run(&gpu);
+                want.extend(read(&out.buffer, n));
+                states.push((
+                    read(&state.conv, state.conv.length() as usize / 4),
+                    read(&state.recurrent, state.recurrent.length() as usize / 4),
+                ));
+            }
+
+            for simds in [0, 8, 16, 32] {
+                DN_SIMDS.store(simds, std::sync::atomic::Ordering::Relaxed);
+                let rows_state = GpuDeltaNetState::new(&gpu, &layer.cfg);
+                let scratch = DeltaNetRowsScratch::new(&gpu, &cfg);
+                let snaps = GpuDeltaNetSnaps::new(&gpu, &layer.cfg, TOKENS);
+                let mut padded = inputs.concat();
+                padded.resize(rows::MAX_ROWS * n, 0.0);
+                let xs = View::new(gpu.buffer_from(&padded));
+                let outs = View::new(gpu.buffer(TOKENS * n * 4));
+                let mut plan = Plan::new(&gpu);
+                layer.record_rows(
+                    &mut plan,
+                    TOKENS,
+                    &xs,
+                    &outs,
+                    &rows_state,
+                    &scratch,
+                    Some(&snaps),
+                );
+                plan.build().run(&gpu);
+                let close = |got: &[f32], want: &[f32], what: &str| {
+                    let err = rel_rms(got, want);
+                    assert!(err < BOUND, "{what}: rel rms {err}");
+                };
+                close(
+                    &read(&outs.buffer, TOKENS * n),
+                    &want,
+                    &format!("simds {simds} outputs"),
+                );
+                let conv_n = rows_state.conv.length() as usize / 4;
+                let rec_n = rows_state.recurrent.length() as usize / 4;
+                for (row, (conv, rec)) in states.iter().enumerate() {
+                    let mut plan = Plan::new(&gpu);
+                    snaps.record_restore(&mut plan, row, &rows_state);
+                    plan.build().run(&gpu);
+                    close(
+                        &read(&rows_state.conv, conv_n),
+                        conv,
+                        &format!("simds {simds} row {row} conv"),
+                    );
+                    close(
+                        &read(&rows_state.recurrent, rec_n),
+                        rec,
+                        &format!("simds {simds} row {row} recurrent"),
+                    );
+                }
+            }
+            DN_SIMDS.store(16, std::sync::atomic::Ordering::Relaxed);
+            println!("deltanet rows: {TOKENS} rows and their restores match {TOKENS} tokens");
+        }
+
+        /// The keys and values a quantized cache stores, from the decode
+        /// path, against the CPU layer's: within the quantization step, and
+        /// nearly all of them the codes the CPU picks.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn quantized_store_matches_cpu() {
+            use crate::kv_quant::{dequantize, round_trip};
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let prefix = "language_model.model.layers.3";
+            let layer = GpuAttention::load(&gpu, &cfg, &weights, prefix).unwrap();
+            let x = View::new(gpu.buffer(cfg.hidden_size * 4));
+            let p = format!("{prefix}.self_attn");
+            let v = |n: &str| weights.tensor(&format!("{p}.{n}")).unwrap().to_f32();
+            let (q_norm, k_norm) = (v("q_norm.weight"), v("k_norm.weight"));
+            let m = |n: &str| quant(&weights, &cfg, &format!("{p}.{n}"));
+            let w = AttentionWeights {
+                q_proj: m("q_proj"),
+                k_proj: m("k_proj"),
+                v_proj: m("v_proj"),
+                o_proj: m("o_proj"),
+                q_norm: &q_norm,
+                k_norm: &k_norm,
+            };
+            let c = attention_config(&cfg);
+            // The rounding error of a group of 64 is about step / sqrt(12),
+            // with the step range / 255 or range / 15: 5.5e-3 and 0.1 of the
+            // rms of the values.
+            for (bits, bound) in [(KvBits::Eight, 8e-3), (KvBits::Four, 0.15)] {
+                let cache = GpuKvCache::with_bits(&gpu, &layer.cfg, 64, bits);
+                let mut plan = Plan::new(&gpu);
+                let [q_and_gate, k, vv] =
+                    [&layer.q_and_gate, &layer.k, &layer.v].map(|b| View::new(b.clone()));
+                layer.q_proj.record(&mut plan, &x, &q_and_gate, false);
+                layer.k_proj.record(&mut plan, &x, &k, true);
+                layer.v_proj.record(&mut plan, &x, &vv, true);
+                layer.record_store(&mut plan, &cache);
+                let built = plan.build();
+                let mut cpu_cache = KvCache::default();
+                for t in 0..TOKENS {
+                    let input = input(&weights, prefix, t, cfg.rms_norm_eps);
+                    attention(&c, &w, &input, &mut cpu_cache);
+                    write(&x.buffer, &input);
+                    plan.set_params(TokenParams::new(0, t as u32));
+                    built.run(&gpu);
+                }
+                let (kq, vq) = cache.quant.as_ref().unwrap();
+                let groups = TOKENS * kq.per_token;
+                let words = groups * bits.words_per_group();
+                let read = |q: &crate::kv_quant::QuantRows| {
+                    dequantize(
+                        crate::gpu::contents::<u32>(&q.data, words),
+                        crate::gpu::contents::<half::f16>(&q.scales, groups),
+                        crate::gpu::contents::<half::f16>(&q.biases, groups),
+                        bits,
+                    )
+                };
+                for (name, got, want) in [
+                    ("keys", read(kq), cpu_cache.keys()),
+                    ("values", read(vq), cpu_cache.values()),
+                ] {
+                    let err = rel_rms(&got, want);
+                    let same = round_trip(want, bits)
+                        .iter()
+                        .zip(&got)
+                        .filter(|(a, b)| a == b)
+                        .count();
+                    println!(
+                        "{bits:?} {name}: rel rms {err:.2e} against f32, {same} of {} as the CPU stores them",
+                        got.len()
+                    );
+                    assert!(err < bound, "{bits:?} {name}");
+                    assert!(same * 100 >= got.len() * 99, "{bits:?} {name}");
+                }
+            }
+        }
+
+        /// The GPU layer over a half cache against the CPU one.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn attention_matches_cpu() {

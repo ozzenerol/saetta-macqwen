@@ -17,6 +17,7 @@ mod mac {
     use crate::gpu_layers::{
         GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm, add_norm, mix_norm,
     };
+    use crate::kv_quant::KvBits;
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
@@ -79,39 +80,55 @@ mod mac {
         ids: &View,
         weights: &View,
     ) {
+        record_route_rows(plan, 1, logits, 0, experts, top_k, ids, weights);
+    }
+
+    /// `record_route` for `rows` rows of logits, `logit_stride` floats
+    /// apart; `ids` and `weights` get `[rows, top_k]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_route_rows(
+        plan: &mut Plan,
+        rows: usize,
+        logits: &View,
+        logit_stride: usize,
+        experts: usize,
+        top_k: usize,
+        ids: &View,
+        weights: &View,
+    ) {
         // ROUTE_PER_LANE values in each of 32 lanes.
         assert!(experts <= 256 && top_k <= 16);
-        let shape = plan.constant(&[experts as u32, top_k as u32]);
+        let shape = plan.constant(&[experts as u32, top_k as u32, logit_stride as u32]);
         plan.op(
             "route_top_k",
             &[logits, ids, weights, &shape],
-            MTLSize::new(1, 1, 1),
+            MTLSize::new(rows as u64, 1, 1),
             MTLSize::new(32, 1, 1),
         );
     }
 
     /// The scratch buffers of the MoE block, shared by all layers.
-    struct MoeScratch {
-        normed: View,
+    pub(crate) struct MoeScratch {
+        pub(crate) normed: View,
         /// The router's output: `num_experts` logits, then the shared
         /// expert gate logit, which `shared_logit` points at.
-        router: View,
-        ids: View,
-        weights: View,
-        shared_logit: View,
-        shared_gate: View,
-        shared_up: View,
-        shared_h: View,
-        shared: View,
-        experts_h: View,
-        routed: View,
+        pub(crate) router: View,
+        pub(crate) ids: View,
+        pub(crate) weights: View,
+        pub(crate) shared_logit: View,
+        pub(crate) shared_gate: View,
+        pub(crate) shared_up: View,
+        pub(crate) shared_h: View,
+        pub(crate) shared: View,
+        pub(crate) experts_h: View,
+        pub(crate) routed: View,
     }
 
     /// The scratch buffers of one layer step, shared by all layers.
     pub(crate) struct Scratch {
-        normed: View,
-        mixed: View,
-        moe: MoeScratch,
+        pub(crate) normed: View,
+        pub(crate) mixed: View,
+        pub(crate) moe: MoeScratch,
     }
 
     impl Scratch {
@@ -142,14 +159,14 @@ mod mac {
         }
     }
 
-    struct GpuMoe<'a> {
-        post_norm: View,
+    pub(crate) struct GpuMoe<'a> {
+        pub(crate) post_norm: View,
         /// Router logits then the shared expert gate, 257 values.
-        router: Router<'a>,
-        shared_gate: GpuQuant<'a>,
-        shared_up: GpuQuant<'a>,
-        shared_down: GpuQuant<'a>,
-        experts: Experts<'a>,
+        pub(crate) router: Router<'a>,
+        pub(crate) shared_gate: GpuQuant<'a>,
+        pub(crate) shared_up: GpuQuant<'a>,
+        pub(crate) shared_down: GpuQuant<'a>,
+        pub(crate) experts: Experts<'a>,
     }
 
     impl<'a> GpuMoe<'a> {
@@ -229,15 +246,15 @@ mod mac {
         }
     }
 
-    enum Mixer<'a> {
+    pub(crate) enum Mixer<'a> {
         Linear(GpuDeltaNet<'a>, GpuDeltaNetState),
         Full(GpuAttention<'a>, GpuKvCache),
     }
 
     pub(crate) struct GpuLayer<'a> {
-        input_norm: View,
-        mixer: Mixer<'a>,
-        moe: GpuMoe<'a>,
+        pub(crate) input_norm: View,
+        pub(crate) mixer: Mixer<'a>,
+        pub(crate) moe: GpuMoe<'a>,
     }
 
     impl<'a> GpuLayer<'a> {
@@ -251,6 +268,19 @@ mod mac {
             kind: LayerType,
             capacity: usize,
         ) -> Result<GpuLayer<'a>, String> {
+            GpuLayer::load_with_bits(gpu, cfg, weights, prefix, kind, capacity, KvBits::Half)
+        }
+
+        /// As `load`, with an attention layer's cache stored as `bits`.
+        pub(crate) fn load_with_bits(
+            gpu: &Gpu,
+            cfg: &Config,
+            weights: &'a Weights,
+            prefix: &str,
+            kind: LayerType,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Result<GpuLayer<'a>, String> {
             let mixer = match kind {
                 LayerType::LinearAttention => {
                     let m = GpuDeltaNet::load(gpu, cfg, weights, prefix)?;
@@ -259,7 +289,7 @@ mod mac {
                 }
                 LayerType::FullAttention => {
                     let m = GpuAttention::load(gpu, cfg, weights, prefix)?;
-                    let cache = GpuKvCache::new(gpu, &m.cfg, capacity);
+                    let cache = GpuKvCache::with_bits(gpu, &m.cfg, capacity, bits);
                     Mixer::Full(m, cache)
                 }
             };
@@ -313,6 +343,22 @@ mod mac {
             self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
         }
 
+        /// Grows an attention layer's cache to `capacity` tokens; a DeltaNet
+        /// layer has nothing to grow.
+        pub(crate) fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+            if let Mixer::Full(_, cache) = &mut self.mixer {
+                cache.grow(gpu, capacity);
+            }
+        }
+
+        /// Bytes of the attention cache as allocated now, 0 for DeltaNet.
+        pub(crate) fn kv_bytes(&self) -> u64 {
+            match &self.mixer {
+                Mixer::Full(_, c) => c.keys.length() + c.values.length(),
+                Mixer::Linear(..) => 0,
+            }
+        }
+
         /// Clears a DeltaNet state; an attention cache needs no clearing.
         pub(crate) fn reset(&self) {
             if let Mixer::Linear(_, state) = &self.mixer {
@@ -338,6 +384,30 @@ mod mac {
         Ok(embed)
     }
 
+    /// Tokens the attention caches start with: Metal makes a whole buffer
+    /// resident once a kernel uses it, so a short chat must not pay for the
+    /// full context.
+    pub const KV_START: usize = 32768;
+
+    /// The first capacity for a context of `limit` tokens.
+    pub fn kv_start(limit: usize) -> usize {
+        KV_START.min(limit)
+    }
+
+    /// The capacity to grow to from `capacity` for `need` tokens: doubled
+    /// until it fits, at most `limit`.
+    pub fn kv_grow(capacity: usize, need: usize, limit: usize) -> usize {
+        assert!(
+            need <= limit,
+            "{need} tokens do not fit in {limit} of context"
+        );
+        let mut c = capacity.max(1);
+        while c < need {
+            c *= 2;
+        }
+        c.min(limit)
+    }
+
     /// `x = embed[params.token]`.
     pub(crate) fn record_embed(plan: &mut Plan, embed: &GpuQuant, x: &View) {
         let cols = embed.cols;
@@ -361,19 +431,27 @@ mod mac {
     /// What a token reads back: the logits, and the hidden state before the
     /// final norm (for tests that run only some layers).
     pub struct GpuModel<'a> {
-        gpu: &'a Gpu,
-        cfg: &'a Config,
-        layers: Vec<GpuLayer<'a>>,
-        plan: Plan<'a>,
-        built: Built,
+        pub(crate) gpu: &'a Gpu,
+        pub(crate) cfg: &'a Config,
+        pub(crate) layers: Vec<GpuLayer<'a>>,
+        pub(crate) embed: GpuQuant<'a>,
+        pub(crate) final_norm: View,
+        pub(crate) lm_head: GpuQuant<'a>,
+        /// The multi-row verify, after `enable_verify`.
+        pub(crate) verify: Option<crate::gpu_verify::GpuVerify<'a>>,
+        pub(crate) plan: Plan<'a>,
+        pub(crate) built: Built,
         hidden: View,
         final_hidden: View,
         logits: View,
         scratch: Scratch,
         /// Samples the next token from `logits` in the same command buffer.
-        sampler: GpuSampler,
-        capacity: usize,
-        position: usize,
+        pub(crate) sampler: GpuSampler,
+        /// Tokens the attention caches hold now.
+        pub(crate) allocated: usize,
+        /// Tokens they may grow to: the context.
+        pub(crate) capacity: usize,
+        pub(crate) position: usize,
     }
 
     /// The MoE router of the last layer that ran, for debugging.
@@ -396,12 +474,54 @@ mod mac {
             layers: usize,
             capacity: usize,
         ) -> Result<GpuModel<'a>, String> {
+            GpuModel::load_with_bits(gpu, cfg, weights, layers, capacity, KvBits::Half)
+        }
+
+        /// As `load`, with the KV caches stored as `bits`.
+        pub fn load_with_bits(
+            gpu: &'a Gpu,
+            cfg: &'a Config,
+            weights: &'a Weights,
+            layers: usize,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Result<GpuModel<'a>, String> {
+            Self::load_from(
+                gpu,
+                cfg,
+                weights,
+                layers,
+                capacity,
+                kv_start(capacity),
+                bits,
+            )
+        }
+
+        /// `load_with_bits` with caches that start at `start` tokens.
+        pub fn load_from(
+            gpu: &'a Gpu,
+            cfg: &'a Config,
+            weights: &'a Weights,
+            layers: usize,
+            capacity: usize,
+            start: usize,
+            bits: KvBits,
+        ) -> Result<GpuModel<'a>, String> {
             assert!(layers <= cfg.num_layers());
             let embed = load_embed(gpu, cfg, weights)?;
+            let allocated = start.min(capacity);
             let loaded = (0..layers)
                 .map(|l| {
                     let prefix = format!("{PREFIX}.layers.{l}");
-                    GpuLayer::load(gpu, cfg, weights, &prefix, cfg.layer_types[l], capacity)
+                    GpuLayer::load_with_bits(
+                        gpu,
+                        cfg,
+                        weights,
+                        &prefix,
+                        cfg.layer_types[l],
+                        allocated,
+                        bits,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let final_norm = vector(gpu, weights, &format!("{PREFIX}.norm.weight"))?;
@@ -412,32 +532,24 @@ mod mac {
             let x = view(gpu, hidden);
             let final_hidden = view(gpu, hidden);
             let logits = view(gpu, lm_head.rows);
-
-            let mut plan = Plan::new(gpu);
-            record_embed(&mut plan, &embed, &x);
-            loaded[0].record_input_norm(&mut plan, cfg, &x, &scratch);
-            for (l, layer) in loaded.iter().enumerate() {
-                let (next_norm, next_out) = match loaded.get(l + 1) {
-                    Some(next) => (next.input_norm(), &scratch.normed),
-                    None => (&final_norm, &final_hidden),
-                };
-                layer.record(&mut plan, cfg, &x, &scratch, next_norm, next_out);
-            }
-            lm_head.record(&mut plan, &final_hidden, &logits, false);
             let sampler = GpuSampler::new(gpu);
-            sampler.record(&mut plan, &logits);
             let greedy = Params {
                 temperature: 0.0,
                 top_p: 1.0,
                 top_k: 1,
             };
             sampler.set(lm_head.rows, &greedy, false);
+            let plan = Plan::new(gpu);
             let built = plan.build();
 
-            Ok(GpuModel {
+            let mut model = GpuModel {
                 gpu,
                 cfg,
                 layers: loaded,
+                embed,
+                final_norm,
+                lm_head,
+                verify: None,
                 plan,
                 built,
                 hidden: x,
@@ -445,9 +557,69 @@ mod mac {
                 logits,
                 scratch,
                 sampler,
+                allocated,
                 capacity,
                 position: 0,
-            })
+            };
+            model.record_plan();
+            Ok(model)
+        }
+
+        /// Records one token's run into `plan` and builds it.
+        fn record_plan(&mut self) {
+            let (cfg, s) = (self.cfg, &self.scratch);
+            let mut plan = Plan::new(self.gpu);
+            record_embed(&mut plan, &self.embed, &self.hidden);
+            self.layers[0].record_input_norm(&mut plan, cfg, &self.hidden, s);
+            for (l, layer) in self.layers.iter().enumerate() {
+                let (next_norm, next_out) = match self.layers.get(l + 1) {
+                    Some(next) => (next.input_norm(), &s.normed),
+                    None => (&self.final_norm, &self.final_hidden),
+                };
+                layer.record(&mut plan, cfg, &self.hidden, s, next_norm, next_out);
+            }
+            self.lm_head
+                .record(&mut plan, &self.final_hidden, &self.logits, false);
+            self.sampler.record(&mut plan, &self.logits);
+            self.built = plan.build();
+            self.plan = plan;
+        }
+
+        /// Makes room for `need` tokens in the attention caches, growing them
+        /// (and recording the plan again) if they are smaller. At most the
+        /// capacity.
+        pub fn reserve(&mut self, need: usize) {
+            if need <= self.allocated {
+                return;
+            }
+            let allocated = kv_grow(self.allocated, need, self.capacity);
+            let before = self.kv_bytes();
+            for layer in &mut self.layers {
+                layer.grow(self.gpu, allocated);
+            }
+            eprintln!(
+                "KV grows from {} to {} tokens: {} MB now, {} MB more for the copy",
+                self.allocated,
+                allocated,
+                self.kv_bytes() >> 20,
+                before >> 20
+            );
+            self.allocated = allocated;
+            self.record_plan();
+            // The verify plans hold the old caches too.
+            if let Some(rows) = self.verify.as_ref().map(|v| v.rows) {
+                self.enable_verify(rows);
+            }
+        }
+
+        /// Tokens the attention caches hold now; `capacity` is the most.
+        pub fn allocated(&self) -> usize {
+            self.allocated
+        }
+
+        /// Bytes of the attention caches as allocated now.
+        pub fn kv_bytes(&self) -> u64 {
+            self.layers.iter().map(GpuLayer::kv_bytes).sum()
         }
 
         /// The recorded token, for profiling.
@@ -516,6 +688,7 @@ mod mac {
                 "context is full ({} tokens)",
                 self.capacity
             );
+            self.reserve(self.position + 1);
             self.plan
                 .set_params(TokenParams::new(token, self.position as u32));
             self.built.run(self.gpu);
@@ -688,21 +861,64 @@ mod mac {
             assert!(rel_rms(&model.hidden(), &x) < 1e-4, "after reset");
         }
 
+        /// A cache that grows from 128 tokens gives bit for bit the hidden
+        /// states of one allocated whole, over the first four layers (one attention).
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn growing_cache_matches_whole() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            // A quantized cache grows its codes, scales and biases.
+            for bits in [KvBits::Half, KvBits::Eight] {
+                let load = |start| {
+                    GpuModel::load_from(&gpu, &cfg, &weights, 4, 1024, start, bits).unwrap()
+                };
+                let (mut grows, mut whole) = (load(128), load(1024));
+                assert_eq!((grows.allocated(), whole.allocated()), (128, 1024));
+                for t in 0..600u32 {
+                    let token = (t * 7919) % 50000;
+                    grows.run(token);
+                    whole.run(token);
+                    // The same kernels, and chunks past the length return at
+                    // once, so the capacity must not change a bit.
+                    assert_eq!(grows.hidden(), whole.hidden(), "{bits:?} token {t}");
+                }
+                assert_eq!(grows.allocated(), 1024);
+            }
+        }
+
         /// All 40 layers: logits against the CPU model and the same greedy
         /// tokens. Needs about 25 GB, so mlx_lm.server must not be running.
         #[test]
         #[ignore = "needs the whole model on the GPU"]
         fn whole_model_matches_cpu() {
+            check_whole_model(KvBits::Half);
+        }
+
+        /// As above over an 8-bit and a 4-bit cache. The codes are the CPU's
+        /// (tests/kv_quant.rs) and decode reads them as f32, as the CPU does.
+        #[test]
+        #[ignore = "needs the whole model on the GPU"]
+        fn whole_model_quantized_matches_cpu() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_whole_model(bits);
+            }
+        }
+
+        fn check_whole_model(bits: KvBits) {
             let (cfg, weights) = open();
             let cpu = Model::new(&cfg, &weights).unwrap();
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
+            let mut model =
+                GpuModel::load_with_bits(&gpu, &cfg, &weights, cfg.num_layers(), 256, bits)
+                    .unwrap();
             let mut states = cpu.new_states();
-            // The GPU cache is half; the CPU rounds its keys and values the
-            // same way, so what is left is the f32 arithmetic.
+            // The CPU rounds its keys and values as the GPU cache stores
+            // them, so what is left is the f32 arithmetic.
             for s in &mut states {
                 if let crate::cpu::model::LayerState::Full(c) = s {
-                    c.round_to_half();
+                    c.round_to(bits);
                 }
             }
             let mut cpu_logits = Vec::new();
@@ -716,8 +932,27 @@ mod mac {
                 let (c, g) = (argmax(&cpu_logits), argmax(&gpu_logits));
                 let err = rel_rms(&gpu_logits, &cpu_logits);
                 println!("token {i}: cpu {c}, gpu {g}, rel rms {err:.2e}");
-                assert!(err < 1e-4);
-                assert_eq!(c, g, "token {i}");
+                // The mma attention sums in another order: 1.2e-4 at token 13.
+                // A key or value that rounds to the next code moves by a
+                // step: 1e-3 of the logits at 8 bits, and 2.6e-2 when that
+                // tips a near tie of the router (token 5). At 4 bits the
+                // values carry 9e-2 of rounding error and many keys sit near
+                // a code boundary: up to 1.2e-1 by token 10.
+                let bound = match bits {
+                    KvBits::Half => 3e-4,
+                    KvBits::Eight => 5e-2,
+                    KvBits::Four => 2e-1,
+                };
+                assert!(err < bound);
+                if bits == KvBits::Half {
+                    assert_eq!(c, g, "token {i}");
+                } else {
+                    // A lossy cache may pick the other side of a near tie
+                    // (8 bits, token 7): the CPU must rate the GPU's pick
+                    // almost as high as its own.
+                    let gap = cpu_logits[c as usize] - cpu_logits[g as usize];
+                    assert!(gap < 0.5, "token {i}: gap {gap}");
+                }
                 cpu_logits = cpu.forward(c, &mut states).unwrap();
                 gpu_logits = model.forward(c);
             }
