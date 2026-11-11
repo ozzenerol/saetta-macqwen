@@ -43,18 +43,32 @@ pub fn route(gate: &[f32], x: &[f32], top_k: usize) -> Vec<(usize, f32)> {
 
 pub fn moe(w: &MoeWeights, x: &[f32], top_k: usize) -> Vec<f32> {
     let experts = w.gate.len() / x.len();
-    let mut out = vec![0.0; x.len()];
-    for (e, weight) in route(w.gate, x, top_k) {
-        let y = mlp(&expert(&w.experts, e, experts), x);
-        for (o, v) in out.iter_mut().zip(&y) {
+    let routes = route(w.gate, x, top_k);
+    let shared = mlp(&w.shared_expert, x);
+    let shared_logit = matvec(w.shared_expert_gate, x)[0];
+    mix(
+        &routes,
+        |e| mlp(&expert(&w.experts, e, experts), x),
+        &shared,
+        shared_logit,
+    )
+}
+
+/// Sums the chosen experts by their router weight and adds the shared expert
+/// scaled by `sigmoid(shared_logit)`. `run_expert(e)` gives the output of
+/// expert `e`, so the caller decides where its weights come from.
+pub fn mix(
+    routes: &[(usize, f32)],
+    mut run_expert: impl FnMut(usize) -> Vec<f32>,
+    shared: &[f32],
+    shared_logit: f32,
+) -> Vec<f32> {
+    let shared_weight = sigmoid(shared_logit);
+    let mut out: Vec<f32> = shared.iter().map(|v| shared_weight * v).collect();
+    for &(e, weight) in routes {
+        for (o, v) in out.iter_mut().zip(&run_expert(e)) {
             *o += weight * v;
         }
-    }
-
-    let shared = mlp(&w.shared_expert, x);
-    let shared_weight = sigmoid(matvec(w.shared_expert_gate, x)[0]);
-    for (o, v) in out.iter_mut().zip(&shared) {
-        *o += shared_weight * v;
     }
     out
 }

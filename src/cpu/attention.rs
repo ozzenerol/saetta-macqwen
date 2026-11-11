@@ -42,6 +42,16 @@ impl KvCache {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// `[len, kv_heads, head_dim]`
+    pub fn keys(&self) -> &[f32] {
+        &self.keys
+    }
+
+    /// `[len, kv_heads, head_dim]`
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
 }
 
 /// Runs one token `x` (`[hidden]`) at position `cache.len()`, appends its
