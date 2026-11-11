@@ -36,6 +36,8 @@ pub trait Restore {
     /// Puts back a state saved at `len` tokens, and cuts the caches that
     /// only grow (the KV cache) to `len`.
     fn restore(&mut self, state: &Self::State, len: usize);
+    /// After `restore`: the tokens the model now holds.
+    fn restored(&mut self, _tokens: &[u32]) {}
     /// True when token `p` always sits in KV row `p` and rows past the
     /// length survive a restore, so a state of another branch can be used
     /// while its rows are intact. Then `backup_rows` and `restore_rows` work.
@@ -409,6 +411,7 @@ impl<M: Model + Restore> Model for Cached<M> {
                 let (n, state) = self.snapshots.find(&prompt[..best]).unwrap();
                 self.model.restore(state, n);
                 self.tokens = prompt[..n].to_vec();
+                self.model.restored(&self.tokens);
                 if !keeps {
                     self.rows.truncate(n);
                 }
@@ -450,6 +453,7 @@ impl<M: Model + Restore> Model for Cached<M> {
             Some((n, state)) => {
                 self.model.restore(state, n);
                 self.tokens.truncate(n);
+                self.model.restored(&self.tokens);
                 if !self.model.keeps_rows() {
                     self.rows.truncate(n);
                 }

@@ -617,6 +617,7 @@ impl server::Model for GpuServed {
         if let Some(d) = &mut self.drafting {
             d.spec.mtp.reserve(need);
             d.spec.report(m.position());
+            d.spec.ran(m.position(), tokens);
         }
         let start = Instant::now();
         let logits = if tokens.len() < SHORT_PREFILL {
@@ -747,6 +748,13 @@ impl Restore for GpuServed {
         m.set_position(len);
         if let Some(d) = &mut self.drafting {
             d.spec.after_restore(len, &state.1);
+        }
+    }
+
+    /// The drafts look up the tokens before the restore point.
+    fn restored(&mut self, tokens: &[u32]) {
+        if let Some(d) = &mut self.drafting {
+            d.spec.restored(tokens);
         }
     }
 
