@@ -6,6 +6,8 @@ use saetta::sample::Params;
 use saetta::server::{self, Server, Settings};
 use saetta::tokenizer::Tokenizer;
 use saetta::weights::Weights;
+#[cfg(target_os = "macos")]
+use std::cell::RefCell;
 use std::env;
 use std::error::Error;
 use std::net::TcpListener;
@@ -162,7 +164,15 @@ fn serve_gpu(
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let model =
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
-    let server = Arc::new(Server::new(GpuServed { model }, tokenizer, settings)?);
+    let layers = model.deltanet_states();
+    let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
+    let served = GpuServed {
+        model,
+        pool,
+        last_blit: RefCell::new(None),
+    };
+    let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
+    let server = Arc::new(Server::new(model, tokenizer, settings)?);
     eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context)");
     server.serve(listener)?;
     Ok(())
@@ -171,6 +181,10 @@ fn serve_gpu(
 #[cfg(target_os = "macos")]
 struct GpuServed {
     model: saetta::gpu_model::GpuModel<'static>,
+    pool: saetta::gpu_cache::SnapshotPool,
+    /// The last snapshot copy, which may still run. The CPU must wait for it
+    /// before it writes the states, as `reset` does.
+    last_blit: RefCell<Option<metal::CommandBuffer>>,
 }
 
 // The server uses the model from one thread at a time, behind its engine
@@ -210,13 +224,35 @@ impl server::Model for GpuServed {
         self.model.forward(token)
     }
 
-    /// Going back needs track D's snapshots.
-    fn truncate(&mut self, _len: usize) -> bool {
-        false
+    /// `Cached` goes back through snapshots instead.
+    fn truncate(&mut self, _len: usize) -> usize {
+        0
     }
 
     fn reset(&mut self) {
+        if let Some(blit) = self.last_blit.take() {
+            blit.wait_until_completed();
+        }
         self.model.reset();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Restore for GpuServed {
+    type State = saetta::gpu_cache::GpuSnapshot;
+
+    fn save(&self) -> Self::State {
+        let m = &self.model;
+        let (snapshot, blit) = saetta::gpu_cache::save(m.gpu(), &self.pool, &m.deltanet_states());
+        *self.last_blit.borrow_mut() = Some(blit);
+        snapshot
+    }
+
+    fn restore(&mut self, state: &Self::State, len: usize) {
+        let m = &mut self.model;
+        let blit = saetta::gpu_cache::restore(m.gpu(), state, &m.deltanet_states());
+        *self.last_blit.borrow_mut() = Some(blit);
+        m.set_position(len);
     }
 }
 
