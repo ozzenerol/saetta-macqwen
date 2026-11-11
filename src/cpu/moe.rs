@@ -1,37 +1,38 @@
 //! Sparse MoE block for one token, as `Qwen3NextSparseMoeBlock` in MLX.
 
-use super::ops::{matvec, sigmoid, silu, softmax};
+use super::matrix::Matrix;
+use super::ops::{sigmoid, silu, softmax};
 
-/// Dense f32 weights of one SwiGLU MLP, row-major `[out, in]`.
+/// The weights of one SwiGLU MLP, `[out, in]`.
 pub struct Mlp<'a> {
-    pub gate_proj: &'a [f32],
-    pub up_proj: &'a [f32],
-    pub down_proj: &'a [f32],
+    pub gate_proj: Matrix<'a>,
+    pub up_proj: Matrix<'a>,
+    pub down_proj: Matrix<'a>,
 }
 
 pub struct MoeWeights<'a> {
     /// Router, `[experts, hidden]`.
-    pub gate: &'a [f32],
+    pub gate: Matrix<'a>,
     /// All experts stacked as in `switch_mlp`: `[experts, out, in]`.
     pub experts: Mlp<'a>,
     pub shared_expert: Mlp<'a>,
     /// `[1, hidden]`.
-    pub shared_expert_gate: &'a [f32],
+    pub shared_expert_gate: Matrix<'a>,
 }
 
 /// `down(silu(gate(x)) * up(x))`
 pub fn mlp(w: &Mlp, x: &[f32]) -> Vec<f32> {
-    let gate = matvec(w.gate_proj, x);
-    let up = matvec(w.up_proj, x);
+    let gate = w.gate_proj.matvec(x);
+    let up = w.up_proj.matvec(x);
     let h: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-    matvec(w.down_proj, &h)
+    w.down_proj.matvec(&h)
 }
 
 /// Router: softmax over all experts, keep the `top_k` best and rescale
 /// their weights to sum to 1 (`norm_topk_prob`). Returns
 /// `(expert, weight)` pairs, best first.
-pub fn route(gate: &[f32], x: &[f32], top_k: usize) -> Vec<(usize, f32)> {
-    let mut probs = matvec(gate, x);
+pub fn route(gate: &Matrix, x: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+    let mut probs = gate.matvec(x);
     softmax(&mut probs);
     let mut ranked: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -42,10 +43,10 @@ pub fn route(gate: &[f32], x: &[f32], top_k: usize) -> Vec<(usize, f32)> {
 }
 
 pub fn moe(w: &MoeWeights, x: &[f32], top_k: usize) -> Vec<f32> {
-    let experts = w.gate.len() / x.len();
-    let routes = route(w.gate, x, top_k);
+    let experts = w.gate.rows(x.len());
+    let routes = route(&w.gate, x, top_k);
     let shared = mlp(&w.shared_expert, x);
-    let shared_logit = matvec(w.shared_expert_gate, x)[0];
+    let shared_logit = w.shared_expert_gate.matvec(x)[0];
     mix(
         &routes,
         |e| mlp(&expert(&w.experts, e, experts), x),
@@ -74,15 +75,11 @@ pub fn mix(
 }
 
 /// The weights of expert `e` out of `n` stacked experts.
-fn expert<'a>(all: &Mlp<'a>, e: usize, n: usize) -> Mlp<'a> {
-    let slice = |t: &'a [f32]| {
-        let size = t.len() / n;
-        &t[e * size..(e + 1) * size]
-    };
+pub fn expert<'a>(all: &Mlp<'a>, e: usize, n: usize) -> Mlp<'a> {
     Mlp {
-        gate_proj: slice(all.gate_proj),
-        up_proj: slice(all.up_proj),
-        down_proj: slice(all.down_proj),
+        gate_proj: all.gate_proj.part(e, n),
+        up_proj: all.up_proj.part(e, n),
+        down_proj: all.down_proj.part(e, n),
     }
 }
 
@@ -106,25 +103,27 @@ mod tests {
         ];
         let t: Vec<Vec<f32>> = names.iter().map(|n| f.vec(n)).collect();
         let w = MoeWeights {
-            gate: &t[0],
+            gate: Matrix::Dense(&t[0]),
             experts: Mlp {
-                gate_proj: &t[1],
-                up_proj: &t[2],
-                down_proj: &t[3],
+                gate_proj: Matrix::Dense(&t[1]),
+                up_proj: Matrix::Dense(&t[2]),
+                down_proj: Matrix::Dense(&t[3]),
             },
             shared_expert: Mlp {
-                gate_proj: &t[4],
-                up_proj: &t[5],
-                down_proj: &t[6],
+                gate_proj: Matrix::Dense(&t[4]),
+                up_proj: Matrix::Dense(&t[5]),
+                down_proj: Matrix::Dense(&t[6]),
             },
-            shared_expert_gate: &t[7],
+            shared_expert_gate: Matrix::Dense(&t[7]),
         };
         let top_k = f.usize("top_k");
         let chosen = f.get("chosen").as_array().unwrap();
 
         for (i, (x, want)) in f.vecs("inputs").iter().zip(f.vecs("outputs")).enumerate() {
-            let mut experts: Vec<u64> =
-                route(w.gate, x, top_k).iter().map(|r| r.0 as u64).collect();
+            let mut experts: Vec<u64> = route(&w.gate, x, top_k)
+                .iter()
+                .map(|r| r.0 as u64)
+                .collect();
             experts.sort();
             let want_experts: Vec<u64> = chosen[i]
                 .as_array()

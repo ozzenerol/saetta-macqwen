@@ -1,7 +1,8 @@
 //! Gated DeltaNet (linear attention) for one token, as `GatedDeltaNet` in
 //! MLX `qwen3_5.py` with the recurrence of `gated_delta.py`.
 
-use super::ops::{dot, matvec, rms_norm, sigmoid, silu, softplus};
+use super::matrix::Matrix;
+use super::ops::{dot, rms_norm, sigmoid, silu, softplus};
 
 pub struct DeltaNetConfig {
     pub k_heads: usize,
@@ -28,14 +29,14 @@ impl DeltaNetConfig {
     }
 }
 
-/// Dense f32 weights, row-major `[out, in]` as in the checkpoint.
+/// Projection matrices are `[out, in]` as in the checkpoint; the rest is f32.
 pub struct DeltaNetWeights<'a> {
     /// `[2 * key_size + value_size, hidden]`, rows in the order q, k, v.
-    pub in_proj_qkv: &'a [f32],
-    pub in_proj_z: &'a [f32],
-    pub in_proj_b: &'a [f32],
-    pub in_proj_a: &'a [f32],
-    pub out_proj: &'a [f32],
+    pub in_proj_qkv: Matrix<'a>,
+    pub in_proj_z: Matrix<'a>,
+    pub in_proj_b: Matrix<'a>,
+    pub in_proj_a: Matrix<'a>,
+    pub out_proj: Matrix<'a>,
     /// `[conv_size, kernel]`; the last column multiplies the newest token.
     pub conv1d: &'a [f32],
     pub a_log: &'a [f32],
@@ -70,10 +71,10 @@ pub fn deltanet(
     x: &[f32],
     state: &mut DeltaNetState,
 ) -> Vec<f32> {
-    let qkv = matvec(w.in_proj_qkv, x);
-    let z = matvec(w.in_proj_z, x);
-    let b = matvec(w.in_proj_b, x);
-    let a = matvec(w.in_proj_a, x);
+    let qkv = w.in_proj_qkv.matvec(x);
+    let z = w.in_proj_z.matvec(x);
+    let b = w.in_proj_b.matvec(x);
+    let a = w.in_proj_a.matvec(x);
 
     let mixed = conv_step(cfg, w.conv1d, &qkv, &mut state.conv);
     let (q, rest) = mixed.split_at(cfg.key_size());
@@ -104,7 +105,7 @@ pub fn deltanet(
             *o *= silu(*g);
         }
     }
-    matvec(w.out_proj, &y)
+    w.out_proj.matvec(&y)
 }
 
 /// Depthwise causal conv1d over the stored inputs and `input`, then SiLU.
@@ -181,11 +182,11 @@ mod tests {
         ];
         let t: Vec<Vec<f32>> = names.iter().map(|n| f.vec(n)).collect();
         let w = DeltaNetWeights {
-            in_proj_qkv: &t[0],
-            in_proj_z: &t[1],
-            in_proj_b: &t[2],
-            in_proj_a: &t[3],
-            out_proj: &t[4],
+            in_proj_qkv: Matrix::Dense(&t[0]),
+            in_proj_z: Matrix::Dense(&t[1]),
+            in_proj_b: Matrix::Dense(&t[2]),
+            in_proj_a: Matrix::Dense(&t[3]),
+            out_proj: Matrix::Dense(&t[4]),
             conv1d: &t[5],
             a_log: &t[6],
             dt_bias: &t[7],
