@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -37,6 +37,10 @@ fn main() -> ExitCode {
         ["bench-qmv", dir] => report(saetta::qmv::bench(Path::new(dir), 5, 20)),
         #[cfg(target_os = "macos")]
         ["bench-moe", dir] => report(saetta::moe::bench(Path::new(dir), 5)),
+        #[cfg(target_os = "macos")]
+        ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
+        #[cfg(target_os = "macos")]
+        ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -375,4 +379,15 @@ fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
         w.len() - text
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
+    match (tokens.parse(), chunk.parse()) {
+        (Ok(t), Ok(c)) => report(saetta::prefill::bench(Path::new(dir), t, c, 3)),
+        _ => {
+            eprintln!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
 }
