@@ -10,6 +10,11 @@ model:
     ~/llm/mlx/bin/python tools/eval_tools.py --saetta http://127.0.0.1:8097 --reference ~/saetta/eval/tool_calls.json
     ~/llm/mlx/bin/python tools/eval_tools.py --saetta http://127.0.0.1:8097
 
+A conversation passes when the calls have the same tool names and the same
+required arguments. Optional arguments that differ are printed as a note:
+a near-tie in the logits can add one, such as a timeout for bash, and qh
+runs the call the same way.
+
 Exits 1 when a conversation gives different calls.
 """
 
@@ -79,6 +84,27 @@ CONVERSATIONS = [
         {"role": "tool", "tool_call_id": "call_1", "content": "1\tmodule example.com/shop\n2\n3\tgo 1.24\n"},
     ],
 ]
+
+
+REQUIRED = {t["function"]["name"]: t["function"]["parameters"]["required"] for t in TOOLS}
+
+
+def compare(mlx, ours):
+    """Whether the calls match on names and required arguments, and notes on
+    the optional arguments that differ."""
+    if not mlx or len(mlx) != len(ours):
+        return False, []
+    notes = []
+    for (name_a, args_a), (name_b, args_b) in zip(mlx, ours):
+        if name_a != name_b:
+            return False, []
+        required = REQUIRED.get(name_a, [])
+        if any(args_a.get(k) != args_b.get(k) for k in required):
+            return False, []
+        for k in sorted(set(args_a) | set(args_b)):
+            if k not in required and args_a.get(k) != args_b.get(k):
+                notes.append(f"{name_a}.{k}: mlx {args_a.get(k)!r}, saetta {args_b.get(k)!r}")
+    return True, notes
 
 
 def model_id(url):
@@ -153,8 +179,10 @@ def main():
         else:
             mlx = run(f"conversation {i} mlx", args.mlx, messages)
         ours = run(f"conversation {i} saetta", args.saetta, messages)
-        same = mlx["calls"] == ours["calls"] and mlx["calls"]
+        same, notes = compare(mlx["calls"], ours["calls"])
         print(f"conversation {i}: {'ok' if same else 'FAIL'}", flush=True)
+        for note in notes:
+            print(f"  note: optional argument differs, {note}", flush=True)
         failed += not same
     print("tool calls passed" if failed == 0 else f"tool calls FAILED in {failed} conversations")
     sys.exit(1 if failed else 0)
