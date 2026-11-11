@@ -224,6 +224,10 @@ impl<M: Model + Restore> Model for Cached<M> {
         self.model.reset();
         self.tokens.clear();
     }
+
+    fn capacity(&self) -> usize {
+        self.model.capacity()
+    }
 }
 
 /// The CPU model's snapshot: the DeltaNet layers' states, in layer order.

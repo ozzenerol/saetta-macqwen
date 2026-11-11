@@ -647,3 +647,67 @@ fn tool_call_from_reasoning_runs() {
     );
     assert_eq!(choice["finish_reason"], "tool_calls");
 }
+
+/// The fake with room for `capacity` tokens.
+struct Small(Fake, usize);
+
+impl Model for Small {
+    fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        assert!(self.0.len + tokens.len() <= self.1, "prompt past capacity");
+        self.0.prefill(tokens)
+    }
+    fn step(&mut self, token: u32) -> Vec<f32> {
+        assert!(self.0.len < self.1, "step past capacity");
+        self.0.step(token)
+    }
+    fn truncate(&mut self, len: usize) -> usize {
+        self.0.truncate(len)
+    }
+    fn reset(&mut self) {
+        self.0.reset()
+    }
+    fn capacity(&self) -> usize {
+        self.1
+    }
+}
+
+#[test]
+fn prompt_over_capacity_is_refused() {
+    let (model, _) = fake(script(&[Ok("never")]));
+    let addr = serve(Small(model, 20));
+    let (status, body) = post(
+        &addr,
+        json!({"messages": [{"role": "user", "content": "hi"}]}),
+    );
+    assert_eq!(status, 400, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("context holds 20"), "{message}");
+}
+
+#[test]
+fn answer_stops_at_capacity() {
+    let (model, _) = fake(script(&[Ok(&"a".repeat(500))]));
+    let addr = serve(Small(model, 60));
+    let (status, body) = post(
+        &addr,
+        json!({"messages": [{"role": "user", "content": "hi"}],
+               "chat_template_kwargs": {"enable_thinking": false}}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+    let u = &v["usage"];
+    assert_eq!(
+        u["prompt_tokens"].as_u64().unwrap() + u["completion_tokens"].as_u64().unwrap(),
+        60
+    );
+
+    // The server still answers after that.
+    let (status, _) = post(
+        &addr,
+        json!({"messages": [{"role": "user", "content": "hi"}],
+                                          "chat_template_kwargs": {"enable_thinking": false}}),
+    );
+    assert_eq!(status, 200);
+}

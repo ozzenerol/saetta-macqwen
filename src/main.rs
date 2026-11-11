@@ -297,12 +297,12 @@ struct GpuServed {
     drafting: Option<Drafting>,
 }
 
-/// Inputs shorter than this run as decode steps. In a 14k-token qh session
-/// a prefill pass took 1.3 to 2.2 s plus 5.7 ms per token (61 tokens in
-/// 2.19 s, 390 in 3.55 s), and a decode step about 12 ms, so they cross near
-/// 250 tokens. Tool results are mostly shorter.
+/// Inputs shorter than this run as decode steps. Measured with bench-prefill
+/// and bench-decode (2026-11-11, 3 runs): prefill takes 27 ms for 2 tokens,
+/// 55 ms for 8, 179 ms for 17 and 458 ms for 64; a decode step takes 10 to
+/// 12 ms up to 8k of context. So prefill wins from about 8 tokens.
 #[cfg(target_os = "macos")]
-const SHORT_PREFILL: usize = 256;
+const SHORT_PREFILL: usize = 8;
 
 /// The MTP drafter, with the final norm to turn prefill rows into the
 /// normed hidden states it reads.
@@ -445,6 +445,12 @@ impl server::Model for GpuServed {
         if let Some(d) = &mut self.drafting {
             d.spec.reset();
         }
+    }
+
+    /// A drafting round runs up to 8 tokens past the ones it keeps
+    /// (`--draft` is at most 7), so they must fit too.
+    fn capacity(&self) -> usize {
+        self.model.capacity() - 8
     }
 }
 
