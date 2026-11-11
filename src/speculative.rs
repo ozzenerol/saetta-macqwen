@@ -620,6 +620,9 @@ mod gpu {
         lookup: LookupAccept,
         /// False with SAETTA_LOOKUP=0: MTP drafts only.
         use_lookup: bool,
+        /// Most drafts a lookup round takes; the verify needs
+        /// `max(k, lookup_max) + 1` rows.
+        lookup_max: usize,
         /// The tokens the model ran, one per position: 4 bytes a token.
         history: Vec<u32>,
         /// Rounds per draft length since the last report.
@@ -642,6 +645,7 @@ mod gpu {
                 length: DraftLength::new(k),
                 lookup: LookupAccept::new(k),
                 use_lookup: std::env::var("SAETTA_LOOKUP").map_or(true, |v| v != "0"),
+                lookup_max: k,
                 history: Vec::new(),
                 lengths: vec![0; k + 1],
                 lookup_rounds: 0,
@@ -656,6 +660,16 @@ mod gpu {
                 hidden,
                 vocab: cfg.vocab_size,
             }
+        }
+
+        /// Lookup rounds take up to `max` drafts instead of `k`; 0 turns
+        /// them off.
+        pub fn with_lookup(mut self, max: usize) -> GpuSpec<'a> {
+            self.lookup_max = max;
+            self.use_lookup &= max > 0;
+            self.lookup = LookupAccept::new(max);
+            self.stats.accepted_at = vec![0; self.k.max(max)];
+            self
         }
 
         /// One MTP step from `h`, the normed hidden state at `position`,
@@ -759,7 +773,7 @@ mod gpu {
             self.lookup_rounds = 0;
             self.lookup_accepted = 0;
             self.stats = Stats {
-                accepted_at: vec![0; self.k],
+                accepted_at: vec![0; self.k.max(self.lookup_max)],
                 ..Stats::default()
             };
         }
@@ -837,7 +851,7 @@ mod gpu {
             let context = model.position();
             self.ran(context, &[pending]);
             let found = if self.use_lookup {
-                lookup(&self.history, self.k)
+                lookup(&self.history, self.lookup_max)
             } else {
                 None
             };
@@ -849,7 +863,7 @@ mod gpu {
             let from_context = match (&found, mtp_rate) {
                 (Some((len, drafts)), Some(best)) => (1..=drafts.len())
                     .map(|kl| {
-                        let t = self.length.time(context, kl);
+                        let t = lookup_time(&mut self.length, context, self.k, kl);
                         (kl, self.lookup.expected(*len, kl) / t)
                     })
                     .filter(|&(_, rate)| rate > best)
@@ -1014,6 +1028,18 @@ mod gpu {
             drafts.truncate(accepted);
             (drafts, next)
         }
+    }
+
+    /// The price of a lookup round with `kl` drafts: the time of an MTP
+    /// round with as many, and past the longest MTP length `k`, that time
+    /// plus the last measured step per extra draft.
+    fn lookup_time(length: &mut DraftLength, context: usize, k: usize, kl: usize) -> f64 {
+        let top = length.time(context, kl.min(k));
+        if kl <= k {
+            return top;
+        }
+        let step = (top - length.time(context, k - 1)).max(0.0);
+        top + (kl - k) as f64 * step
     }
 
     fn ptr(v: &View) -> *mut f32 {
