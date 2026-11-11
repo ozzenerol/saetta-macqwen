@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen3_5 import GatedDeltaNet
-from mlx_lm.models.qwen3_next import Qwen3NextAttention
+from mlx_lm.models.qwen3_next import Qwen3NextAttention, Qwen3NextSparseMoeBlock
 
 OUT = Path(__file__).parent
 mx.set_default_device(mx.cpu)
@@ -124,6 +124,53 @@ def deltanet():
     }
 
 
+def moe():
+    args = SimpleNamespace(
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=24,
+        num_experts=16,
+        num_experts_per_tok=4,
+        norm_topk_prob=True,
+    )
+    m = Qwen3NextSparseMoeBlock(args)
+    m.gate.weight = randn(*m.gate.weight.shape, scale=0.5)
+    m.shared_expert_gate.weight = randn(*m.shared_expert_gate.weight.shape, scale=0.3)
+    for lin in [m.switch_mlp.gate_proj, m.switch_mlp.up_proj, m.switch_mlp.down_proj]:
+        lin.weight = randn(*lin.weight.shape, scale=0.3)
+    for lin in [m.shared_expert.gate_proj, m.shared_expert.up_proj, m.shared_expert.down_proj]:
+        lin.weight = randn(*lin.weight.shape, scale=0.3)
+
+    xs, ys, experts = [], [], []
+    for _ in range(4):
+        x = randn(1, 1, args.hidden_size)
+        y = m(x)
+        gates = mx.softmax(m.gate(x), axis=-1, precise=True)
+        top = mx.argpartition(gates, kth=-args.num_experts_per_tok, axis=-1)
+        top = top[..., -args.num_experts_per_tok :]
+        mx.eval(y, top)
+        xs.append(flat(x))
+        ys.append(flat(y))
+        experts.append(sorted(int(i) for i in top.reshape(-1).tolist()))
+
+    return {
+        "hidden": args.hidden_size,
+        "experts": args.num_experts,
+        "top_k": args.num_experts_per_tok,
+        "gate": flat(m.gate.weight),
+        "gate_proj": flat(m.switch_mlp.gate_proj.weight),
+        "up_proj": flat(m.switch_mlp.up_proj.weight),
+        "down_proj": flat(m.switch_mlp.down_proj.weight),
+        "shared_gate_proj": flat(m.shared_expert.gate_proj.weight),
+        "shared_up_proj": flat(m.shared_expert.up_proj.weight),
+        "shared_down_proj": flat(m.shared_expert.down_proj.weight),
+        "shared_expert_gate": flat(m.shared_expert_gate.weight),
+        "inputs": xs,
+        "outputs": ys,
+        "chosen": experts,
+    }
+
+
 def small_ops():
     x = randn(64)
     w = 1.0 + randn(64, scale=0.1)
@@ -148,3 +195,4 @@ def write(name, data):
 write("ops.json", small_ops())
 write("attention.json", attention())
 write("deltanet.json", deltanet())
+write("moe.json", moe())

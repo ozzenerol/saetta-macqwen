@@ -11,7 +11,7 @@ impl Fixture {
         Fixture(serde_json::from_str(&text).unwrap())
     }
 
-    fn get(&self, key: &str) -> &Value {
+    pub fn get(&self, key: &str) -> &Value {
         self.0
             .get(key)
             .unwrap_or_else(|| panic!("fixture has no {key}"))

@@ -3,6 +3,7 @@
 
 pub mod attention;
 pub mod deltanet;
+pub mod moe;
 pub mod ops;
 
 #[cfg(test)]
