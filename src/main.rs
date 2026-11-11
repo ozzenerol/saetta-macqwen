@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -22,11 +22,10 @@ fn main() -> ExitCode {
         ["info", dir] => report(info(Path::new(dir))),
         ["convert", src, out] => report(convert(Path::new(src), Path::new(out))),
         ["convert-mtp", file, dir] => report(convert_mtp(Path::new(file), Path::new(dir))),
-        ["serve", dir] => report(serve(Path::new(dir), 8090)),
-        ["serve", dir, "--port", port] => match port.parse() {
-            Ok(port) => report(serve(Path::new(dir), port)),
-            Err(_) => {
-                eprintln!("bad port {port}");
+        ["serve", dir, ref rest @ ..] => match serve_flags(rest) {
+            Ok((gpu, port)) => report(serve(Path::new(dir), port, gpu)),
+            Err(e) => {
+                eprintln!("{e}\n{USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -76,14 +75,29 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Serves the CPU model on 127.0.0.1. Slow, but it runs the whole path
-/// until the GPU model replaces it behind the same trait.
-fn serve(dir: &Path, port: u16) -> Result<(), Box<dyn Error>> {
+/// `[--gpu] [--port N]` after `serve <dir>`.
+fn serve_flags(flags: &[&str]) -> Result<(bool, u16), String> {
+    let (mut gpu, mut port) = (false, 8090);
+    let mut it = flags.iter();
+    while let Some(&flag) = it.next() {
+        match flag {
+            "--gpu" => gpu = true,
+            "--port" => {
+                let value = it.next().ok_or("--port needs a number")?;
+                port = value.parse().map_err(|_| format!("bad port {value}"))?;
+            }
+            _ => return Err(format!("unknown flag {flag}")),
+        }
+    }
+    Ok((gpu, port))
+}
+
+/// Serves the model on 127.0.0.1, on the GPU with `gpu`, else on the CPU
+/// (slow, but it runs the whole path).
+fn serve(dir: &Path, port: u16, gpu: bool) -> Result<(), Box<dyn Error>> {
     // The model borrows these for as long as the server runs.
     let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
     let weights: &'static Weights = Box::leak(Box::new(Weights::open(dir)?));
-    let model = Model::new(config, weights)?;
-    let states = model.new_states();
     let tokenizer = Tokenizer::load(dir)?;
     let settings = Settings {
         model_name: dir.display().to_string(),
@@ -96,15 +110,108 @@ fn serve(dir: &Path, port: u16) -> Result<(), Box<dyn Error>> {
         max_tokens: 16384,
         eos_token_ids: config.eos_token_ids.clone(),
     };
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let what = format!("{} on 127.0.0.1:{port}", dir.display());
+    if gpu {
+        return serve_gpu(config, weights, tokenizer, settings, listener, &what);
+    }
+    let model = Model::new(config, weights)?;
+    let states = model.new_states();
     let server = Arc::new(Server::new(
         CpuModel { model, states },
         tokenizer,
         settings,
     )?);
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("serving {} on 127.0.0.1:{port} (CPU model)", dir.display());
+    eprintln!("serving {what} (CPU model)");
     server.serve(listener)?;
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn serve_gpu(
+    _: &Config,
+    _: &Weights,
+    _: Tokenizer,
+    _: Settings,
+    _: TcpListener,
+    _: &str,
+) -> Result<(), Box<dyn Error>> {
+    Err("--gpu needs macOS".into())
+}
+
+/// Tokens of context the GPU model has room for: 40 KB of keys and values
+/// per token over the 10 attention layers, 1.3 GB in all.
+#[cfg(target_os = "macos")]
+const GPU_CONTEXT: usize = 32768;
+
+#[cfg(target_os = "macos")]
+fn serve_gpu(
+    config: &'static Config,
+    weights: &'static Weights,
+    tokenizer: Tokenizer,
+    settings: Settings,
+    listener: TcpListener,
+    what: &str,
+) -> Result<(), Box<dyn Error>> {
+    let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
+    let model =
+        saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
+    let server = Arc::new(Server::new(GpuServed { model }, tokenizer, settings)?);
+    eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context)");
+    server.serve(listener)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct GpuServed {
+    model: saetta::gpu_model::GpuModel<'static>,
+}
+
+// The server uses the model from one thread at a time, behind its engine
+// lock. The model is not Send only because Gpu caches pipelines in a
+// RefCell, which nothing else touches.
+#[cfg(target_os = "macos")]
+unsafe impl Send for GpuServed {}
+
+#[cfg(target_os = "macos")]
+impl server::Model for GpuServed {
+    fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let m = &mut self.model;
+        assert!(
+            m.position() + tokens.len() <= m.capacity(),
+            "prompt of {} tokens does not fit in {} of context",
+            tokens.len(),
+            m.capacity()
+        );
+        let start = Instant::now();
+        let Some((&last, rest)) = tokens.split_last() else {
+            return Vec::new();
+        };
+        for &t in rest {
+            m.run(t);
+        }
+        let logits = m.forward(last);
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "prefill {} tokens in {secs:.2} s ({:.1} ms/token)",
+            tokens.len(),
+            secs * 1e3 / tokens.len() as f64
+        );
+        logits
+    }
+
+    fn step(&mut self, token: u32) -> Vec<f32> {
+        self.model.forward(token)
+    }
+
+    /// Going back needs track D's snapshots.
+    fn truncate(&mut self, _len: usize) -> bool {
+        false
+    }
+
+    fn reset(&mut self) {
+        self.model.reset();
+    }
 }
 
 struct CpuModel {
