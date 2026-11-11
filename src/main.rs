@@ -190,7 +190,9 @@ impl Default for Memory {
             // The full context of Qwen3.6.
             context: 262144,
             cache_bytes: 1 << 30,
-            kv_bits: KvBits::Half,
+            // Half the memory of a half cache at the same quality (track
+            // F's gate: ppl +0.03%, prefill KL median 5e-5 at 32k).
+            kv_bits: KvBits::Eight,
         }
     }
 }
