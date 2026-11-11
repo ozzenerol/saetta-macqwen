@@ -177,13 +177,16 @@ mod mac {
 
     /// The keys (after norm and rope) and values on the GPU as half, each
     /// token `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p`
-    /// goes in slot `p`. A page of the buffers takes memory only once
-    /// something is written there, so the full context costs nothing up front.
+    /// goes in slot `p`. Metal makes the whole of a buffer resident once a
+    /// kernel uses it, so a cache starts small and `grow`s with the context.
     pub struct GpuKvCache {
         pub keys: Buffer,
         pub values: Buffer,
         decode: DecodeAttention,
         pub capacity: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
     }
 
     /// The capacity is a multiple of this: the decode attention chunk, and a
@@ -200,7 +203,33 @@ mod mac {
                 values: gpu.buffer(capacity * token),
                 decode: DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity),
                 capacity,
+                heads: cfg.heads,
+                kv_heads: cfg.kv_heads,
+                head_dim: cfg.head_dim,
             }
+        }
+
+        /// Moves to new buffers with room for at least `capacity` tokens and
+        /// copies every old row over: the prompt cache may still use rows
+        /// past the position (another branch, or a backup put back). Plans
+        /// recorded with the old buffers must be recorded again. Both sets
+        /// of buffers are held during the copy.
+        pub fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+            let capacity = capacity.next_multiple_of(KV_ALIGN);
+            assert!(capacity >= self.capacity);
+            let token = self.kv_heads * self.head_dim * 2;
+            let (keys, values) = (gpu.buffer(capacity * token), gpu.buffer(capacity * token));
+            let len = self.keys.length();
+            gpu.blit(|blit| {
+                blit.copy_from_buffer(&self.keys, 0, &keys, 0, len);
+                blit.copy_from_buffer(&self.values, 0, &values, 0, len);
+            })
+            .wait_until_completed();
+            self.keys = keys;
+            self.values = values;
+            self.decode =
+                DecodeAttention::new(gpu, self.heads, self.kv_heads, self.head_dim, capacity);
+            self.capacity = capacity;
         }
     }
 
