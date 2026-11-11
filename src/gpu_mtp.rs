@@ -39,6 +39,9 @@ mod mac {
         layer: GpuLayer<'a>,
         plan: Plan<'a>,
         built: Built,
+        /// The same step without lm_head and the argmax, for `record`.
+        record_plan: Plan<'a>,
+        record_built: Built,
         input: View,
         output: View,
         token: View,
@@ -85,16 +88,29 @@ mod mac {
             let logits = view(gpu, lm_head.rows);
             let token = View::new(gpu.buffer(4));
 
-            let mut plan = Plan::new(gpu);
-            record_embed(&mut plan, &embed, &cat);
-            Norm::rows(1, hidden, eps, &pre_hidden).record(&mut plan, &input, &cat_hidden, true);
-            Norm::rows(1, hidden, eps, &pre_embedding).record(&mut plan, &cat, &cat, false);
-            fc.record(&mut plan, &cat, &x, false);
-            layer.record(&mut plan, cfg, &x, &scratch);
-            Norm::rows(1, hidden, eps, &norm).record(&mut plan, &x, &output, false);
+            // Everything up to the output hidden state; `step` adds lm_head
+            // and the argmax.
+            let layer_plan = || {
+                let mut plan = Plan::new(gpu);
+                record_embed(&mut plan, &embed, &cat);
+                Norm::rows(1, hidden, eps, &pre_hidden).record(
+                    &mut plan,
+                    &input,
+                    &cat_hidden,
+                    true,
+                );
+                Norm::rows(1, hidden, eps, &pre_embedding).record(&mut plan, &cat, &cat, false);
+                fc.record(&mut plan, &cat, &x, false);
+                layer.record(&mut plan, cfg, &x, &scratch);
+                Norm::rows(1, hidden, eps, &norm).record(&mut plan, &x, &output, false);
+                plan
+            };
+            let mut plan = layer_plan();
             lm_head.record(&mut plan, &output, &logits, false);
             record_argmax(&mut plan, &logits, lm_head.rows, &token);
             let built = plan.build();
+            let record_plan = layer_plan();
+            let record_built = record_plan.build();
 
             Ok(GpuMtp {
                 gpu,
@@ -102,6 +118,8 @@ mod mac {
                 layer,
                 plan,
                 built,
+                record_plan,
+                record_built,
                 input,
                 output,
                 token,
@@ -115,17 +133,32 @@ mod mac {
         /// `output()`, and `token` the token after it. Returns the drafted
         /// token; `output()` then holds the new hidden state.
         pub fn step(&mut self, hidden: &View, token: u32) -> u32 {
+            self.run(hidden, token, true);
+            contents::<u32>(&self.token.buffer, 1)[0]
+        }
+
+        /// `step` without the draft: adds the cache entry and sets
+        /// `output()`, but skips lm_head, which is most of a step.
+        pub fn record(&mut self, hidden: &View, token: u32) {
+            self.run(hidden, token, false);
+        }
+
+        fn run(&mut self, hidden: &View, token: u32, draft: bool) {
             assert!(
                 self.position < self.capacity,
                 "MTP cache is full ({} steps)",
                 self.capacity
             );
             copy(hidden, &self.input, self.cfg.hidden_size);
-            self.plan
-                .set_params(TokenParams::new(token, self.position as u32));
-            self.built.run(self.gpu);
+            let params = TokenParams::new(token, self.position as u32);
+            if draft {
+                self.plan.set_params(params);
+                self.built.run(self.gpu);
+            } else {
+                self.record_plan.set_params(params);
+                self.record_built.run(self.gpu);
+            }
             self.position += 1;
-            contents::<u32>(&self.token.buffer, 1)[0]
         }
 
         /// The normed hidden state of the last step.
@@ -270,6 +303,14 @@ mod mac {
             let want = cpu_step(&mtp, &model, &hidden(20), 42, &mut state);
             let got = g.step(&main(20), 42);
             check("after truncate", &g, got, &want);
+
+            let want = cpu_step(&mtp, &model, &hidden(21), 7, &mut state);
+            g.record(&main(21), 7);
+            check("record", &g, want.1, &want);
+            let want = cpu_step(&mtp, &model, &hidden(22), 8, &mut state);
+            let got = g.step(&main(22), 8);
+            check("step after record", &g, got, &want);
+            let got = want.1;
 
             let mut times = Vec::new();
             let mut token = got;
