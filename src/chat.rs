@@ -230,7 +230,7 @@ fn render_assistant(out: &mut String, m: &Message, content: &str, show_thinking:
 
 /// Python's `str.strip()`: it also strips the separators U+001C to U+001F,
 /// which Rust does not count as whitespace.
-fn py_strip(s: &str) -> &str {
+pub fn py_strip(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
 

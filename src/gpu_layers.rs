@@ -9,6 +9,7 @@ pub use mac::*;
 
 #[cfg(target_os = "macos")]
 mod mac {
+    use crate::attention::DecodeAttention;
     use crate::config::Config;
     use crate::cpu::attention::AttentionConfig;
     use crate::cpu::deltanet::DeltaNetConfig;
@@ -144,7 +145,7 @@ mod mac {
     pub struct GpuKvCache {
         pub keys: Buffer,
         pub values: Buffer,
-        scores: Buffer,
+        decode: DecodeAttention,
         pub capacity: usize,
     }
 
@@ -154,20 +155,10 @@ mod mac {
             GpuKvCache {
                 keys: gpu.buffer(capacity * token),
                 values: gpu.buffer(capacity * token),
-                scores: gpu.buffer(cfg.heads * capacity * 4),
+                decode: DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity),
                 capacity,
             }
         }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct AttentionParams {
-        heads: u32,
-        kv_heads: u32,
-        dim: u32,
-        capacity: u32,
-        scale: f32,
     }
 
     /// Full attention with q/k norm, partial RoPE, GQA and the output gate.
@@ -245,20 +236,9 @@ mod mac {
                 size(256, 1),
             );
 
-            let p = plan.constant(&[AttentionParams {
-                heads: c.heads as u32,
-                kv_heads: c.kv_heads as u32,
-                dim: d as u32,
-                capacity: cache.capacity as u32,
-                scale: 1.0 / (d as f32).sqrt(),
-            }]);
-            let scores = whole(&cache.scores);
-            plan.op(
-                "attention",
-                &[&q, &keys, &values, &q_and_gate, &attn, &scores, &p, &params],
-                size(c.heads, 1),
-                size(256, 1),
-            );
+            cache
+                .decode
+                .record(plan, &q, &keys, &values, &q_and_gate, &attn);
 
             self.o_proj.record(plan, &attn, out, false);
         }

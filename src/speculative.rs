@@ -417,9 +417,48 @@ mod gpu {
                 .iter()
                 .take_while(|&&p| p + 1 < len)
                 .count();
+            // Entries kept from another conversation with the same prefix
+            // would be stale; within one conversation they are exact.
+            eprintln!(
+                "MTP cache: kept {keep} entries going back to {len} tokens ({} dropped)",
+                self.mtp_positions.len() - keep
+            );
             self.mtp.truncate(keep);
             self.mtp_positions.truncate(keep);
             write(&self.last, last);
+        }
+
+        /// Prints the drafting counts since the last call and clears them.
+        pub fn report(&mut self) {
+            let s = &self.stats;
+            if s.rounds > 0 {
+                eprintln!(
+                    "drafts: {} rounds, {} of {} accepted, {:.2} tokens per round, accepted at {:?}",
+                    s.rounds,
+                    s.accepted,
+                    s.drafted,
+                    s.tokens_per_round(),
+                    s.accepted_at
+                );
+            }
+            self.stats = Stats {
+                accepted_at: vec![0; self.k],
+                ..Stats::default()
+            };
+        }
+
+        /// A plain decode step that keeps the MTP cache and the last hidden
+        /// state up to date, for a token run outside `speculate` (the
+        /// prompt cache runs a prompt's last token this way).
+        pub fn step(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
+            let pos = model.position();
+            if pos > 0 {
+                let last = self.last.clone();
+                self.mtp_step(&last, pos - 1, token);
+            }
+            let logits = model.forward(token);
+            copy(model.final_hidden(), &self.last, self.hidden);
+            logits
         }
 
         pub fn last_hidden(&self) -> Vec<f32> {

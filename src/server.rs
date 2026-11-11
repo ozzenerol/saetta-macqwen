@@ -43,6 +43,10 @@ pub struct Settings {
     pub sampling: Params,
     pub max_tokens: usize,
     pub eos_token_ids: Vec<u32>,
+    /// Always tokenize the rendered prompt, as MLX does. When false, a
+    /// conversation that continues from our last answer keeps the tokens the
+    /// model generated instead of the re-rendered ones (see `splice`).
+    pub exact_history: bool,
 }
 
 pub struct Server<M: Model> {
@@ -57,6 +61,15 @@ struct Engine<M> {
     model: M,
     /// Tokens the model state holds now.
     tokens: Vec<u32>,
+    /// The last request, when its answer is still at the end of `tokens`.
+    last: Option<Turn>,
+}
+
+/// What a request asked and what we answered.
+struct Turn {
+    messages: Vec<Message>,
+    prompt_text: String,
+    answer: Message,
 }
 
 /// Ids of the tokens that switch the output between thinking, text and tool calls.
@@ -78,6 +91,7 @@ impl<M: Model + 'static> Server<M> {
             engine: Mutex::new(Engine {
                 model,
                 tokens: Vec::new(),
+                last: None,
             }),
             tokenizer,
             settings,
@@ -229,6 +243,9 @@ impl<M: Model + 'static> Server<M> {
                 self.requests.fetch_add(1, Ordering::Relaxed)
             ),
             prompt: self.tokenizer.encode(&prompt),
+            prompt_text: prompt,
+            messages,
+            options,
             thinking,
             tools,
             stream: body["stream"] == true,
@@ -251,14 +268,37 @@ impl<M: Model + 'static> Server<M> {
     /// when the client has gone.
     fn generate(&self, r: &ChatRequest, mut emit: impl FnMut(Event) -> bool) -> Done {
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let (logits, cached) = engine.start(&r.prompt);
+        let held = engine.tokens.clone();
+        let spliced = match engine.last.take() {
+            Some(last) if !self.settings.exact_history => self.splice(&last, &held, r),
+            _ => None,
+        };
+        let how = if spliced.is_some() {
+            "splice"
+        } else {
+            "render"
+        };
+        let prompt = spliced.unwrap_or_else(|| r.prompt.clone());
+        let (logits, cached) = engine.start(&prompt);
+        eprintln!(
+            "{}",
+            reuse_report(how, &held, &prompt, cached, &self.tokenizer)
+        );
         let mut decide = Sampled {
             params: r.sampling,
             sampler: Sampler::new(r.seed),
         };
         let mut output = Output::new(r.thinking, &r.tools, &r.id);
+        let mut answer = Message {
+            role: "assistant".into(),
+            ..Message::default()
+        };
+        let mut emit = |event: Event| {
+            record(&mut answer, &event);
+            emit(event)
+        };
         let mut done = Done {
-            prompt_tokens: r.prompt.len(),
+            prompt_tokens: prompt.len(),
             cached_tokens: cached,
             completion_tokens: 0,
             hit_limit: false,
@@ -302,8 +342,46 @@ impl<M: Model + 'static> Server<M> {
             pending = next;
         }
         let events = output.finish();
-        self.emit_all(events, &mut emit, &mut done);
+        if self.emit_all(events, &mut emit, &mut done) {
+            engine.last = Some(Turn {
+                messages: r.messages.clone(),
+                prompt_text: r.prompt_text.clone(),
+                answer,
+            });
+        }
         done
+    }
+
+    /// The prompt as the tokens the state holds (our last prompt and the
+    /// tokens the model generated for its answer) plus the rest of the new
+    /// render, when the new conversation is the last one followed by exactly
+    /// that answer. The model then sees its own tokens, not the template's
+    /// re-render of them, and nothing has to run again. `None` when anything
+    /// differs.
+    fn splice(&self, last: &Turn, held: &[u32], r: &ChatRequest) -> Option<Vec<u32>> {
+        const END: &str = "<|im_end|>\n";
+        let n = last.messages.len();
+        if r.messages.len() <= n
+            || r.messages[..n] != last.messages[..]
+            || !same_answer(&r.messages[n], &last.answer)
+        {
+            return None;
+        }
+        let options = Options {
+            add_generation_prompt: false,
+            ..r.options
+        };
+        let upto = chat::render(&r.messages[..=n], &r.tools, &options).ok()?;
+        if !upto.starts_with(&last.prompt_text)
+            || !upto.ends_with(END)
+            || !r.prompt_text.starts_with(&upto)
+        {
+            return None;
+        }
+        let rest = &r.prompt_text[upto.len() - END.len()..];
+        let mut tokens = held.to_vec();
+        tokens.extend(self.tokenizer.encode(rest));
+        Some(tokens)
     }
 
     fn emit_all(
@@ -354,8 +432,70 @@ impl<M: Model> Engine<M> {
     }
 }
 
+/// Adds an output event to the answer as the client will send it back.
+fn record(answer: &mut Message, event: &Event) {
+    match event {
+        Event::Reasoning(s) => {
+            *answer.reasoning_content.get_or_insert_with(String::new) += s;
+        }
+        Event::Content(s) => answer.content += s,
+        Event::ToolCall(c) => answer.tool_calls.push(chat::ToolCall {
+            name: c.name.clone(),
+            arguments: serde_json::from_str(&c.arguments).ok(),
+        }),
+    }
+}
+
+/// Whether a message from the client is the answer we sent: the same
+/// content, reasoning and tool calls, up to the whitespace the template trims.
+fn same_answer(m: &Message, answer: &Message) -> bool {
+    let text = |s: &Option<String>| chat::py_strip(s.as_deref().unwrap_or("")).to_string();
+    // Without reasoning_content the template takes the reasoning out of a
+    // content with </think>; our answers never have one.
+    let reasoning_in_content = m.reasoning_content.is_none() && m.content.contains("</think>");
+    m.role == "assistant"
+        && !reasoning_in_content
+        && chat::py_strip(&m.content) == chat::py_strip(&answer.content)
+        && text(&m.reasoning_content) == text(&answer.reasoning_content)
+        && m.tool_calls == answer.tool_calls
+}
+
+/// One log line per request: whether the prompt was spliced or rendered, how
+/// much of it the state already had, and where it first differs from the
+/// tokens the state holds.
+fn reuse_report(
+    how: &str,
+    held: &[u32],
+    prompt: &[u32],
+    reused: usize,
+    tokenizer: &Tokenizer,
+) -> String {
+    let common = held.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    let mut line = format!(
+        "request: {how}, prompt {}, held {}, common {common}, reused {reused}",
+        prompt.len(),
+        held.len()
+    );
+    if common < held.len() && common < prompt.len() {
+        let text = |tokens: &[u32]| {
+            let from = common.saturating_sub(8);
+            let to = (common + 16).min(tokens.len());
+            format!(
+                "{:?} | {:?}",
+                tokenizer.decode(&tokens[from..common]),
+                tokenizer.decode(&tokens[common..to])
+            )
+        };
+        line += &format!("; held {} ; prompt {}", text(held), text(prompt));
+    }
+    line
+}
+
 struct ChatRequest {
     id: String,
+    messages: Vec<Message>,
+    options: Options,
+    prompt_text: String,
     prompt: Vec<u32>,
     thinking: bool,
     tools: Vec<Value>,

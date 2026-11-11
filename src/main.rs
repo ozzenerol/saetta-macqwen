@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk]";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--port N] [--exact-history] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -27,7 +27,7 @@ fn main() -> ExitCode {
         ["convert", src, out] => report(convert(Path::new(src), Path::new(out))),
         ["convert-mtp", file, dir] => report(convert_mtp(Path::new(file), Path::new(dir))),
         ["serve", dir, ref rest @ ..] => match serve_flags(rest) {
-            Ok(flags) => report(serve(Path::new(dir), &flags)),
+            Ok(flags) => report(serve(Path::new(dir), flags)),
             Err(e) => {
                 eprintln!("{e}\n{USAGE}");
                 ExitCode::from(2)
@@ -41,6 +41,16 @@ fn main() -> ExitCode {
         ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
+        #[cfg(target_os = "macos")]
+        ["bench-decode", dir] => report(saetta::attention::bench_decode(
+            Path::new(dir),
+            &[40, 1024, 4096, 8192, 16384, 32768],
+            5,
+        )),
+        #[cfg(target_os = "macos")]
+        ["bench-attention"] => {
+            report(saetta::attention::bench(&[1024, 8192, 16384, 32768], 10, 5).map_err(Into::into))
+        }
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -83,47 +93,58 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// What `serve` runs with.
 struct ServeFlags {
     gpu: bool,
     /// Tokens the MTP layer drafts per round; 0 turns drafting off.
     draft: usize,
     port: u16,
+    exact_history: bool,
 }
 
-/// `[--gpu] [--draft K] [--port N]` after `serve <dir>`.
+/// `[--gpu] [--draft K] [--port N] [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
-    let (mut gpu, mut draft, mut port) = (false, 0, 8090);
+    let mut f = ServeFlags {
+        gpu: false,
+        draft: 0,
+        port: 8090,
+        exact_history: false,
+    };
     let mut it = flags.iter();
     while let Some(&flag) = it.next() {
         match flag {
-            "--gpu" => gpu = true,
+            "--gpu" => f.gpu = true,
             "--draft" => {
                 let value = it.next().ok_or("--draft needs a number")?;
-                draft = value
+                f.draft = value
                     .parse()
                     .map_err(|_| format!("bad draft count {value}"))?;
-                if draft > 7 {
+                if f.draft > 7 {
                     return Err("--draft takes 0 to 7".into());
                 }
             }
+            "--exact-history" => f.exact_history = true,
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
-                port = value.parse().map_err(|_| format!("bad port {value}"))?;
+                f.port = value.parse().map_err(|_| format!("bad port {value}"))?;
             }
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
-    if draft > 0 && !gpu {
+    if f.draft > 0 && !f.gpu {
         return Err("--draft needs --gpu".into());
     }
-    Ok(ServeFlags { gpu, draft, port })
+    Ok(f)
 }
 
 /// Serves the model on 127.0.0.1, on the GPU with `gpu`, else on the CPU
 /// (slow, but it runs the whole path).
-fn serve(dir: &Path, flags: &ServeFlags) -> Result<(), Box<dyn Error>> {
-    let port = flags.port;
+fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
+    let ServeFlags {
+        gpu,
+        draft,
+        port,
+        exact_history,
+    } = flags;
     // The model borrows these for as long as the server runs.
     let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
     let weights: &'static Weights = Box::leak(Box::new(Weights::open(dir)?));
@@ -138,19 +159,12 @@ fn serve(dir: &Path, flags: &ServeFlags) -> Result<(), Box<dyn Error>> {
         },
         max_tokens: 16384,
         eos_token_ids: config.eos_token_ids.clone(),
+        exact_history,
     };
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
-    if flags.gpu {
-        return serve_gpu(
-            config,
-            weights,
-            tokenizer,
-            settings,
-            listener,
-            &what,
-            flags.draft,
-        );
+    if gpu {
+        return serve_gpu(config, weights, tokenizer, settings, listener, &what, draft);
     }
     let model = Model::new(config, weights)?;
     let states = model.new_states();
@@ -286,6 +300,9 @@ impl server::Model for GpuServed {
         if tokens.is_empty() {
             return Vec::new();
         }
+        if let Some(d) = &mut self.drafting {
+            d.spec.report();
+        }
         let start = Instant::now();
         let pos = m.position();
         let states: Vec<_> = m.states().collect();
@@ -323,7 +340,10 @@ impl server::Model for GpuServed {
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
-        self.model.forward(token)
+        match &mut self.drafting {
+            Some(d) => d.spec.step(&mut self.model, token),
+            None => self.model.forward(token),
+        }
     }
 
     fn speculate(
