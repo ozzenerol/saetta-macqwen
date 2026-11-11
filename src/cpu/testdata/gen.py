@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.qwen3_5 import GatedDeltaNet
 from mlx_lm.models.qwen3_next import Qwen3NextAttention
 
 OUT = Path(__file__).parent
@@ -72,6 +73,57 @@ def attention():
     }
 
 
+def deltanet():
+    args = SimpleNamespace(
+        hidden_size=32,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    m = GatedDeltaNet(args)
+    for lin in [m.in_proj_qkv, m.in_proj_z, m.in_proj_b, m.in_proj_a, m.out_proj]:
+        lin.weight = randn(*lin.weight.shape, scale=0.3)
+    m.conv1d.weight = randn(*m.conv1d.weight.shape, scale=0.4)
+    m.A_log = randn(args.linear_num_value_heads)
+    m.dt_bias = randn(args.linear_num_value_heads)
+    m.norm.weight = 0.9 + randn(args.linear_value_head_dim, scale=0.1)
+
+    cache = ArraysCache(size=2)
+    xs, ys = [], []
+    for _ in range(6):
+        x = randn(1, 1, args.hidden_size)
+        y = m(x, mask=None, cache=cache)
+        mx.eval(y, cache[0], cache[1])
+        xs.append(flat(x))
+        ys.append(flat(y))
+
+    return {
+        "hidden": args.hidden_size,
+        "k_heads": args.linear_num_key_heads,
+        "v_heads": args.linear_num_value_heads,
+        "k_dim": args.linear_key_head_dim,
+        "v_dim": args.linear_value_head_dim,
+        "kernel": args.linear_conv_kernel_dim,
+        "eps": args.rms_norm_eps,
+        "in_proj_qkv": flat(m.in_proj_qkv.weight),
+        "in_proj_z": flat(m.in_proj_z.weight),
+        "in_proj_b": flat(m.in_proj_b.weight),
+        "in_proj_a": flat(m.in_proj_a.weight),
+        "out_proj": flat(m.out_proj.weight),
+        "conv1d": flat(m.conv1d.weight),
+        "A_log": flat(m.A_log),
+        "dt_bias": flat(m.dt_bias),
+        "norm": flat(m.norm.weight),
+        "inputs": xs,
+        "outputs": ys,
+        "conv_state": flat(cache[0]),
+        "state": flat(cache[1]),
+    }
+
+
 def small_ops():
     x = randn(64)
     w = 1.0 + randn(64, scale=0.1)
@@ -95,3 +147,4 @@ def write(name, data):
 
 write("ops.json", small_ops())
 write("attention.json", attention())
+write("deltanet.json", deltanet())

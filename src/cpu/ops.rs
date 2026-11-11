@@ -43,6 +43,11 @@ pub fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
+/// `log(1 + e^x)`, written as in `mx.logaddexp(x, 0)` so it does not overflow.
+pub fn softplus(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
 pub fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;

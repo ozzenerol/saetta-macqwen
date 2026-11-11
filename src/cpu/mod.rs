@@ -2,6 +2,7 @@
 //! checked against it.
 
 pub mod attention;
+pub mod deltanet;
 pub mod ops;
 
 #[cfg(test)]
