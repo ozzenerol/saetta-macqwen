@@ -136,7 +136,7 @@ mod mac {
                 return;
             }
             let capacity = kv_grow(self.capacity, need, self.limit);
-            self.layer.grow(self.gpu, capacity, self.position);
+            self.layer.grow(self.gpu, capacity);
             self.capacity = capacity;
             let (plan, record_plan) = record_plans(
                 self.gpu,

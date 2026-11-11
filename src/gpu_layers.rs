@@ -189,21 +189,21 @@ mod mac {
         }
 
         /// Moves to new buffers with room for at least `capacity` tokens and
-        /// copies the first `keep` tokens over. Plans recorded with the old
-        /// buffers must be recorded again.
-        pub fn grow(&mut self, gpu: &Gpu, capacity: usize, keep: usize) {
+        /// copies every old row over: the prompt cache may still use rows
+        /// past the position (another branch, or a backup put back). Plans
+        /// recorded with the old buffers must be recorded again. Both sets
+        /// of buffers are held during the copy.
+        pub fn grow(&mut self, gpu: &Gpu, capacity: usize) {
             let capacity = capacity.next_multiple_of(KV_ALIGN);
-            assert!(capacity >= self.capacity && keep <= self.capacity);
+            assert!(capacity >= self.capacity);
             let token = self.kv_heads * self.head_dim * 2;
             let (keys, values) = (gpu.buffer(capacity * token), gpu.buffer(capacity * token));
-            if keep > 0 {
-                let len = (keep * token) as u64;
-                gpu.blit(|blit| {
-                    blit.copy_from_buffer(&self.keys, 0, &keys, 0, len);
-                    blit.copy_from_buffer(&self.values, 0, &values, 0, len);
-                })
-                .wait_until_completed();
-            }
+            let len = self.keys.length();
+            gpu.blit(|blit| {
+                blit.copy_from_buffer(&self.keys, 0, &keys, 0, len);
+                blit.copy_from_buffer(&self.values, 0, &values, 0, len);
+            })
+            .wait_until_completed();
             self.keys = keys;
             self.values = values;
             self.decode =

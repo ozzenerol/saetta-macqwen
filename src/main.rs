@@ -150,8 +150,9 @@ struct ServeFlags {
 /// What the GPU server may allocate besides the weights.
 #[derive(Clone, Copy)]
 struct Memory {
-    /// Tokens of context: the KV caches are allocated for this many. A page
-    /// of them takes memory only once a token is written there.
+    /// Tokens of context: the KV caches may grow to this many. They start at
+    /// `gpu_model::KV_START` and double when a prompt needs more, since
+    /// Metal makes a whole buffer resident once a kernel uses it.
     context: usize,
     /// Bytes for prompt cache snapshots.
     cache_bytes: usize,

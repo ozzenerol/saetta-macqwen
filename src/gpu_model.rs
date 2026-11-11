@@ -313,11 +313,11 @@ mod mac {
             self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
         }
 
-        /// Grows an attention layer's cache to `capacity` tokens, keeping the
-        /// first `keep`; a DeltaNet layer has nothing to grow.
-        pub(crate) fn grow(&mut self, gpu: &Gpu, capacity: usize, keep: usize) {
+        /// Grows an attention layer's cache to `capacity` tokens; a DeltaNet
+        /// layer has nothing to grow.
+        pub(crate) fn grow(&mut self, gpu: &Gpu, capacity: usize) {
             if let Mixer::Full(_, cache) = &mut self.mixer {
-                cache.grow(gpu, capacity, keep);
+                cache.grow(gpu, capacity);
             }
         }
 
@@ -531,9 +531,17 @@ mod mac {
                 return;
             }
             let allocated = kv_grow(self.allocated, need, self.capacity);
+            let before = self.kv_bytes();
             for layer in &mut self.layers {
-                layer.grow(self.gpu, allocated, self.position);
+                layer.grow(self.gpu, allocated);
             }
+            eprintln!(
+                "KV grows from {} to {} tokens: {} MB now, {} MB more for the copy",
+                self.allocated,
+                allocated,
+                self.kv_bytes() >> 20,
+                before >> 20
+            );
             self.allocated = allocated;
             self.record_plan();
         }
