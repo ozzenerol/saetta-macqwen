@@ -883,6 +883,121 @@ mod gpu_real {
         }
     }
 
+    /// Where plain decode and the verify path part ways on the same tokens.
+    /// Prefills the "system" and "user" of SAETTA_MARGIN, decodes
+    /// SAETTA_STEPS (default 256) greedy tokens plainly, then again plainly
+    /// (decode against itself), then runs the same tokens through `verify`
+    /// in rows of 4, and prints how far each step's logits are from the
+    /// first run's.
+    #[test]
+    #[ignore = "needs the model on the Mac"]
+    fn decode_against_verify_logits() {
+        let file = std::env::var("SAETTA_MARGIN").expect("SAETTA_MARGIN=<json>");
+        let steps: usize = std::env::var("SAETTA_STEPS")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(256);
+        let case: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        let text = |k: &str| case[k].as_str().unwrap().to_string();
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+        let cfg = Config::load(&dir).unwrap();
+        let weights = Weights::open(&dir).unwrap();
+        let tok = Tokenizer::load(&dir).unwrap();
+        let gpu = Gpu::new().unwrap();
+        let message = |role: &str, content: String| Message {
+            role: role.into(),
+            content,
+            ..Message::default()
+        };
+        let opts = chat::Options {
+            enable_thinking: false,
+            ..chat::Options::default()
+        };
+        let messages = [
+            message("system", text("system")),
+            message("user", text("user")),
+        ];
+        let tokens = tok.encode(&chat::render(&messages, &[], &opts).unwrap());
+        let (&last, prompt) = tokens.split_last().unwrap();
+
+        let capacity = (tokens.len() + steps + 64).next_multiple_of(128);
+        let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity).unwrap();
+        model.enable_verify(4);
+        let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
+        prefill.exact = crate::prefill::exact_from_env();
+        // The prompt from a cleared model; returns the logits after it.
+        let start = |model: &mut GpuModel<'_>, prefill: &mut crate::prefill::Prefill<'_>| {
+            model.reset();
+            for piece in prompt.chunks(1024) {
+                let pos = model.position();
+                let states: Vec<_> = model.states().collect();
+                prefill.run(&gpu, piece, pos, &states);
+                drop(states);
+                model.set_position(pos + piece.len());
+            }
+            model.forward(last)
+        };
+        let greedy = |l: &[f32]| crate::sample::argmax(l);
+
+        // Plain greedy: logits[i] are the logits after generated token i - 1.
+        let mut plain = vec![start(&mut model, &mut prefill)];
+        let mut generated = Vec::new();
+        for _ in 0..steps {
+            let t = greedy(plain.last().unwrap());
+            generated.push(t);
+            plain.push(model.forward(t));
+        }
+        println!(
+            "{} tokens of context, {steps} steps:\n{:?}",
+            tokens.len(),
+            tok.decode(&generated)
+        );
+
+        let mut again = vec![start(&mut model, &mut prefill)];
+        for &t in &generated {
+            again.push(model.forward(t));
+        }
+
+        let first = start(&mut model, &mut prefill);
+        let mut verified = vec![first];
+        for group in generated.chunks(4) {
+            model.verify(group);
+            model.accept(group.len());
+            verified.extend((0..group.len()).map(|r| model.verify_logits(r)));
+        }
+
+        let mut worst = (0.0f32, 0.0f32);
+        for i in 0..=steps {
+            let (a, v) = (
+                rel_rms(&again[i], &plain[i]),
+                rel_rms(&verified[i], &plain[i]),
+            );
+            worst = (worst.0.max(a), worst.1.max(v));
+            let flip = greedy(&verified[i]) != greedy(&plain[i]);
+            if i % 16 == 0 || flip || greedy(&again[i]) != greedy(&plain[i]) {
+                println!(
+                    "  step {i:4}: decode again {a:.1e}, verify {v:.1e}, plain gap {:.3}{}",
+                    top2_gap(&plain[i]),
+                    if flip {
+                        ", verify picks another token"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        println!(
+            "worst rel rms: decode again {:.1e}, verify {:.1e}",
+            worst.0, worst.1
+        );
+    }
+
+    fn rel_rms(a: &[f32], b: &[f32]) -> f32 {
+        let d: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let n: f32 = b.iter().map(|y| y * y).sum();
+        (d / n).sqrt()
+    }
+
     /// The two best logits' gap.
     fn top2_gap(logits: &[f32]) -> f32 {
         let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
