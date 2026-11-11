@@ -36,12 +36,14 @@ mod mac {
     /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one and
     /// SAETTA_ATT=8 the one with 8 heads per threadgroup, to compare.
     /// The fast-mode attention kernel: SAETTA_ATT=fa8 or fa4 picks B's flash
-    /// kernels in src/attention_prefill.rs, 1 and 8 older ones.
+    /// kernels in src/attention_prefill.rs, gemm src/attention_gemm.rs, 1 and
+    /// 8 older ones.
     fn attention_half_kernel() -> &'static str {
         match std::env::var("SAETTA_ATT").as_deref() {
             Ok("1") => "attention_rows_half",
             Ok("8") => "attention_rows2_half8",
             Ok("fa8") => "attention_fa8",
+            Ok("gemm") => "gemm",
             Ok("fa4") => "attention_fa4",
             _ => "attention_rows2_half",
         }
@@ -616,6 +618,8 @@ mod mac {
         /// Set while `verify` encodes: its rows run on the exact kernels
         /// whatever `exact` says, so they match decode.
         force_exact: Cell<bool>,
+        /// The buffers of the matrix-product attention, with SAETTA_ATT=gemm.
+        gemm: Option<crate::attention_gemm::AttGemm>,
         /// Set by `profile`: only the stages up to this index in STAGES run.
         only: Cell<Option<usize>>,
     }
@@ -756,7 +760,10 @@ mod mac {
                 });
             }
             let chunk = chunk.next_multiple_of(TILE);
+            let gemm = (attention_half_kernel() == "gemm")
+                .then(|| crate::attention_gemm::AttGemm::new(gpu, chunk, attention.kv_heads));
             Ok(Prefill {
+                gemm,
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
                 only: Cell::new(None),
@@ -1426,7 +1433,7 @@ mod mac {
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
-                if kernel.starts_with("attention_fa") {
+                if kernel.starts_with("attention_fa") || kernel == "gemm" {
                     let p = crate::attention_prefill::FlashParams {
                         heads: c.heads as u32,
                         kv_heads: c.kv_heads as u32,
@@ -1435,7 +1442,14 @@ mod mac {
                         scale: 1.0 / (d as f32).sqrt(),
                     };
                     let (k, v) = (&cached[0], &cached[1]);
-                    crate::attention_prefill::encode(enc, gpu, kernel, &q_half, k, v, &q_and_gate, &y, p);
+                    match &self.gemm {
+                        Some(gemm) if kernel == "gemm" => {
+                            gemm.encode(enc, gpu, &q_half, k, v, &q_and_gate, &y, p)
+                        }
+                        _ => crate::attention_prefill::encode(
+                            enc, gpu, kernel, &q_half, k, v, &q_and_gate, &y, p,
+                        ),
+                    }
                     self.record(gpu, enc, 2, &y, t * c.heads * d);
                     if self.on("attention o_proj") {
                         self.mm(gpu, enc, &w.o, &y, out, t);
@@ -2022,6 +2036,10 @@ mod mac {
                 "prefill_silu_few",
                 "attention_fa8",
                 "attention_fa4",
+                "prefill_ag_scores",
+                "prefill_ag_softmax",
+                "prefill_ag_pv",
+                "prefill_ag_final",
             ] {
                 gpu.pipeline(name);
             }

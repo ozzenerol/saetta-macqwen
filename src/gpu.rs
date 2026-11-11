@@ -17,6 +17,7 @@ pub const KERNELS: &str = concat!(
     include_str!("../kernels/sample.metal"),
     include_str!("../kernels/qmm.metal"),
     include_str!("../kernels/attention_prefill.metal"),
+    include_str!("../kernels/attention_gemm.metal"),
 );
 
 #[cfg(target_os = "macos")]
