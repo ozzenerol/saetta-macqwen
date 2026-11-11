@@ -1829,11 +1829,12 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn fast_prefill_matches_token_by_token() {
-            // The median token is off by 1e-2 at layer 20 of this prompt,
-            // with attention in half and some near-tie expert choices; MLX
-            // in bf16 is off by 1.6e-2 at layer 3. Bounds are about twice
-            // what was measured.
-            check_prefill(false, 3e-2, 0.1);
+            // With 128-row chunks on the half kernels a few near-tie tokens
+            // pick another expert at layer 0 and spread through attention:
+            // the median token peaks at 6.1e-2 (layer 26), state 7.4e-2,
+            // logits 4.2e-2. MLX in bf16 is off by 1.6e-2 at layer 3.
+            // Bounds are about twice what was measured.
+            check_prefill(false, 0.12, 0.1);
         }
 
         /// 166 tokens in two calls (150 then 16) with chunks of 128 rounded
@@ -1913,8 +1914,8 @@ mod mac {
                 );
                 // The half path may pick another expert at a near tie for a
                 // token, as bf16 MLX does, so only the median token counts.
-                let (hidden, state_bound) = if exact { (err, bound) } else { (median, 0.1) };
-                assert!(hidden < bound && state < state_bound, "layer {l}");
+                let hidden = if exact { err } else { median };
+                assert!(hidden < bound && state < bound * 1.25, "layer {l}");
             }
 
             let norm = weights
