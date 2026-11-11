@@ -18,7 +18,7 @@ mod mac {
         mix_norm_rows,
     };
     use crate::gpu_model::{
-        GpuLayer, GpuModel, Mixer, elementwise, record_embed, record_route, view,
+        GpuLayer, GpuModel, Mixer, elementwise, record_embed, record_route_rows, view,
     };
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::View;
@@ -78,10 +78,10 @@ mod mac {
         }
     }
 
-    pub struct GpuVerify {
+    pub struct GpuVerify<'a> {
         rows: usize,
         /// `plans[m - 1]` runs `m` rows.
-        plans: Vec<Built>,
+        plans: Vec<(Plan<'a>, Built)>,
         /// `restores[r]` sets the DeltaNet states to the ones after row r.
         restores: Vec<Built>,
         /// One TokenParams per row.
@@ -130,7 +130,7 @@ mod mac {
             let logits = moe.router.outputs();
             let k = cfg.num_experts_per_tok;
             rows::record_router(plan, &moe.router, m, &s.moe_normed, &s.router, false);
-            rows::record_qmv(
+            rows::record_proj(
                 plan,
                 &moe.shared_gate,
                 m,
@@ -138,17 +138,17 @@ mod mac {
                 &s.shared_gate,
                 true,
             );
-            rows::record_qmv(plan, &moe.shared_up, m, &s.moe_normed, &s.shared_up, true);
-            for r in 0..m {
-                record_route(
-                    plan,
-                    &row(&s.router, r, logits),
-                    cfg.num_experts,
-                    k,
-                    &row(&s.ids, r, k),
-                    &row(&s.weights, r, k),
-                );
-            }
+            rows::record_proj(plan, &moe.shared_up, m, &s.moe_normed, &s.shared_up, true);
+            record_route_rows(
+                plan,
+                m,
+                &s.router,
+                logits,
+                cfg.num_experts,
+                k,
+                &s.ids,
+                &s.weights,
+            );
             elementwise(
                 plan,
                 "silu_mul",
@@ -156,7 +156,7 @@ mod mac {
                 m * moe.shared_gate.rows,
                 true,
             );
-            rows::record_qmv(plan, &moe.shared_down, m, &s.shared_h, &s.shared, false);
+            rows::record_proj(plan, &moe.shared_down, m, &s.shared_h, &s.shared, false);
             s.moe.record(
                 plan,
                 &moe.experts,
@@ -185,7 +185,7 @@ mod mac {
         }
     }
 
-    impl GpuModel<'_> {
+    impl<'a> GpuModel<'a> {
         /// Makes the verify for up to `rows` tokens (at most `MAX_ROWS`):
         /// one plan per row count, and about 2 MB per row per DeltaNet
         /// layer for the states after each row.
@@ -246,7 +246,7 @@ mod mac {
                             next_out,
                         );
                     }
-                    rows::record_qmv(&mut plan, &self.lm_head, m, &final_hidden, &logits, false);
+                    rows::record_proj(&mut plan, &self.lm_head, m, &final_hidden, &logits, false);
                     let n = plan.constant(&[vocab as u32]);
                     plan.op(
                         "argmax_rows",
@@ -254,7 +254,8 @@ mod mac {
                         MTLSize::new(m as u64, 1, 1),
                         MTLSize::new(1024, 1, 1),
                     );
-                    plan.build()
+                    let built = plan.build();
+                    (plan, built)
                 })
                 .collect();
 
@@ -295,7 +296,7 @@ mod mac {
             for (r, &t) in tokens.iter().enumerate() {
                 unsafe { *p.add(r) = TokenParams::new(t, (pos + r) as u32) };
             }
-            v.plans[m - 1].run(self.gpu);
+            v.plans[m - 1].1.run(self.gpu);
             v.last = Some((m, pos));
             self.position = pos + m;
             contents::<u32>(&v.argmax.buffer, m).to_vec()
@@ -329,6 +330,11 @@ mod mac {
             all[r * n..].to_vec()
         }
 
+        /// The recorded verify of `m` rows, for profiling.
+        pub fn verify_plan(&self, m: usize) -> &Plan<'a> {
+            &self.verify.as_ref().expect("enable_verify first").plans[m - 1].0
+        }
+
         /// GPU milliseconds of one verify of `m` rows at the current
         /// position, which it leaves unchanged.
         pub fn time_verify(&self, m: usize) -> f64 {
@@ -337,7 +343,7 @@ mod mac {
             for r in 0..m {
                 unsafe { *p.add(r) = TokenParams::new(0, (self.position + r) as u32) };
             }
-            v.plans[m - 1].run_timed(self.gpu).1 * 1e3
+            v.plans[m - 1].1.run_timed(self.gpu).1 * 1e3
         }
     }
 

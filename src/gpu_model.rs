@@ -77,13 +77,29 @@ mod mac {
         ids: &View,
         weights: &View,
     ) {
+        record_route_rows(plan, 1, logits, 0, experts, top_k, ids, weights);
+    }
+
+    /// `record_route` for `rows` rows of logits, `logit_stride` floats
+    /// apart; `ids` and `weights` get `[rows, top_k]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_route_rows(
+        plan: &mut Plan,
+        rows: usize,
+        logits: &View,
+        logit_stride: usize,
+        experts: usize,
+        top_k: usize,
+        ids: &View,
+        weights: &View,
+    ) {
         // ROUTE_PER_LANE values in each of 32 lanes.
         assert!(experts <= 256 && top_k <= 16);
-        let shape = plan.constant(&[experts as u32, top_k as u32]);
+        let shape = plan.constant(&[experts as u32, top_k as u32, logit_stride as u32]);
         plan.op(
             "route_top_k",
             &[logits, ids, weights, &shape],
-            MTLSize::new(1, 1, 1),
+            MTLSize::new(rows as u64, 1, 1),
             MTLSize::new(32, 1, 1),
         );
     }
@@ -366,7 +382,7 @@ mod mac {
         pub(crate) final_norm: View,
         pub(crate) lm_head: GpuQuant<'a>,
         /// The multi-row verify, after `enable_verify`.
-        pub(crate) verify: Option<crate::gpu_verify::GpuVerify>,
+        pub(crate) verify: Option<crate::gpu_verify::GpuVerify<'a>>,
         pub(crate) plan: Plan<'a>,
         pub(crate) built: Built,
         hidden: View,

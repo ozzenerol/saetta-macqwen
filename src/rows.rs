@@ -43,6 +43,77 @@ mod mac {
         }
     }
 
+    /// The m-row projection the verify uses: `record_qmv_reg`.
+    pub fn record_proj(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        parallel: bool,
+    ) {
+        record_qmv_reg(plan, w, m, x, y, parallel);
+    }
+
+    /// Must match QR and QR_SIMDS in rows.metal.
+    const QR: usize = 8;
+    const QR_SIMDS: usize = 2;
+    /// Rows of x one qmv_reg dispatch takes.
+    const REG_ROWS: usize = 4;
+
+    /// `record_qmv` with x held in registers: up to 4 rows per dispatch,
+    /// more as a second dispatch. Each weight is read once per 4 rows.
+    pub fn record_qmv_reg(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        parallel: bool,
+    ) {
+        record_qmv_reg_strided(plan, w, m, x, y, w.rows, parallel);
+    }
+
+    /// `record_qmv_reg` with rows of y `y_stride` floats apart.
+    pub fn record_qmv_reg_strided(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        y_stride: usize,
+        parallel: bool,
+    ) {
+        assert_eq!(w.experts, 1, "stacked experts go through moe");
+        assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
+        assert!(w.cols.is_multiple_of(64));
+        assert!(
+            matches!(w.bits, 5 | 8),
+            "no qmv_reg kernel for {} bits",
+            w.bits
+        );
+        let shape = plan.constant(&[w.rows as u32, w.cols as u32, y_stride as u32]);
+        let grid = MTLSize::new(w.rows.div_ceil(QR * QR_SIMDS) as u64, 1, 1);
+        let threads = MTLSize::new(32 * QR_SIMDS as u64, 1, 1);
+        for (pass, r0) in (0..m).step_by(REG_ROWS).enumerate() {
+            let rows = REG_ROWS.min(m - r0);
+            let at = |v: &View, floats: usize| View {
+                buffer: v.buffer.clone(),
+                offset: v.offset + (r0 * floats * 4) as u64,
+            };
+            let kernel = format!("qmv_reg_{}bit_{rows}", w.bits);
+            let buffers = [
+                &w.words,
+                &w.scales,
+                &w.biases,
+                &at(x, w.cols),
+                &at(y, y_stride),
+                &shape,
+            ];
+            op(plan, &kernel, &buffers, grid, threads, parallel || pass > 0);
+        }
+    }
+
     /// Must match MMA_SIMDS in rows.metal: simdgroups per 8-row tile.
     const MMA_SIMDS: usize = 8;
 
@@ -91,12 +162,11 @@ mod mac {
         }
     }
 
-    /// Must match ROUTER_SIMDS in kernels/router.metal and MOE_SIMDS in
-    /// kernels/moe.metal.
-    const ROUTER_SIMDS: usize = 8;
+    /// Must match MOE_SIMDS in kernels/moe.metal.
     const MOE_SIMDS: usize = 8;
 
-    /// `Router::record` for `m` rows: `out` gets `[m, experts + 1]`.
+    /// `Router::record` for `m` rows: `out` gets `[m, experts + 1]`, as
+    /// two qmv_reg ops.
     pub fn record_router(
         plan: &mut Plan,
         r: &Router,
@@ -105,21 +175,13 @@ mod mac {
         out: &View,
         parallel: bool,
     ) {
-        let (g, s) = (&r.gate, &r.shared_gate);
-        let shape = plan.constant(&[g.rows as u32, g.cols as u32]);
-        let buffers = [
-            &g.words, &g.scales, &g.biases, &s.words, &s.scales, &s.biases, x, out, &shape,
-        ];
-        let grid = MTLSize::new(r.outputs().div_ceil(ROUTER_SIMDS) as u64, 1, 1);
-        let threads = MTLSize::new(32 * ROUTER_SIMDS as u64, 1, 1);
-        op(
-            plan,
-            &format!("router_rows_{m}"),
-            &buffers,
-            grid,
-            threads,
-            parallel,
-        );
+        let n = r.outputs();
+        record_qmv_reg_strided(plan, &r.gate, m, x, out, n, parallel);
+        let shared = View {
+            buffer: out.buffer.clone(),
+            offset: out.offset + (r.gate.rows * 4) as u64,
+        };
+        record_qmv_reg_strided(plan, &r.shared_gate, m, x, &shared, n, true);
     }
 
     /// Must match RowsAttentionParams in kernels/attention_rows.metal.
@@ -260,7 +322,7 @@ mod mac {
             MoeRows {
                 list: View::new(gpu.buffer((1 + most) * 4)),
                 slots: View::new(gpu.buffer(most * MAX_ROWS * 4)),
-                mma: true,
+                mma: false,
             }
         }
 
@@ -436,13 +498,20 @@ mod mac {
                 println!("{module}: rows 1 to {MAX_ROWS} match qmv");
                 let xs = input(MAX_ROWS, w.cols);
                 let x = View::new(gpu.buffer_from(&xs));
-                for m in 1..=MAX_ROWS {
+                for (mma, m) in [false, true]
+                    .into_iter()
+                    .flat_map(|a| (1..=MAX_ROWS).map(move |m| (a, m)))
+                {
                     let (y, want) = (
                         View::new(gpu.buffer(m * w.rows * 4)),
                         View::new(gpu.buffer(m * w.rows * 4)),
                     );
                     let mut plan = Plan::new(&gpu);
-                    record_qmv_mma(&mut plan, &w, m, &x, &y, false);
+                    if mma {
+                        record_qmv_mma(&mut plan, &w, m, &x, &y, false);
+                    } else {
+                        record_qmv_reg(&mut plan, &w, m, &x, &y, false);
+                    }
                     record_qmv(&mut plan, &w, m, &x, &want, true);
                     plan.build().run(&gpu);
                     let (got, want) = (
@@ -452,9 +521,9 @@ mod mac {
                     let err: f32 = got.iter().zip(want).map(|(g, w)| (g - w) * (g - w)).sum();
                     let norm: f32 = want.iter().map(|w| w * w).sum();
                     let rel = (err / norm).sqrt();
-                    assert!(rel < 1e-6, "{module} mma m {m}: rel rms {rel}");
+                    assert!(rel < 1e-6, "{module} mma {mma} m {m}: rel rms {rel}");
                 }
-                println!("{module}: mma rows 1 to {MAX_ROWS} within 1e-6");
+                println!("{module}: reg and mma rows 1 to {MAX_ROWS} within 1e-6");
             }
         }
 
@@ -586,8 +655,9 @@ mod mac {
                     for _ in 0..50 {
                         match m {
                             0 => w.record(&mut plan, &x, &y, false),
-                            1..=MAX_ROWS => record_qmv(&mut plan, &w, m, &x, &y, false),
-                            _ => record_qmv_mma(&mut plan, &w, m - MAX_ROWS, &x, &y, false),
+                            1..=8 => record_qmv(&mut plan, &w, m, &x, &y, false),
+                            9..=16 => record_qmv_reg(&mut plan, &w, m - 8, &x, &y, false),
+                            _ => record_qmv_mma(&mut plan, &w, m - 16, &x, &y, false),
                         }
                     }
                     let built = plan.build();
@@ -599,10 +669,10 @@ mod mac {
                 };
                 let base = time(0);
                 let rows: Vec<String> = (1..=MAX_ROWS)
-                    .map(|m| format!("m{m} {:.1}/{:.1}", time(m), time(m + MAX_ROWS)))
+                    .map(|m| format!("m{m} {:.1}/{:.1}/{:.1}", time(m), time(m + 8), time(m + 16)))
                     .collect();
                 println!(
-                    "{module} {}x{}: qmv {base:.1} us; rows/mma {}",
+                    "{module} {}x{}: qmv {base:.1} us; rows/reg/mma {}",
                     w.rows,
                     w.cols,
                     rows.join(", ")

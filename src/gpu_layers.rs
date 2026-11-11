@@ -344,9 +344,9 @@ mod mac {
             let d = c.head_dim;
             let s = scratch;
             let [q_and_gate, q, k, v, attn] = [&s.q_and_gate, &s.q, &s.k, &s.v, &s.out].map(whole);
-            rows::record_qmv(plan, &self.q_proj, m, x, &q_and_gate, false);
-            rows::record_qmv(plan, &self.k_proj, m, x, &k, true);
-            rows::record_qmv(plan, &self.v_proj, m, x, &v, true);
+            rows::record_proj(plan, &self.q_proj, m, x, &q_and_gate, false);
+            rows::record_proj(plan, &self.k_proj, m, x, &k, true);
+            rows::record_proj(plan, &self.v_proj, m, x, &v, true);
 
             let (keys, values) = (whole(&cache.keys), whole(&cache.values));
             let p = plan.constant(&[PrepParams {
@@ -386,7 +386,7 @@ mod mac {
             }
             s.attention
                 .record(plan, m, &q, &keys, &values, &q_and_gate, &attn, params);
-            rows::record_qmv(plan, &self.o_proj, m, &attn, out, false);
+            rows::record_proj(plan, &self.o_proj, m, &attn, out, false);
         }
     }
 
@@ -521,7 +521,7 @@ mod mac {
                 if m == 1 {
                     w.record(plan, x, y, parallel);
                 } else {
-                    rows::record_qmv(plan, w, m, x, y, parallel);
+                    rows::record_proj(plan, w, m, x, y, parallel);
                 }
             };
             proj(plan, &self.in_proj_qkv, x, qkv, false);
