@@ -95,3 +95,32 @@ fn decode_row_matches_cpu() {
         compare(&cache, &x, 41, bits);
     }
 }
+
+#[test]
+fn dequantize_matches_cpu() {
+    let gpu = Gpu::new().unwrap();
+    for bits in [KvBits::Eight, KvBits::Four] {
+        let tokens = 9;
+        let cache = QuantRows::new(&gpu, bits, VALUES, 64);
+        let x = rows(tokens);
+        let xb = View::new(gpu.buffer_from(&x));
+        let out = View::new(gpu.buffer(tokens * VALUES * 2));
+        gpu.run(|enc| {
+            cache.encode(&gpu, enc, &xb, 0, tokens);
+            cache.encode_dequantize(&gpu, enc, &out, tokens);
+        });
+        let groups = tokens * cache.per_token;
+        let want = dequantize(
+            contents::<u32>(&cache.data, groups * bits.words_per_group()),
+            contents::<f16>(&cache.scales, groups),
+            contents::<f16>(&cache.biases, groups),
+            bits,
+        );
+        let got: Vec<f32> = contents::<f16>(&out.buffer, tokens * VALUES)
+            .iter()
+            .map(|h| h.to_f32())
+            .collect();
+        let want: Vec<f32> = want.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+        assert_eq!(got, want, "{bits:?}");
+    }
+}

@@ -190,6 +190,37 @@ mod mac {
             );
         }
 
+        /// Encodes writing the values of tokens 0..`tokens` as half into
+        /// `out`.
+        pub fn encode_dequantize(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            out: &View,
+            tokens: usize,
+        ) {
+            let groups = self.per_token * tokens;
+            let kernel = match self.bits {
+                KvBits::Eight => "kv_dequantize_8",
+                KvBits::Four => "kv_dequantize_4",
+                KvBits::Half => unreachable!(),
+            };
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
+            enc.set_buffer(0, Some(&self.data), 0);
+            enc.set_buffer(1, Some(&self.scales), 0);
+            enc.set_buffer(2, Some(&self.biases), 0);
+            enc.set_buffer(3, Some(&out.buffer), out.offset);
+            let p = Params {
+                groups: groups as u32,
+                per_token: self.per_token as u32,
+            };
+            enc.set_bytes(4, size_of::<Params>() as u64, (&p as *const Params).cast());
+            enc.dispatch_threads(
+                MTLSize::new((groups * GROUP) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
         /// Encodes the quantizing of `tokens` tokens of values in `x` into
         /// the slots from `pos`.
         pub fn encode(

@@ -57,3 +57,26 @@ kernel void kv_quantize(device const float *x [[buffer(0)]],
 
 template [[host_name("kv_quantize_8")]] kernel decltype(kv_quantize<8>) kv_quantize<8>;
 template [[host_name("kv_quantize_4")]] kernel decltype(kv_quantize<4>) kv_quantize<4>;
+
+// The values of groups 0..p.groups as half, one thread per value: the
+// prefill attention reads a quantized cache through this copy for now.
+template <uint BITS>
+kernel void kv_dequantize(device const uint *data [[buffer(0)]],
+                          device const half *scales [[buffer(1)]],
+                          device const half *biases [[buffer(2)]],
+                          device half *out [[buffer(3)]],
+                          constant KvQuantParams &p [[buffer(4)]],
+                          uint i [[thread_position_in_grid]]) {
+    uint g = i / 64;
+    if (g >= p.groups) {
+        return;
+    }
+    const uint per_word = 32 / BITS;
+    uint j = i % 64;
+    uint word = data[g * 2 * BITS + j / per_word];
+    uint q = (word >> ((j % per_word) * BITS)) & ((1u << BITS) - 1);
+    out[i] = half(float(scales[g]) * float(q) + float(biases[g]));
+}
+
+template [[host_name("kv_dequantize_8")]] kernel decltype(kv_dequantize<8>) kv_dequantize<8>;
+template [[host_name("kv_dequantize_4")]] kernel decltype(kv_dequantize<4>) kv_dequantize<4>;

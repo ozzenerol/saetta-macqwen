@@ -16,11 +16,12 @@ mod mac {
     use crate::gpu::{Gpu, contents, dispatch_1d};
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache, Norm};
     use crate::gpu_model::State;
+    use crate::kv_quant::KvBits;
     use crate::moe::Experts;
     use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::time::Instant;
 
     const PREFIX: &str = "language_model.model";
@@ -433,6 +434,10 @@ mod mac {
         verify_rows: Option<VerifyRows>,
         /// Set while `verify` encodes, so the DeltaNet layers write snapshots.
         snapshot_run: Cell<bool>,
+        /// Half copies of a quantized cache's keys and values, which the
+        /// attention reads; made at the first such cache, at its size. The
+        /// layers run one after the other, so they share it.
+        dequantized: RefCell<Option<(Buffer, Buffer)>>,
     }
 
     /// Per-row outputs of `verify`: the DeltaNet state after each row, one
@@ -552,6 +557,7 @@ mod mac {
             Ok(Prefill {
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
+                dequantized: RefCell::new(None),
                 cfg,
                 attention,
                 deltanet,
@@ -1007,11 +1013,22 @@ mod mac {
                     vq.encode(gpu, enc, &values, pos, t);
                 }
             }
-            assert!(
-                cache.quant.is_none(),
-                "prefill attention over a quantized KV cache is not written yet"
-            );
-            let cached = [whole(&cache.keys), whole(&cache.values)];
+            // A quantized cache goes through a half copy of the tokens so far.
+            let cached = match &cache.quant {
+                None => [whole(&cache.keys), whole(&cache.values)],
+                Some((kq, vq)) => {
+                    let mut copy = self.dequantized.borrow_mut();
+                    let bytes = (cache.capacity * kv_size * 2) as u64;
+                    if copy.as_ref().is_none_or(|(k, _)| k.length() < bytes) {
+                        *copy = Some((gpu.buffer(bytes as usize), gpu.buffer(bytes as usize)));
+                    }
+                    let (hk, hv) = copy.as_ref().unwrap();
+                    let (hk, hv) = (whole(hk), whole(hv));
+                    kq.encode_dequantize(gpu, enc, &hk, pos + t);
+                    vq.encode_dequantize(gpu, enc, &hv, pos + t);
+                    [hk, hv]
+                }
+            };
             if self.exact {
                 enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows"));
                 set_views(enc, 0, &[&q, &cached[0], &cached[1]]);
@@ -1159,6 +1176,16 @@ mod mac {
 
     impl OwnedState {
         pub fn new_all(gpu: &Gpu, cfg: &Config, capacity: usize) -> Vec<OwnedState> {
+            OwnedState::with_bits(gpu, cfg, capacity, KvBits::Half)
+        }
+
+        /// As `new_all`, with the KV caches stored as `bits`.
+        pub fn with_bits(
+            gpu: &Gpu,
+            cfg: &Config,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Vec<OwnedState> {
             let capacity = capacity.next_multiple_of(KEY_BLOCK);
             cfg.layer_types
                 .iter()
@@ -1166,9 +1193,12 @@ mod mac {
                     LayerType::LinearAttention => {
                         OwnedState::Linear(GpuDeltaNetState::new(gpu, &deltanet_config(cfg)))
                     }
-                    LayerType::FullAttention => {
-                        OwnedState::Full(GpuKvCache::new(gpu, &attention_config(cfg), capacity))
-                    }
+                    LayerType::FullAttention => OwnedState::Full(GpuKvCache::with_bits(
+                        gpu,
+                        &attention_config(cfg),
+                        capacity,
+                        bits,
+                    )),
                 })
                 .collect()
         }
@@ -1347,7 +1377,20 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 2e-4, 1e-2);
+            check_prefill(true, 2e-4, 1e-2, KvBits::Half);
+        }
+
+        /// Prefill over an 8-bit and a 4-bit KV cache against the CPU storing
+        /// its cache the same way, with the bounds of the half cache. The
+        /// codes match the CPU's (tests/kv_quant.rs), so what is left is f32
+        /// rounding and near-tie expert flips.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn quantized_prefill_matches_token_by_token() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_prefill(true, 2e-4, 1e-2, bits);
+            }
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1364,14 +1407,14 @@ mod mac {
             // with attention in half and some near-tie expert choices; MLX
             // in bf16 is off by 1.6e-2 at layer 3. Bounds are about twice
             // what was measured.
-            check_prefill(false, 3e-2, 0.1);
+            check_prefill(false, 3e-2, 0.1, KvBits::Half);
         }
 
         /// 45 tokens in two calls (29 then 16) with chunks of 64 rounded
         /// from 20: the hidden state after each layer and every layer state
         /// must be within `bound` of the CPU fed one token at a time, the
         /// logits within `logits_bound`, with the same argmax.
-        fn check_prefill(exact: bool, bound: f32, logits_bound: f32) {
+        fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
@@ -1383,14 +1426,13 @@ mod mac {
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
-            // The GPU cache is half; the CPU rounds its keys and values the
-            // same way.
+            // The CPU stores its keys and values as the GPU cache does.
             for s in &mut cpu_states {
                 if let LayerState::Full(c) = s {
-                    c.round_to_half();
+                    c.round_to(bits);
                 }
             }
-            let gpu_states = OwnedState::new_all(&gpu, &cfg, capacity);
+            let gpu_states = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
             let mut cpu_x: Vec<Vec<Vec<f32>>> = parts
                 .iter()
                 .map(|p| p.iter().map(|&t| model.embed(t)).collect())
@@ -1445,8 +1487,21 @@ mod mac {
                                 .map(|v| v.to_f32())
                                 .collect()
                         };
-                        let k = rel_rms(&f32s(&g.keys), c.keys());
-                        let v = rel_rms(&f32s(&g.values), c.values());
+                        let dequantized = |q: &crate::kv_quant::QuantRows| {
+                            let groups = n / crate::kv_quant::GROUP;
+                            crate::kv_quant::dequantize(
+                                contents::<u32>(&q.data, groups * q.bits.words_per_group()),
+                                contents::<half::f16>(&q.scales, groups),
+                                contents::<half::f16>(&q.biases, groups),
+                                q.bits,
+                            )
+                        };
+                        let (keys, values) = match &g.quant {
+                            None => (f32s(&g.keys), f32s(&g.values)),
+                            Some((k, v)) => (dequantized(k), dequantized(v)),
+                        };
+                        let k = rel_rms(&keys, c.keys());
+                        let v = rel_rms(&values, c.values());
                         k.max(v)
                     }
                     _ => panic!("layer {l}: state types differ"),
