@@ -148,6 +148,26 @@ mod mac {
         shared_up: GpuQuant<'a>,
         shared_down: GpuQuant<'a>,
         experts: Experts<'a>,
+        /// SAETTA_FORCE_EXPERT for this layer: (position, slot, expert).
+        force: Option<[u32; 3]>,
+    }
+
+    /// SAETTA_FORCE_EXPERT=layer:position:slot:expert makes the router of
+    /// that layer take `expert` in `slot` at `position`, keeping the weight.
+    /// For debugging near ties; unset, the plan has no extra op.
+    fn force_expert(prefix: &str) -> Option<[u32; 3]> {
+        let v = std::env::var("SAETTA_FORCE_EXPERT").ok()?;
+        let n: Vec<u32> = v
+            .split(':')
+            .map(|x| {
+                x.trim()
+                    .parse()
+                    .expect("SAETTA_FORCE_EXPERT=layer:position:slot:expert")
+            })
+            .collect();
+        assert_eq!(n.len(), 4, "SAETTA_FORCE_EXPERT=layer:position:slot:expert");
+        let layer: u32 = prefix.rsplit('.').next()?.parse().ok()?;
+        (layer == n[0]).then_some([n[1], n[2], n[3]])
     }
 
     impl<'a> GpuMoe<'a> {
@@ -169,6 +189,7 @@ mod mac {
                 shared_up: m("shared_expert.up_proj")?,
                 shared_down: m("shared_expert.down_proj")?,
                 experts: Experts::new(gpu, weights, &cfg.quantization, prefix)?,
+                force: force_expert(prefix),
             })
         }
 
@@ -196,6 +217,16 @@ mod mac {
                 &s.ids,
                 &s.weights,
             );
+            if let Some(f) = self.force {
+                let c = plan.constant(&f);
+                let params = plan.params.clone();
+                plan.op(
+                    "force_expert",
+                    &[&s.ids, &c, &params],
+                    MTLSize::new(1, 1, 1),
+                    MTLSize::new(1, 1, 1),
+                );
+            }
             elementwise(
                 plan,
                 "silu_mul",

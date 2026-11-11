@@ -98,6 +98,15 @@ kernel void route_top_k(device const float *logits [[buffer(0)]],
     }
 }
 
+// Debug (SAETTA_FORCE_EXPERT): at position f[0], slot f[1] takes expert f[2].
+kernel void force_expert(device uint *ids [[buffer(0)]],
+                         constant uint *f [[buffer(1)]],
+                         constant TokenParams &tp [[buffer(2)]]) {
+    if (tp.position == f[0]) {
+        ids[f[1]] = f[2];
+    }
+}
+
 // out = silu(gate) * up, the middle of a SwiGLU MLP.
 kernel void silu_mul(device const float *gate [[buffer(0)]],
                      device const float *up [[buffer(1)]],
