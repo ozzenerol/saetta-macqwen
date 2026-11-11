@@ -1,5 +1,14 @@
 <p align="center"><img src="docs/logo.png" alt="saetta-macqwen" width="640"></p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/Metal-147EFB?style=for-the-badge&logo=apple&logoColor=white" alt="Metal">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-555555?style=for-the-badge&logo=apple&logoColor=white" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/Qwen3.6-615CED?style=for-the-badge" alt="Qwen3.6">
+  <img src="https://img.shields.io/badge/OpenAI%20API-412991?style=for-the-badge&logo=openai&logoColor=white" alt="OpenAI-compatible API">
+  <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="MIT">
+</p>
+
 # saetta-macqwen
 
 An inference engine for the Qwen3.6 MoE models on Apple Silicon, written in Rust with Metal kernels. It runs one model family on one kind of machine and is built to be faster than MLX and llama.cpp there.
