@@ -325,7 +325,7 @@ fn serve_gpu(
     let served = load_gpu(config, weights, draft, memory)?;
     let snapshots = served.snapshots;
     let model = anchored(
-        Cached::new(served, snapshots, cache::DEFAULT_EVERY),
+        Cached::new(served, snapshots, SNAPSHOT_EVERY),
         &tokenizer,
     );
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
@@ -491,6 +491,13 @@ const MTP_WINDOW: usize = 32;
 /// and 4096 no better at 15k.
 #[cfg(target_os = "macos")]
 const PREFILL_CHUNK: usize = 2048;
+
+/// The GPU prompt cache takes a snapshot every this many tokens of a long
+/// prefill, and each piece between two is one prefill call. Pieces of
+/// cache::DEFAULT_EVERY (1024) would run half chunks and pay the fixed cost
+/// of a call four times as often.
+#[cfg(target_os = "macos")]
+const SNAPSHOT_EVERY: usize = 2 * PREFILL_CHUNK;
 
 #[cfg(target_os = "macos")]
 /// Fast prefill unless SAETTA_EXACT=1: track F's eval found it within
