@@ -28,8 +28,19 @@ mod mac {
     const PREFIX: &str = "language_model.model";
     /// Rows and columns of a qmm tile; must match PREFILL_MM_BM and PREFILL_MM_BN.
     const TILE: usize = 64;
-    /// Key block of attention_rows; the KV cache needs this much slack.
-    const KEY_BLOCK: usize = 32;
+    /// Key block of attention_rows2 (attention_rows takes 32); the KV
+    /// cache needs this much slack.
+    const KEY_BLOCK: usize = 64;
+
+    /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one and
+    /// SAETTA_ATT=8 the one with 8 heads per threadgroup, to compare.
+    fn attention_half_kernel() -> &'static str {
+        match std::env::var("SAETTA_ATT").as_deref() {
+            Ok("1") => "attention_rows_half",
+            Ok("8") => "attention_rows2_half8",
+            _ => "attention_rows2_half",
+        }
+    }
 
     fn at(buffer: &Buffer, floats: usize) -> View {
         View {
@@ -236,6 +247,70 @@ mod mac {
         groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
     }
 
+    /// qmm_grouped on qmm2 (src/qmm.rs), which takes `x_half`, the half of
+    /// `x`; the tiles of FEW rows or fewer still go to qmm_few on `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn qmm2_grouped(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        x_half: &View,
+        y: &View,
+        g: &Grouped,
+        gather_x: bool,
+    ) {
+        assert_eq!(crate::qmm::FEW, FEW);
+        crate::qmm::encode_gather(
+            enc,
+            gpu,
+            crate::qmm::DEFAULT,
+            w,
+            x_half,
+            y,
+            g.tiles,
+            g.rows,
+            g.tile_count,
+            g.max_tiles,
+            gather_x,
+        );
+        enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
+        set_quant(enc, 0, w);
+        set_views(enc, 3, &[x, y]);
+        let shape = MmShape {
+            m: 0,
+            n: w.rows as u32,
+            k: w.cols as u32,
+            gather: if gather_x { 1 } else { 2 },
+        };
+        params(enc, 5, &shape);
+        set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
+        groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
+    }
+
+    /// Fast-mode dense matrices run on qmm_dq (w rounded to half), 6% faster
+    /// than qmm2 at 1800 tokens; SAETTA_QMM2=1 picks qmm2 (x in half).
+    fn dense_qmm2() -> bool {
+        std::env::var("SAETTA_QMM2").is_ok_and(|v| v == "1")
+    }
+
+    /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
+    fn fast_router() -> bool {
+        std::env::var("SAETTA_ROUTER_FAST").is_ok_and(|v| v == "1")
+    }
+
+    /// SAETTA_CONV=1 runs the DeltaNet conv on conv_rows, one thread per
+    /// channel, instead of conv_rows2 and conv_state, to compare.
+    fn old_conv() -> bool {
+        std::env::var("SAETTA_CONV").is_ok_and(|v| v == "1")
+    }
+
+    /// SAETTA_DELTA2=1 runs the delta rule on delta_prep and delta_rows2
+    /// instead of delta_rows: measured slower so far.
+    fn delta2() -> bool {
+        std::env::var("SAETTA_DELTA2").is_ok_and(|v| v == "1")
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -325,6 +400,11 @@ mod mac {
         expert_g: Buffer,
         expert_u: Buffer,
         expert_out: Buffer,
+        /// normed and expert_g in half, the input of qmm2 in fast mode
+        normed_half: Buffer,
+        expert_half: Buffer,
+        /// the x of a dense qmm2 in fast mode
+        x_half: Buffer,
         max_tiles: usize,
     }
 
@@ -339,7 +419,7 @@ mod mac {
             let narrow = (d.v_heads * d.v_dim).max(a.heads * a.head_dim);
             let pairs = chunk * cfg.num_experts_per_tok;
             let size = cfg.moe_intermediate_size;
-            let max_tiles = pairs.div_ceil(TILE) + cfg.num_experts;
+            let max_tiles = pairs.div_ceil(TILE.min(crate::qmm::tile_rows())) + cfg.num_experts;
             Scratch {
                 normed: f(chunk * h),
                 wide: f(chunk * wide),
@@ -364,6 +444,9 @@ mod mac {
                 expert_g: f(pairs * size),
                 expert_u: f(pairs * size),
                 expert_out: f(pairs * h),
+                normed_half: f(chunk * h / 2),
+                x_half: f(chunk * h.max(narrow) / 2),
+                expert_half: f(pairs * size / 2),
                 max_tiles,
             }
         }
@@ -422,6 +505,7 @@ mod mac {
         pairs: u32,
         top_k: u32,
         experts: u32,
+        tile_rows: u32,
     }
 
     #[repr(C)]
@@ -450,6 +534,11 @@ mod mac {
         verify_rows: Option<VerifyRows>,
         /// Set while `verify` encodes, so the DeltaNet layers write snapshots.
         snapshot_run: Cell<bool>,
+        /// Set while `verify` encodes: its rows run on the exact kernels
+        /// whatever `exact` says, so they match decode.
+        force_exact: Cell<bool>,
+        /// Set by `profile`: only the stages up to this index in STAGES run.
+        only: Cell<Option<usize>>,
     }
 
     /// Per-row outputs of `verify`: the DeltaNet state after each row, one
@@ -485,6 +574,28 @@ mod mac {
             }
         }
     }
+
+    /// The stages `profile` times, in the order they run.
+    pub const STAGES: [&str; 18] = [
+        "norm",
+        "deltanet in_proj",
+        "deltanet conv",
+        "deltanet delta",
+        "deltanet norm",
+        "deltanet out_proj",
+        "attention q/k/v",
+        "attention norm, rope",
+        "attention",
+        "attention o_proj",
+        "add, post norm",
+        "router",
+        "shared expert",
+        "route, group",
+        "experts gate, up",
+        "experts silu",
+        "experts down",
+        "combine",
+    ];
 
     /// The inputs whose range `track_ranges` records: half tops out at 65504.
     pub const RANGES: [&str; 5] = [
@@ -569,6 +680,8 @@ mod mac {
             Ok(Prefill {
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
+                only: Cell::new(None),
+                force_exact: Cell::new(false),
                 cfg,
                 attention,
                 deltanet,
@@ -700,6 +813,95 @@ mod mac {
             }
         }
 
+        /// y = x W^T for `m` rows of x, with the kernels `exact` picks: in
+        /// fast mode, more than FEW_MAX rows go to qmm2 on x in half.
+        #[allow(clippy::too_many_arguments)]
+        fn mm(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            w: &GpuQuant,
+            x: &View,
+            y: &View,
+            m: usize,
+        ) {
+            if self.exact_now() || m <= FEW_MAX || !dense_qmm2() {
+                return qmm(gpu, enc, w, x, y, m, self.exact_now());
+            }
+            let x_half = whole(&self.scratch.x_half);
+            to_half(gpu, enc, x, &x_half, m * w.cols);
+            crate::qmm::encode(enc, gpu, crate::qmm::DEFAULT, w, &x_half, y, m);
+        }
+
+        /// `exact`, or true while `verify` runs.
+        fn exact_now(&self) -> bool {
+            self.exact || self.force_exact.get()
+        }
+
+        /// Whether the dispatches of `stage` run: all do unless `profile`
+        /// picked one.
+        fn on(&self, stage: &str) -> bool {
+            self.only.get().is_none_or(|last| {
+                STAGES
+                    .iter()
+                    .position(|&s| s == stage)
+                    .expect("a stage in STAGES")
+                    <= last
+            })
+        }
+
+        /// Runs `tokens` from position 0 as `run` does, and returns the GPU
+        /// time of each of `STAGES`, summed over the layers, then the time
+        /// of whole layers and of the logits. Each layer runs once for real,
+        /// then once for every stage k with only stages 0 ..= k, from the
+        /// same input; stage k gets the difference to the run up to k - 1.
+        /// So every stage sees the data the earlier ones made for its chunk.
+        pub fn profile(
+            &self,
+            gpu: &Gpu,
+            tokens: &[u32],
+            states: &[State],
+        ) -> Vec<(&'static str, f64)> {
+            let n = tokens.len();
+            let x = self.embed(gpu, tokens);
+            let bytes = n * self.cfg.hidden_size * 4;
+            let ptr = x.contents() as *mut u8;
+            let (mut input, mut output) = (vec![0u8; bytes], vec![0u8; bytes]);
+            let mut times: Vec<(&'static str, f64)> = STAGES.iter().map(|&s| (s, 0.0)).collect();
+            let mut layers = 0.0;
+            let serial = metal::MTLDispatchType::Serial;
+            for (l, state) in states.iter().enumerate() {
+                unsafe { std::ptr::copy_nonoverlapping(ptr, input.as_mut_ptr(), bytes) };
+                let run = || {
+                    gpu.run_timed(serial, |enc| {
+                        self.encode_layer(gpu, enc, l, &x, n, 0, state)
+                    })
+                    .1
+                };
+                layers += run();
+                unsafe { std::ptr::copy_nonoverlapping(ptr, output.as_mut_ptr(), bytes) };
+                let mut before = 0.0;
+                for (k, (_, total)) in times.iter_mut().enumerate() {
+                    unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), ptr, bytes) };
+                    self.only.set(Some(k));
+                    let upto = run();
+                    *total += upto - before;
+                    before = upto;
+                }
+                self.only.set(None);
+                unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, bytes) };
+            }
+            let logits = gpu.buffer(self.lm_head.rows * 4);
+            let head = gpu
+                .run_timed(metal::MTLDispatchType::Serial, |enc| {
+                    self.encode_logits(gpu, enc, &x, n, &logits)
+                })
+                .1;
+            times.push(("whole layers", layers));
+            times.push(("final norm, lm_head", head));
+            times
+        }
+
         /// Which DeltaNet layer `l` is.
         fn linear_index(&self, l: usize) -> usize {
             self.layers[..l]
@@ -733,8 +935,9 @@ mod mac {
 
         /// Runs `tokens` at positions `pos ..` as `run` does, and keeps for
         /// every row the final-norm hidden state, the logits, the argmax and
-        /// the DeltaNet state after it, for speculative decoding. Use the
-        /// exact kernels so rows match decode. Needs `enable_verify`.
+        /// the DeltaNet state after it, for speculative decoding. Runs on the
+        /// exact kernels even when `exact` is false, so rows match decode.
+        /// Needs `enable_verify`.
         /// With `sampler`, also samples every row into its ring slot
         /// (row i at position pos + i fills slot pos + i + 1), against the
         /// drafts set in the ring.
@@ -755,6 +958,7 @@ mod mac {
             let hidden = whole(&v.hidden);
             let logits = whole(&v.logits);
             self.snapshot_run.set(true);
+            self.force_exact.set(true);
             gpu.run(|enc| {
                 self.encode_embed(gpu, enc, &ids, &x, n);
                 for (l, state) in states.iter().enumerate() {
@@ -792,6 +996,7 @@ mod mac {
                 }
             });
             self.snapshot_run.set(false);
+            self.force_exact.set(false);
             Verify {
                 hidden,
                 logits,
@@ -870,14 +1075,16 @@ mod mac {
             let normed = whole(&s.normed);
             let mixer_out = whole(&s.mixer_out);
 
-            norm(
-                gpu,
-                enc,
-                &Norm::rows(t, h, eps, &layer.input_norm),
-                &xt,
-                &normed,
-            );
-            self.record(gpu, enc, 0, &normed, t * h);
+            if self.on("norm") {
+                norm(
+                    gpu,
+                    enc,
+                    &Norm::rows(t, h, eps, &layer.input_norm),
+                    &xt,
+                    &normed,
+                );
+                self.record(gpu, enc, 0, &normed, t * h);
+            }
             match (&layer.mixer, state) {
                 (Mixer::Linear(w), State::Linear(st)) => {
                     let snaps = self
@@ -895,19 +1102,21 @@ mod mac {
                 }
                 _ => panic!("layer {l}: state does not match the layer type"),
             }
-            dispatch_1d(
-                enc,
-                &gpu.pipeline("add_in_place"),
-                &[(&xt.buffer, xt.offset), (&s.mixer_out, 0)],
-                t * h,
-            );
-            norm(
-                gpu,
-                enc,
-                &Norm::rows(t, h, eps, &layer.post_norm),
-                &xt,
-                &normed,
-            );
+            if self.on("add, post norm") {
+                dispatch_1d(
+                    enc,
+                    &gpu.pipeline("add_in_place"),
+                    &[(&xt.buffer, xt.offset), (&s.mixer_out, 0)],
+                    t * h,
+                );
+                norm(
+                    gpu,
+                    enc,
+                    &Norm::rows(t, h, eps, &layer.post_norm),
+                    &xt,
+                    &normed,
+                );
+            }
             self.encode_moe(gpu, enc, layer, &normed, &xt, t);
         }
 
@@ -927,38 +1136,48 @@ mod mac {
             let s = &self.scratch;
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
             let [wide, mixed, z, y, a, b] = [&s.wide, &s.mixed, &s.z, &s.y, &s.a, &s.b].map(whole);
-            qmm(gpu, enc, &w.qkv, x, &wide, t, self.exact);
-            qmm(gpu, enc, &w.z, x, &z, t, self.exact);
-            qmm(gpu, enc, &w.b, x, &b, t, self.exact);
-            qmm(gpu, enc, &w.a, x, &a, t, self.exact);
+            if self.on("deltanet in_proj") {
+                self.mm(gpu, enc, &w.qkv, x, &wide, t);
+                self.mm(gpu, enc, &w.z, x, &z, t);
+                self.mm(gpu, enc, &w.b, x, &b, t);
+                self.mm(gpu, enc, &w.a, x, &a, t);
+            }
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("conv_rows"));
-            set_views(enc, 0, &[&wide, &w.conv1d, &whole(&state.conv), &mixed]);
             let (conv_snaps, delta_snaps) = snaps.unwrap_or((&state.conv, &state.recurrent));
-            let p = ConvRowsParams {
-                channels: channels as u32,
-                kernel_size: c.kernel as u32,
-                tokens: t as u32,
-                snapshots: snaps.is_some() as u32,
-            };
-            params(enc, 4, &p);
-            set_views(enc, 5, &[&whole(conv_snaps)]);
-            enc.dispatch_threads(MTLSize::new(channels as u64, 1, 1), MTLSize::new(256, 1, 1));
+            if self.on("deltanet conv") {
+                enc.set_compute_pipeline_state(&gpu.pipeline("conv_rows"));
+                set_views(enc, 0, &[&wide, &w.conv1d, &whole(&state.conv), &mixed]);
+                let p = ConvRowsParams {
+                    channels: channels as u32,
+                    kernel_size: c.kernel as u32,
+                    tokens: t as u32,
+                    snapshots: snaps.is_some() as u32,
+                };
+                params(enc, 4, &p);
+                set_views(enc, 5, &[&whole(conv_snaps)]);
+                if old_conv() {
+                    enc.dispatch_threads(
+                        MTLSize::new(channels as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                } else {
+                    assert!(c.kernel <= 9);
+                    enc.set_compute_pipeline_state(&gpu.pipeline("conv_rows2"));
+                    enc.dispatch_threads(
+                        MTLSize::new(channels as u64, t as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    enc.set_compute_pipeline_state(&gpu.pipeline("conv_state"));
+                    enc.dispatch_threads(
+                        MTLSize::new(channels as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            }
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows"));
-            set_views(
-                enc,
-                0,
-                &[
-                    &mixed,
-                    &a,
-                    &b,
-                    &w.a_log,
-                    &w.dt_bias,
-                    &whole(&state.recurrent),
-                    &y,
-                ],
-            );
+            if !self.on("deltanet delta") {
+                return self.encode_deltanet_out(gpu, enc, w, &y, &z, out, t);
+            }
             let p = DeltaRowsParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
@@ -968,16 +1187,66 @@ mod mac {
                 eps: c.eps,
                 snapshots: snaps.is_some() as u32,
             };
-            params(enc, 7, &p);
-            set_views(enc, 8, &[&whole(delta_snaps)]);
-            // 2 simdgroups of 8 rows each per threadgroup.
-            groups(enc, (c.v_dim.div_ceil(16), c.v_heads), 64);
+            if !delta2() {
+                enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows"));
+                set_views(
+                    enc,
+                    0,
+                    &[
+                        &mixed,
+                        &a,
+                        &b,
+                        &w.a_log,
+                        &w.dt_bias,
+                        &whole(&state.recurrent),
+                        &y,
+                    ],
+                );
+                params(enc, 7, &p);
+                set_views(enc, 8, &[&whole(delta_snaps)]);
+                // 2 simdgroups of 8 rows each per threadgroup.
+                groups(enc, (c.v_dim.div_ceil(16), c.v_heads), 64);
+            } else {
+                assert!(c.k_dim == 128 && c.v_heads.is_multiple_of(32));
+                // Normalizes q and k in place, a and b become g and beta.
+                enc.set_compute_pipeline_state(&gpu.pipeline("delta_prep"));
+                set_views(enc, 0, &[&mixed, &a, &b, &w.a_log, &w.dt_bias]);
+                params(enc, 5, &p);
+                groups(enc, (t, 2 * c.k_heads + 1), 32);
 
-            let mut gated = Norm::rows(t * c.v_heads, c.v_dim, c.eps, &w.norm);
-            gated.gate = Some(&z);
-            norm(gpu, enc, &gated, &y, &y);
-            self.record(gpu, enc, 1, &y, t * c.v_heads * c.v_dim);
-            qmm(gpu, enc, &w.out, &y, out, t, self.exact);
+                enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows2"));
+                set_views(enc, 0, &[&mixed, &a, &b]);
+                set_views(enc, 5, &[&whole(&state.recurrent), &y]);
+                params(enc, 7, &p);
+                set_views(enc, 8, &[&whole(delta_snaps)]);
+                // 2 simdgroups of 4 rows each per threadgroup.
+                groups(enc, (c.v_dim.div_ceil(8), c.v_heads), 64);
+            }
+            self.encode_deltanet_out(gpu, enc, w, &y, &z, out, t);
+        }
+
+        /// The gated norm of the delta rule output y, and out_proj.
+        #[allow(clippy::too_many_arguments)]
+        fn encode_deltanet_out(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            w: &DeltaNetWeights,
+            y: &View,
+            z: &View,
+            out: &View,
+            t: usize,
+        ) {
+            let c = &self.deltanet;
+            if self.on("deltanet norm") {
+                let mut gated = Norm::rows(t * c.v_heads, c.v_dim, c.eps, &w.norm);
+                gated.gate = Some(z);
+                norm(gpu, enc, &gated, y, y);
+                self.record(gpu, enc, 1, y, t * c.v_heads * c.v_dim);
+            }
+            if self.on("deltanet out_proj") {
+                self.mm(gpu, enc, &w.out, y, out, t);
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -996,11 +1265,16 @@ mod mac {
             let s = &self.scratch;
             let d = c.head_dim;
             let kv_size = c.kv_heads * d;
-            let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
+            let (q_and_gate, q) = (whole(&s.wide), whole(&s.z));
             let (keys, values) = (whole(&s.mixed), at(&s.mixed, t * kv_size));
-            qmm(gpu, enc, &w.q, x, &q_and_gate, t, self.exact);
-            qmm(gpu, enc, &w.k, x, &keys, t, self.exact);
-            qmm(gpu, enc, &w.v, x, &values, t, self.exact);
+            if self.on("attention q/k/v") {
+                self.mm(gpu, enc, &w.q, x, &q_and_gate, t);
+                self.mm(gpu, enc, &w.k, x, &keys, t);
+                self.mm(gpu, enc, &w.v, x, &values, t);
+            }
+            if !self.on("attention norm, rope") {
+                return self.encode_attention_rows(gpu, enc, w, cache, out, t, pos);
+            }
 
             let mut q_norm = Norm::rows(t * c.heads, d, c.eps, &w.q_norm);
             q_norm.in_stride = 2 * d;
@@ -1029,29 +1303,50 @@ mod mac {
                     MTLSize::new(half.min(64) as u64, 1, 1),
                 );
             }
+            self.encode_attention_rows(gpu, enc, w, cache, out, t, pos);
+        }
 
-            to_half(
-                gpu,
-                enc,
-                &keys,
-                &at_half(&cache.keys, pos * kv_size),
-                t * kv_size,
-            );
-            to_half(
-                gpu,
-                enc,
-                &values,
-                &at_half(&cache.values, pos * kv_size),
-                t * kv_size,
-            );
+        /// The new keys and values into the half cache, attention over the
+        /// cache for the `t` new queries, and o_proj.
+        #[allow(clippy::too_many_arguments)]
+        fn encode_attention_rows(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            w: &AttentionWeights,
+            cache: &GpuKvCache,
+            out: &View,
+            t: usize,
+            pos: usize,
+        ) {
+            let c = &self.attention;
+            let s = &self.scratch;
+            let d = c.head_dim;
+            let kv_size = c.kv_heads * d;
+            let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
+            let (keys, values) = (whole(&s.mixed), at(&s.mixed, t * kv_size));
+            for (new, cached) in [(&keys, &cache.keys), (&values, &cache.values)] {
+                to_half(gpu, enc, new, &at_half(cached, pos * kv_size), t * kv_size);
+            }
+            if !self.on("attention") {
+                if self.on("attention o_proj") {
+                    self.mm(gpu, enc, &w.o, &y, out, t);
+                }
+                return;
+            }
             let cached = [whole(&cache.keys), whole(&cache.values)];
-            if self.exact {
-                enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows"));
+            let kernel = if self.exact_now() {
+                "attention_rows"
+            } else {
+                attention_half_kernel()
+            };
+            if self.exact_now() {
+                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q, &cached[0], &cached[1]]);
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
-                enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows_half"));
+                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q_half, &cached[0], &cached[1]]);
             }
             set_views(enc, 3, &[&q_and_gate, &y]);
@@ -1063,10 +1358,14 @@ mod mac {
                 scale: 1.0 / (d as f32).sqrt(),
             };
             params(enc, 5, &p);
-            // 4 heads of one kv head per threadgroup.
-            groups(enc, (t.div_ceil(8), c.heads / 4), 128);
+            // Heads of one kv head per threadgroup.
+            let heads = if kernel.ends_with('8') { 8 } else { 4 };
+            assert!((c.heads / c.kv_heads).is_multiple_of(heads));
+            groups(enc, (t.div_ceil(8), c.heads / heads), 32 * heads);
             self.record(gpu, enc, 2, &y, t * c.heads * d);
-            qmm(gpu, enc, &w.o, &y, out, t, self.exact);
+            if self.on("attention o_proj") {
+                self.mm(gpu, enc, &w.o, &y, out, t);
+            }
         }
 
         /// x += moe(normed) for `t` tokens.
@@ -1091,29 +1390,36 @@ mod mac {
                 &s.shared_out,
             ]
             .map(whole);
-            // Routing stays close to f32 so it picks the experts decode would.
-            qmm(gpu, enc, &layer.router, normed, &router, t, true);
-            qmm(
-                gpu,
-                enc,
-                &layer.shared_gate,
-                normed,
-                &shared_gate,
-                t,
-                self.exact,
-            );
-            qmm(gpu, enc, &layer.shared[0], normed, &sg, t, self.exact);
-            qmm(gpu, enc, &layer.shared[1], normed, &su, t, self.exact);
+            if self.on("router") {
+                // Routing stays close to f32 so it picks the experts decode
+                // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
+                if !self.exact_now() && fast_router() {
+                    self.mm(gpu, enc, &layer.router, normed, &router, t);
+                } else {
+                    qmm(gpu, enc, &layer.router, normed, &router, t, true);
+                }
+                self.mm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
+            }
             let silu_mul = gpu.pipeline("silu_mul_rows");
-            dispatch_1d(
-                enc,
-                &silu_mul,
-                &[(&s.shared_g, 0), (&s.shared_u, 0)],
-                t * layer.shared[0].rows,
-            );
-            self.record(gpu, enc, 3, &sg, t * layer.shared[0].rows);
-            qmm(gpu, enc, &layer.shared[2], &sg, &sd, t, self.exact);
+            if self.on("shared expert") {
+                self.mm(gpu, enc, &layer.shared[0], normed, &sg, t);
+                self.mm(gpu, enc, &layer.shared[1], normed, &su, t);
+                dispatch_1d(
+                    enc,
+                    &silu_mul,
+                    &[(&s.shared_g, 0), (&s.shared_u, 0)],
+                    t * layer.shared[0].rows,
+                );
+                self.record(gpu, enc, 3, &sg, t * layer.shared[0].rows);
+                self.mm(gpu, enc, &layer.shared[2], &sg, &sd, t);
+            }
 
+            // Fast mode runs the experts on qmm2, with its tile size.
+            let tile_rows = if self.exact_now() {
+                TILE
+            } else {
+                crate::qmm::tile_rows()
+            };
             let [ids, weights, order, rows, tiles, tile_count] = [
                 &s.ids,
                 &s.expert_weights,
@@ -1123,53 +1429,76 @@ mod mac {
                 &s.tile_count,
             ]
             .map(whole);
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_route"));
-            set_views(enc, 0, &[&router, &ids, &weights]);
-            let p = RouteParams {
-                experts: cfg.num_experts as u32,
-                top_k: top_k as u32,
-            };
-            params(enc, 3, &p);
-            groups(enc, (t, 1), 32);
+            if self.on("route, group") {
+                enc.set_compute_pipeline_state(&gpu.pipeline("moe_route"));
+                set_views(enc, 0, &[&router, &ids, &weights]);
+                let p = RouteParams {
+                    experts: cfg.num_experts as u32,
+                    top_k: top_k as u32,
+                };
+                params(enc, 3, &p);
+                groups(enc, (t, 1), 32);
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_group"));
-            set_views(enc, 0, &[&ids, &order, &rows, &tiles, &tile_count]);
-            let p = GroupParams {
-                pairs: (t * top_k) as u32,
-                top_k: top_k as u32,
-                experts: cfg.num_experts as u32,
-            };
-            params(enc, 5, &p);
-            groups(enc, (1, 1), 1024);
+                enc.set_compute_pipeline_state(&gpu.pipeline("moe_group"));
+                set_views(enc, 0, &[&ids, &order, &rows, &tiles, &tile_count]);
+                let p = GroupParams {
+                    pairs: (t * top_k) as u32,
+                    top_k: top_k as u32,
+                    experts: cfg.num_experts as u32,
+                    tile_rows: tile_rows as u32,
+                };
+                params(enc, 5, &p);
+                groups(enc, (1, 1), 1024);
+            }
 
             let g = Grouped {
                 tiles: &tiles,
                 rows: &rows,
                 tile_count: &tile_count,
-                max_tiles: (t * top_k).div_ceil(TILE) + cfg.num_experts,
+                max_tiles: (t * top_k).div_ceil(tile_rows) + cfg.num_experts,
             };
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
-            qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, self.exact);
-            qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, self.exact);
-            dispatch_1d(
-                enc,
-                &silu_mul,
-                &[(&s.expert_g, 0), (&s.expert_u, 0)],
-                t * top_k * e.size(),
-            );
-            self.record(gpu, enc, 4, &eg, t * top_k * e.size());
-            qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, self.exact);
+            let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
+            if self.on("experts gate, up") {
+                if self.exact_now() {
+                    qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
+                    qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
+                } else {
+                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
+                    qmm2_grouped(gpu, enc, &e.up, normed, &normed_half, &eu, &g, true);
+                }
+            }
+            if self.on("experts silu") {
+                dispatch_1d(
+                    enc,
+                    &silu_mul,
+                    &[(&s.expert_g, 0), (&s.expert_u, 0)],
+                    t * top_k * e.size(),
+                );
+                self.record(gpu, enc, 4, &eg, t * top_k * e.size());
+            }
+            if self.on("experts down") {
+                if self.exact_now() {
+                    qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, true);
+                } else {
+                    to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    qmm2_grouped(gpu, enc, &e.down, &eg, &expert_half, &eo, &g, false);
+                }
+            }
 
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_combine"));
-            set_views(enc, 0, &[x, &sd, &shared_gate, &eo, &order, &weights]);
-            let p = CombineParams {
-                dim: h as u32,
-                top_k: top_k as u32,
-            };
-            params(enc, 6, &p);
-            enc.dispatch_threads(MTLSize::new(h as u64, t as u64, 1), MTLSize::new(256, 1, 1));
+            if self.on("combine") {
+                enc.set_compute_pipeline_state(&gpu.pipeline("moe_combine"));
+                set_views(enc, 0, &[x, &sd, &shared_gate, &eo, &order, &weights]);
+                let p = CombineParams {
+                    dim: h as u32,
+                    top_k: top_k as u32,
+                };
+                params(enc, 6, &p);
+                enc.dispatch_threads(MTLSize::new(h as u64, t as u64, 1), MTLSize::new(256, 1, 1));
+            }
         }
     }
 
@@ -1255,6 +1584,44 @@ mod mac {
             times[runs / 2],
             tokens as f64 / times[runs / 2],
         );
+        Ok(())
+    }
+
+    /// Prints the GPU time per stage of a `tokens`-token prefill (see
+    /// `Prefill::profile`), after one warm-up run.
+    pub fn bench_profile(
+        dir: &std::path::Path,
+        tokens: usize,
+        chunk: usize,
+        exact: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = Config::load(dir)?;
+        let weights = Weights::open(dir)?;
+        let gpu = Gpu::new()?;
+        let capacity = tokens.next_multiple_of(KEY_BLOCK);
+        let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
+        prefill.exact = exact;
+        let prompt = test_tokens(tokens);
+        let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+        let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
+        prefill.run(&gpu, &prompt, 0, &states);
+        for s in &owned {
+            if let OwnedState::Linear(d) = s {
+                zero(&d.conv);
+                zero(&d.recurrent);
+            }
+        }
+        let times = prefill.profile(&gpu, &prompt, &states);
+        let total: f64 = times.iter().rev().take(2).map(|t| t.1).sum();
+        println!(
+            "prefill {tokens} tokens, chunk {}, exact {exact}: GPU {:.3} s ({:.0} tokens/s)",
+            prefill.chunk,
+            total,
+            tokens as f64 / total
+        );
+        for (stage, t) in &times {
+            println!("{stage:>22} {:8.1} ms {:5.1}%", t * 1e3, 100.0 * t / total);
+        }
         Ok(())
     }
 
@@ -1400,26 +1767,28 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn fast_prefill_matches_token_by_token() {
-            // The median token is off by 1e-2 at layer 20 of this prompt,
-            // with attention in half and some near-tie expert choices; MLX
-            // in bf16 is off by 1.6e-2 at layer 3. Bounds are about twice
-            // what was measured.
-            check_prefill(false, 3e-2, 0.1);
+            // With 128-row chunks on the half kernels a few near-tie tokens
+            // pick another expert at layer 0 and spread through attention:
+            // the median token peaks at 6.1e-2 (layer 26), state 7.4e-2,
+            // logits 4.2e-2. MLX in bf16 is off by 1.6e-2 at layer 3.
+            // Bounds are about twice what was measured.
+            check_prefill(false, 0.12, 0.1);
         }
 
-        /// 45 tokens in two calls (29 then 16) with chunks of 64 rounded
-        /// from 20: the hidden state after each layer and every layer state
+        /// 166 tokens in two calls (150 then 16) with chunks of 128 rounded
+        /// from 100, so the first call runs a 128-row chunk on the large-m
+        /// kernels and a 22-row one on qmm_few: the hidden state after each layer and every layer state
         /// must be within `bound` of the CPU fed one token at a time, the
         /// logits within `logits_bound`, with the same argmax.
         fn check_prefill(exact: bool, bound: f32, logits_bound: f32) {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
-            let tokens = test_tokens(45);
+            let tokens = test_tokens(166);
             let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
-            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 20).unwrap();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 100).unwrap();
             prefill.exact = exact;
-            let parts = [&tokens[..29], &tokens[29..]];
+            let parts = [&tokens[..150], &tokens[150..]];
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
@@ -1494,13 +1863,10 @@ mod mac {
                 println!(
                     "layer {l}: hidden rel rms {err:.2e}, median token {median:.2e}, state {state:.2e}"
                 );
-                // A token may pick another expert at a near tie (see the
-                // tests above), so the median token counts.
-                let state_bound = if exact { 2e-2 } else { 0.1 };
-                assert!(median < bound && state < state_bound, "layer {l}");
-                if exact {
-                    assert!(err < 3e-2, "layer {l}");
-                }
+                // The half path may pick another expert at a near tie for a
+                // token, as bf16 MLX does, so only the median token counts.
+                let hidden = if exact { err } else { median };
+                assert!(hidden < bound && state < bound * 1.25, "layer {l}");
             }
 
             let norm = weights
@@ -1522,6 +1888,71 @@ mod mac {
             if exact {
                 assert_eq!(argmax(&got), argmax(&want));
             }
+        }
+
+        /// verify gives the same rows with `exact` false as with true.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn verify_is_exact_in_fast_mode() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let n = cfg.num_layers();
+            let tokens = test_tokens(26);
+            let (prompt, draft) = tokens[..25].split_at(20);
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 64).unwrap();
+            prefill.enable_verify(&gpu, 5);
+            let mut rows = Vec::new();
+            for exact in [true, false] {
+                let mut model = GpuModel::load(&gpu, &cfg, &weights, n, 64).unwrap();
+                prefill.exact = true;
+                prefill.run(&gpu, prompt, 0, &model.states().collect::<Vec<_>>());
+                model.set_position(20);
+                prefill.exact = exact;
+                let v = prefill.verify(&gpu, draft, 20, &model.states().collect::<Vec<_>>(), None);
+                rows.push(contents::<f32>(&v.logits.buffer, draft.len() * cfg.vocab_size).to_vec());
+            }
+            assert!(rows[0] == rows[1]);
+        }
+
+        /// Fast prefill of 1100 tokens in chunks of 1024 against exact
+        /// prefill, which check_prefill holds to the CPU. A 1024-token chunk
+        /// gives about 32 rows per expert, so this covers the large-m and
+        /// gather kernels the short tests leave to qmm_few.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn fast_matches_exact_long() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let tokens = test_tokens(1100);
+            let h = cfg.hidden_size;
+            let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
+            let mut runs = Vec::new();
+            for exact in [true, false] {
+                let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
+                prefill.exact = exact;
+                let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+                let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
+                let (logits, x) = prefill.run_hidden(&gpu, &tokens, 0, &states);
+                runs.push((logits, contents::<f32>(&x, tokens.len() * h).to_vec()));
+            }
+            let [(want_logits, want), (got_logits, got)] = [&runs[0], &runs[1]];
+            let mut per_token: Vec<f32> = got
+                .chunks_exact(h)
+                .zip(want.chunks_exact(h))
+                .map(|(g, w)| rel_rms(g, w))
+                .collect();
+            per_token.sort_by(f32::total_cmp);
+            let median = per_token[per_token.len() / 2];
+            let worst = per_token[per_token.len() - 1];
+            let logits = rel_rms(got_logits, want_logits);
+            println!(
+                "fast vs exact, 1100 tokens: hidden median token {median:.2e}, worst {worst:.2e}, logits {logits:.2e}, argmax {} vs {}",
+                argmax(got_logits),
+                argmax(want_logits)
+            );
+            // fast_prefill_matches_token_by_token measures a median of 2e-4
+            // to 2.5e-3 at layer 39 of a short prompt.
+            assert!(median < 2e-2 && logits < 5e-2);
         }
 
         /// Prefill into a GpuModel's states, then decode with it: the logits

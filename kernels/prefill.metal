@@ -714,6 +714,193 @@ kernel void delta_rows(device const float *mixed [[buffer(0)]],
     }
 }
 
+// conv_rows with one thread per (channel, token), all tokens at once, then
+// conv_state moves the last kernel_size - 1 inputs into the state. Input i
+// of the window is x[i] for i >= 0, else state row i + kernel_size - 1.
+inline float prefill_conv_in(device const float *x, device const float *state, int i, uint c,
+                             constant ConvRowsParams &p) {
+    return i >= 0 ? x[ulong(i) * p.channels + c] : state[uint(i + int(p.kernel_size) - 1) * p.channels + c];
+}
+
+kernel void conv_rows2(device const float *x [[buffer(0)]],
+                       device const float *w [[buffer(1)]],
+                       device const float *state [[buffer(2)]],
+                       device float *out [[buffer(3)]],
+                       constant ConvRowsParams &p [[buffer(4)]],
+                       device float *snaps [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.x, t = gid.y;
+    if (c >= p.channels || t >= p.tokens) {
+        return;
+    }
+    int past = int(p.kernel_size) - 1;
+    device const float *wc = w + c * p.kernel_size;
+    float acc = 0;
+    for (int j = 0; j <= past; j++) {
+        acc += wc[j] * prefill_conv_in(x, state, int(t) - past + j, c, p);
+    }
+    out[ulong(t) * p.channels + c] = silu(acc);
+    if (p.snapshots) {
+        device float *snap = snaps + ulong(t) * uint(past) * p.channels;
+        for (int j = 0; j < past; j++) {
+            snap[uint(j) * p.channels + c] = prefill_conv_in(x, state, int(t) - past + 1 + j, c, p);
+        }
+    }
+}
+
+kernel void conv_state(device const float *x [[buffer(0)]],
+                       device float *state [[buffer(2)]],
+                       constant ConvRowsParams &p [[buffer(4)]],
+                       uint c [[thread_position_in_grid]]) {
+    if (c >= p.channels) {
+        return;
+    }
+    int past = int(p.kernel_size) - 1;
+    float last[8];
+    for (int j = 0; j < past; j++) {
+        last[j] = prefill_conv_in(x, state, int(p.tokens) - past + j, c, p);
+    }
+    for (int j = 0; j < past; j++) {
+        state[uint(j) * p.channels + c] = last[j];
+    }
+}
+
+// delta_rows in two steps. delta_prep runs over all tokens at once: q and
+// k of each k head are normalized in place in `mixed` (q also scaled by
+// 1/sqrt(K_DIM)), and a and b become the decay g and the rate beta. Then
+// delta_rows2 walks the tokens with only the state update left, 8 lanes per
+// state row of 16 values each, loading token t + 1 while it computes t.
+kernel void delta_prep(device float *mixed [[buffer(0)]],
+                       device float *a [[buffer(1)]],
+                       device float *b [[buffer(2)]],
+                       device const float *a_log [[buffer(3)]],
+                       device const float *dt_bias [[buffer(4)]],
+                       constant DeltaRowsParams &p [[buffer(5)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K_DIM = 128;
+    uint t = tg.x;
+    uint head = tg.y;  // q heads, then k heads, then v heads for g, beta
+    if (head < 2 * p.k_heads) {
+        device float4 *v = (device float4 *)(mixed + ulong(t) * p.channels + head * K_DIM) + lane;
+        float4 x = *v;
+        float ss = simd_sum(dot(x, x));
+        float scale = head < p.k_heads ? 1.0f / sqrt(float(K_DIM)) : 1.0f;
+        *v = x * (scale / sqrt(ss + p.eps));
+    } else {
+        uint h = head - 2 * p.k_heads + lane * (p.v_heads / 32);
+        for (uint i = 0; i < p.v_heads / 32; i++, h++) {
+            ulong at = ulong(t) * p.v_heads + h;
+            float x = a[at] + dt_bias[h];
+            float softplus = max(x, 0.0f) + log(1.0f + exp(-abs(x)));
+            a[at] = exp(-exp(a_log[h]) * softplus);
+            b[at] = sigmoid(b[at]);
+        }
+    }
+}
+
+kernel void delta_rows2(device const float *mixed [[buffer(0)]],
+                        device const float *g [[buffer(1)]],
+                        device const float *beta [[buffer(2)]],
+                        device float *state [[buffer(5)]],
+                        device float *y [[buffer(6)]],
+                        constant DeltaRowsParams &p [[buffer(7)]],
+                        device float *snaps [[buffer(8)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint simd [[simdgroup_index_in_threadgroup]],
+                        uint simds [[simdgroups_per_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K_DIM = 128;
+    constexpr uint PER = 16;
+    uint h = tg.y;
+    uint row = (tg.x * simds + simd) * 4 + lane / 8;
+    uint part = lane % 8;
+    if (row >= p.v_dim) {
+        return;
+    }
+    uint kh = h / (p.v_heads / p.k_heads);
+    uint key_size = p.k_heads * K_DIM;
+    uint value_size = p.v_heads * p.v_dim;
+
+    device float *sp = state + (ulong(h) * p.v_dim + row) * K_DIM + part * PER;
+    float st[PER];
+    for (uint i = 0; i < PER; i++) {
+        st[i] = sp[i];
+    }
+
+    device const float *qp = mixed + kh * K_DIM + part * PER;
+    device const float *kp = qp + key_size;
+    device const float *vp = mixed + 2 * key_size + h * p.v_dim + row;
+    float4 nq[PER / 4], nk[PER / 4];
+    float nv = 0, ng = 0, nb = 0;
+    if (p.tokens > 0) {
+        for (uint i = 0; i < PER / 4; i++) {
+            nq[i] = ((device const float4 *)qp)[i];
+            nk[i] = ((device const float4 *)kp)[i];
+        }
+        nv = vp[0];
+        ng = g[h];
+        nb = beta[h];
+    }
+    for (uint t = 0; t < p.tokens; t++) {
+        float4 q[PER / 4], k[PER / 4];
+        for (uint i = 0; i < PER / 4; i++) {
+            q[i] = nq[i];
+            k[i] = nk[i];
+        }
+        float v = nv, gt = ng, bt = nb;
+        if (t + 1 < p.tokens) {
+            ulong o = ulong(t + 1) * p.channels;
+            for (uint i = 0; i < PER / 4; i++) {
+                nq[i] = ((device const float4 *)(qp + o))[i];
+                nk[i] = ((device const float4 *)(kp + o))[i];
+            }
+            nv = vp[o];
+            ng = g[(t + 1) * p.v_heads + h];
+            nb = beta[(t + 1) * p.v_heads + h];
+        }
+
+        float mem = 0;
+        for (uint i = 0; i < PER / 4; i++) {
+            float4 s4 = float4(st[4 * i], st[4 * i + 1], st[4 * i + 2], st[4 * i + 3]) * gt;
+            st[4 * i] = s4.x;
+            st[4 * i + 1] = s4.y;
+            st[4 * i + 2] = s4.z;
+            st[4 * i + 3] = s4.w;
+            mem += dot(s4, k[i]);
+        }
+        mem += simd_shuffle_xor(mem, 1);
+        mem += simd_shuffle_xor(mem, 2);
+        mem += simd_shuffle_xor(mem, 4);
+        float delta = (v - mem) * bt;
+        float out = 0;
+        for (uint i = 0; i < PER / 4; i++) {
+            float4 s4 = float4(st[4 * i], st[4 * i + 1], st[4 * i + 2], st[4 * i + 3]) + k[i] * delta;
+            st[4 * i] = s4.x;
+            st[4 * i + 1] = s4.y;
+            st[4 * i + 2] = s4.z;
+            st[4 * i + 3] = s4.w;
+            out += dot(s4, q[i]);
+        }
+        out += simd_shuffle_xor(out, 1);
+        out += simd_shuffle_xor(out, 2);
+        out += simd_shuffle_xor(out, 4);
+        if (part == 0) {
+            y[ulong(t) * value_size + h * p.v_dim + row] = out;
+        }
+        if (p.snapshots) {
+            device float *snap = snaps + ulong(t) * p.v_heads * p.v_dim * K_DIM +
+                                 (ulong(h) * p.v_dim + row) * K_DIM + part * PER;
+            for (uint i = 0; i < PER; i++) {
+                snap[i] = st[i];
+            }
+        }
+    }
+    for (uint i = 0; i < PER; i++) {
+        sp[i] = st[i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Causal attention of T new tokens over the KV cache, which already holds
 // them at positions pos .. pos + T - 1. A simdgroup takes 8 query tokens of
@@ -875,6 +1062,155 @@ kernel void attention_rows(device const T *q [[buffer(0)]],
 template [[host_name("attention_rows")]] kernel decltype(attention_rows<float>) attention_rows<float>;
 template [[host_name("attention_rows_half")]] kernel decltype(attention_rows<half>) attention_rows<half>;
 
+// attention_rows over a half cache, with q held in registers for the whole
+// key loop and 64 keys per block, SIMDS heads of one kv head per
+// threadgroup. T is the type of q and of the
+// probabilities; the products accumulate in f32.
+constant uint PREFILL_ATT2_KB = 64;
+
+template <typename T>
+inline simdgroup_matrix<T, 8, 8> prefill_att2_widen(simdgroup_half8x8 m) {
+    simdgroup_matrix<T, 8, 8> r;
+    thread auto &re = r.thread_elements();
+    thread auto &me = m.thread_elements();
+    re[0] = T(me[0]);
+    re[1] = T(me[1]);
+    return r;
+}
+
+template <typename T, uint SIMDS>
+kernel void attention_rows2(device const T *q [[buffer(0)]],
+                            device const half *keys [[buffer(1)]],
+                            device const half *values [[buffer(2)]],
+                            device const float *q_and_gate [[buffer(3)]],
+                            device float *out [[buffer(4)]],
+                            constant PrefillAttentionParams &p [[buffer(5)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint simd [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint KB = PREFILL_ATT2_KB;
+    constexpr uint D = PREFILL_ATT_DIM;
+    threadgroup float s_all[SIMDS][8 * KB];
+    threadgroup T p_all[SIMDS][8 * KB];
+    threadgroup float a_all[SIMDS][8];
+    threadgroup float *sc = s_all[simd];
+    threadgroup T *pt = p_all[simd];
+    threadgroup float *al = a_all[simd];
+
+    uint h = tg.y * SIMDS + simd;
+    uint kv = h / (p.heads / p.kv_heads);
+    uint q0 = tg.x * 8;
+    uint q_stride = p.heads * D;
+    uint kv_stride = p.kv_heads * D;
+    device const half *kh = keys + kv * D;
+    device const half *vh = values + kv * D;
+    uint end = p.pos + min(q0 + 8, p.tokens);
+
+    simdgroup_matrix<T, 8, 8> qm[D / 8];
+    {
+        device const T *qh = q + ulong(q0) * q_stride + h * D;
+        for (uint d = 0; d < D / 8; d++) {
+            simdgroup_load(qm[d], qh + 8 * d, q_stride);
+        }
+    }
+
+    // For the softmax, lane l handles row l / 4, columns (l % 4) * 16 .. + 16
+    // of the scores. In the matrices it holds row fp.x.
+    constexpr uint PER = KB / 4;
+    uint r = lane / 4;
+    uint c0 = (lane % 4) * PER;
+    uint last = p.pos + q0 + r;  // the newest key this row may see
+    uint2 fp = frag_pos(lane);
+    float m = -INFINITY;
+    float l = 0;
+
+    simdgroup_float8x8 o[D / 8];
+    for (uint i = 0; i < D / 8; i++) {
+        o[i] = simdgroup_float8x8(0);
+    }
+
+    for (uint k0 = 0; k0 < end; k0 += KB) {
+        simdgroup_float8x8 s[KB / 8];
+        for (uint j = 0; j < KB / 8; j++) {
+            s[j] = simdgroup_float8x8(0);
+        }
+        for (uint d = 0; d < D / 8; d++) {
+            for (uint j = 0; j < KB / 8; j++) {
+                simdgroup_half8x8 km;
+                simdgroup_load(km, kh + ulong(k0 + 8 * j) * kv_stride + 8 * d, kv_stride, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s[j], qm[d], prefill_att2_widen<T>(km), s[j]);
+            }
+        }
+        for (uint j = 0; j < KB / 8; j++) {
+            simdgroup_store(s[j], sc + 8 * j, KB);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float v[PER];
+        float bm = -INFINITY;
+        for (uint i = 0; i < PER; i++) {
+            uint key = k0 + c0 + i;
+            v[i] = key <= last && key < end ? sc[r * KB + c0 + i] * p.scale : -INFINITY;
+            bm = max(bm, v[i]);
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 2));
+        float m_new = max(m, bm);
+        float sum = 0;
+        for (uint i = 0; i < PER; i++) {
+            float e = exp(v[i] - m_new);
+            pt[r * KB + c0 + i] = T(e);
+            sum += e;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        float alpha = exp(m - m_new);
+        l = l * alpha + sum;
+        m = m_new;
+        if (lane % 4 == 0) {
+            al[r] = alpha;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float a = al[fp.x];
+        simdgroup_matrix<T, 8, 8> pm[KB / 8];
+        for (uint j = 0; j < KB / 8; j++) {
+            simdgroup_load(pm[j], pt + 8 * j, KB);
+        }
+        for (uint d = 0; d < D / 8; d++) {
+            thread auto &oe = o[d].thread_elements();
+            oe[0] *= a;
+            oe[1] *= a;
+            for (uint j = 0; j < KB / 8; j++) {
+                simdgroup_half8x8 vm;
+                simdgroup_load(vm, vh + ulong(k0 + 8 * j) * kv_stride + 8 * d, kv_stride);
+                simdgroup_multiply_accumulate(o[d], pm[j], prefill_att2_widen<T>(vm), o[d]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Lane l writes row l / 4, two values per 8 x 8 block.
+    float inv = 1.0f / l;
+    uint row_t = q0 + r;
+    for (uint d = 0; d < D / 8; d++) {
+        simdgroup_store(o[d], sc, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (row_t < p.tokens) {
+            for (uint i = (lane % 4) * 2; i < (lane % 4) * 2 + 2; i++) {
+                uint col = 8 * d + i;
+                float gate = q_and_gate[ulong(row_t) * 2 * q_stride + h * 2 * D + D + col];
+                out[ulong(row_t) * q_stride + h * D + col] = sc[r * 8 + i] * inv * sigmoid(gate);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template [[host_name("attention_rows2")]] kernel decltype(attention_rows2<float, 4>) attention_rows2<float, 4>;
+template [[host_name("attention_rows2_half")]] kernel decltype(attention_rows2<half, 4>) attention_rows2<half, 4>;
+template [[host_name("attention_rows2_half8")]] kernel decltype(attention_rows2<half, 8>) attention_rows2<half, 8>;
+
 kernel void to_half(device const float *x [[buffer(0)]],
                     device half *y [[buffer(1)]],
                     uint i [[thread_position_in_grid]]) {
@@ -951,6 +1287,7 @@ struct GroupParams {
     uint pairs;  // tokens * top_k
     uint top_k;
     uint experts;
+    uint tile_rows;  // rows per tile at most
 };
 
 // One threadgroup sorts the (token, slot) pairs by expert. For each pair i:
@@ -982,8 +1319,8 @@ kernel void moe_group(device const uint *ids [[buffer(0)]],
         for (uint e = 0; e < p.experts; e++) {
             uint count = atomic_load_explicit(&counts[e], memory_order_relaxed);
             offsets[e] = offset;
-            for (uint s = 0; s < count; s += PREFILL_MM_BM) {
-                tiles[n++] = uint4(e, offset + s, min(PREFILL_MM_BM, count - s), 0);
+            for (uint s = 0; s < count; s += p.tile_rows) {
+                tiles[n++] = uint4(e, offset + s, min(p.tile_rows, count - s), 0);
             }
             offset += count;
             atomic_store_explicit(&counts[e], 0, memory_order_relaxed);
