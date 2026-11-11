@@ -202,6 +202,11 @@ mod mac {
     /// Up to this many rows, qmm uses qmm_few: weights are read once per 8
     /// rows of x instead of computing a 64-row tile.
     const FEW_MAX: usize = 64;
+    /// x rows per qmm_few threadgroup; must match PREFILL_FEW.
+    const FEW: usize = 8;
+    /// y columns per qmm_few threadgroup: 2 simdgroups of 4.
+    const FEW_OUT: usize = 8;
+
     /// Rows per pass of encode_few_experts: the rows kernels take 8.
     const FEW_MOE_ROWS: usize = crate::rows::MAX_ROWS;
     /// Simdgroups of moe_gate_up_mma3 and moe_down_mma3, as rows::MOE_SPLIT.
@@ -218,11 +223,6 @@ mod mac {
                 .unwrap_or(64)
         })
     }
-
-    /// x rows per qmm_few threadgroup; must match PREFILL_FEW.
-    const FEW: usize = 8;
-    /// y columns per qmm_few threadgroup: 2 simdgroups of 4.
-    const FEW_OUT: usize = 8;
 
     fn few_pipeline(gpu: &Gpu, w: &GpuQuant) -> metal::ComputePipelineState {
         match w.bits {
