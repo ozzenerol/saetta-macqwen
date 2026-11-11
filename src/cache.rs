@@ -8,6 +8,7 @@
 use crate::cpu::deltanet::DeltaNetState;
 use crate::cpu::model::LayerState;
 use crate::server::Model;
+use crate::speculative::Decider;
 
 /// Saved snapshots by default: about 1 GB with the 66 MB states of the 35B model.
 pub const DEFAULT_LIMIT: usize = 16;
@@ -187,6 +188,13 @@ impl<M: Model + Restore> Model for Cached<M> {
     fn step(&mut self, token: u32) -> Vec<f32> {
         self.tokens.push(token);
         self.model.step(token)
+    }
+
+    fn speculate(&mut self, pending: u32, decide: &mut dyn Decider) -> (Vec<u32>, u32) {
+        let (accepted, next) = self.model.speculate(pending, decide);
+        self.tokens.push(pending);
+        self.tokens.extend(&accepted);
+        (accepted, next)
     }
 
     /// Saves the state being left, then goes back to the longest snapshot

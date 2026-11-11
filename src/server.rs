@@ -8,6 +8,7 @@
 
 use crate::chat::{self, Message, Options};
 use crate::sample::{Params, Sampler};
+use crate::speculative::{Decider, Sampled};
 use crate::tokenizer::Tokenizer;
 use crate::toolcall;
 use serde_json::{Value, json};
@@ -28,6 +29,13 @@ pub trait Model: Send {
     /// holds now. At 0 the server resets the model.
     fn truncate(&mut self, len: usize) -> usize;
     fn reset(&mut self);
+    /// Runs `pending` and returns the tokens decided after it: tokens the
+    /// state already holds, and the next token, which it does not. A model
+    /// with a drafter returns several tokens per call.
+    fn speculate(&mut self, pending: u32, decide: &mut dyn Decider) -> (Vec<u32>, u32) {
+        let logits = self.step(pending);
+        (Vec::new(), decide.pick(&logits))
+    }
 }
 
 pub struct Settings {
@@ -243,8 +251,11 @@ impl<M: Model + 'static> Server<M> {
     /// when the client has gone.
     fn generate(&self, r: &ChatRequest, mut emit: impl FnMut(Event) -> bool) -> Done {
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut logits, cached) = engine.start(&r.prompt);
-        let mut sampler = Sampler::new(r.seed);
+        let (logits, cached) = engine.start(&r.prompt);
+        let mut decide = Sampled {
+            params: r.sampling,
+            sampler: Sampler::new(r.seed),
+        };
         let mut output = Output::new(r.thinking, &r.tools, &r.id);
         let mut done = Done {
             prompt_tokens: r.prompt.len(),
@@ -254,22 +265,41 @@ impl<M: Model + 'static> Server<M> {
             tool_calls: 0,
         };
 
-        loop {
+        // Emits one decided token; false when generation ends here.
+        let mut take = |token: u32, done: &mut Done| -> Take {
             if done.completion_tokens == r.max_tokens {
                 done.hit_limit = true;
-                break;
+                return Take::Stop;
             }
-            let token = sampler.sample(&logits, &r.sampling);
             done.completion_tokens += 1;
             if self.settings.eos_token_ids.contains(&token) {
-                break;
+                return Take::Stop;
             }
             let events = output.push(token, &self.tokenizer, &self.special);
-            if !self.emit_all(events, &mut emit, &mut done) {
-                return done;
+            if !self.emit_all(events, &mut emit, done) {
+                return Take::Gone;
             }
-            logits = engine.model.step(token);
-            engine.tokens.push(token);
+            Take::Go
+        };
+
+        let mut pending = decide.pick(&logits);
+        'outer: loop {
+            match take(pending, &mut done) {
+                Take::Go => {}
+                Take::Stop => break,
+                Take::Gone => return done,
+            }
+            let (accepted, next) = engine.model.speculate(pending, &mut decide);
+            engine.tokens.push(pending);
+            engine.tokens.extend(&accepted);
+            for t in accepted {
+                match take(t, &mut done) {
+                    Take::Go => {}
+                    Take::Stop => break 'outer,
+                    Take::Gone => return done,
+                }
+            }
+            pending = next;
         }
         let events = output.finish();
         self.emit_all(events, &mut emit, &mut done);
@@ -292,6 +322,12 @@ impl<M: Model + 'static> Server<M> {
         }
         true
     }
+}
+
+enum Take {
+    Go,
+    Stop,
+    Gone,
 }
 
 impl<M: Model> Engine<M> {
