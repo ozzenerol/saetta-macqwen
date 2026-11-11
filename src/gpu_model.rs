@@ -767,7 +767,14 @@ mod mac {
                 let (c, g) = (argmax(&cpu_logits), argmax(&gpu_logits));
                 let err = rel_rms(&gpu_logits, &cpu_logits);
                 println!("token {i}: cpu {c}, gpu {g}, rel rms {err:.2e}");
-                assert!(err < 1e-4);
+                // A key or value that rounds to the next code moves by a
+                // step: 1e-3 of the logits at 8 bits.
+                let bound = match bits {
+                    KvBits::Half => 1e-4,
+                    KvBits::Eight => 1e-2,
+                    KvBits::Four => 5e-2,
+                };
+                assert!(err < bound);
                 assert_eq!(c, g, "token {i}");
                 cpu_logits = cpu.forward(c, &mut states).unwrap();
                 gpu_logits = model.forward(c);

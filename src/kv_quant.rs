@@ -104,6 +104,18 @@ pub fn dequantize(data: &[u32], scales: &[f16], biases: &[f16], bits: KvBits) ->
     out
 }
 
+/// How much looser than for a half cache a test of `bits` bounds the
+/// difference to the CPU: the CPU and GPU round slightly different keys,
+/// and a key that lands on the next code moves by one step, about 4e-3 of
+/// its group's range at 8 bits and 7e-2 at 4.
+pub fn test_slack(bits: KvBits) -> f32 {
+    match bits {
+        KvBits::Half => 1.0,
+        KvBits::Eight => 4.0,
+        KvBits::Four => 16.0,
+    }
+}
+
 /// x after a round trip through the cache and the half copy that prefill
 /// attention reads a quantized cache through.
 pub fn round_trip_as_half(x: &[f32], bits: KvBits) -> Vec<f32> {

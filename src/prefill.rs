@@ -1433,9 +1433,11 @@ mod mac {
         }
 
         /// Prefill over an 8-bit and a 4-bit KV cache against the CPU storing
-        /// its cache the same way and reading it through half, with the bounds
-        /// of the half cache. The codes match the CPU's (tests/kv_quant.rs),
-        /// so what is left is f32 rounding and near-tie expert flips.
+        /// its cache the same way and reading it through half. The codes match
+        /// the CPU's for the same input (tests/kv_quant.rs); here the inputs
+        /// differ by f32 rounding, so a value now and then lands on the next
+        /// code, and the bounds are the half cache's times
+        /// kv_quant::test_slack (8 bits: logits 1.3e-2, median token 2e-3).
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn quantized_prefill_matches_token_by_token() {
@@ -1467,6 +1469,8 @@ mod mac {
         /// must be within `bound` of the CPU fed one token at a time, the
         /// logits within `logits_bound`, with the same argmax.
         fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) {
+            let slack = crate::kv_quant::test_slack(bits);
+            let (bound, logits_bound) = (bound * slack, logits_bound * slack);
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
@@ -1564,10 +1568,10 @@ mod mac {
                 );
                 // A token may pick another expert at a near tie (see the
                 // tests above), so the median token counts.
-                let state_bound = if exact { 2e-2 } else { 0.1 };
+                let state_bound = if exact { 2e-2 * slack } else { 0.1 };
                 assert!(median < bound && state < state_bound, "layer {l}");
                 if exact {
-                    assert!(err < 3e-2, "layer {l}");
+                    assert!(err < 3e-2 * slack, "layer {l}");
                 }
             }
 
