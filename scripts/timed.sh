@@ -6,7 +6,7 @@
 # this run made it.
 #   ~/saetta/timed.sh <who> <command...>      (on the Mac)
 #   TIMED_PRIORITY=1 ~/saetta/timed.sh <who> <command...>
-# It waits for the battery to reach TIMED_MIN_BATTERY (default 40%) first.
+# It waits for the battery to reach TIMED_MIN_BATTERY (default 12%) first.
 set -u
 who=$1
 shift
@@ -39,9 +39,9 @@ rm -f "$ticket"
 echo "$who pid $$ since $(date +%T)" > "$lock/owner"
 
 # Below about 10% battery the Mac slows down, so timings would be wrong.
-# Wait, holding the lock, until the battery is back to TIMED_MIN_BATTERY.
+# Wait, holding the lock, while the battery is below TIMED_MIN_BATTERY.
 battery() { pmset -g batt | grep -o '[0-9]*%' | tr -d %; }
-min=${TIMED_MIN_BATTERY:-40}
+min=${TIMED_MIN_BATTERY:-12}
 while [ "$(battery)" -lt "$min" ]; do
     echo "battery $(battery)%, waiting for $min% before running" >&2
     echo "$who pid $$ since $(date +%T), waiting for battery" > "$lock/owner"
