@@ -104,6 +104,15 @@ pub fn dequantize(data: &[u32], scales: &[f16], biases: &[f16], bits: KvBits) ->
     out
 }
 
+/// x after a round trip through the cache and the half copy that prefill
+/// attention reads a quantized cache through.
+pub fn round_trip_as_half(x: &[f32], bits: KvBits) -> Vec<f32> {
+    round_trip(x, bits)
+        .iter()
+        .map(|&v| f16::from_f32(v).to_f32())
+        .collect()
+}
+
 /// x after a round trip through the cache, as the CPU reference stores it.
 pub fn round_trip(x: &[f32], bits: KvBits) -> Vec<f32> {
     if bits == KvBits::Half {

@@ -36,6 +36,9 @@ pub struct KvCache {
     /// Round keys and values as they are stored, as the GPU cache does, so
     /// the two can be compared tightly.
     rounding: Option<crate::kv_quant::KvBits>,
+    /// Round the values read back to half as well, as prefill reads a
+    /// quantized cache.
+    as_half: bool,
 }
 
 impl KvCache {
@@ -47,6 +50,13 @@ impl KvCache {
     /// Stores the keys and values from now on as a cache of `bits` would.
     pub fn round_to(&mut self, bits: crate::kv_quant::KvBits) {
         self.rounding = Some(bits);
+    }
+
+    /// As `round_to`, with the values then rounded to half, as the GPU
+    /// prefill reads them.
+    pub fn round_to_as_half(&mut self, bits: crate::kv_quant::KvBits) {
+        self.rounding = Some(bits);
+        self.as_half = true;
     }
 
     pub fn len(&self) -> usize {
@@ -119,8 +129,13 @@ pub fn attention_at(
     }
     let mut v = v;
     if let Some(bits) = cache.rounding {
-        k = crate::kv_quant::round_trip(&k, bits);
-        v = crate::kv_quant::round_trip(&v, bits);
+        let round = if cache.as_half {
+            crate::kv_quant::round_trip_as_half
+        } else {
+            crate::kv_quant::round_trip
+        };
+        k = round(&k, bits);
+        v = round(&v, bits);
     }
     cache.keys.extend_from_slice(&k);
     cache.values.extend_from_slice(&v);

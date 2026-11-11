@@ -1426,10 +1426,11 @@ mod mac {
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
-            // The CPU stores its keys and values as the GPU cache does.
+            // The CPU stores its keys and values as the GPU cache does, and
+            // reads a quantized one through half as prefill does.
             for s in &mut cpu_states {
                 if let LayerState::Full(c) = s {
-                    c.round_to(bits);
+                    c.round_to_as_half(bits);
                 }
             }
             let gpu_states = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
