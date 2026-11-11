@@ -205,16 +205,20 @@ mod mac {
     /// rows of x instead of computing a 64-row tile.
     const FEW_MAX: usize = 64;
 
-    /// The FEW_MAX of the fast (qmm_dq) dense products: SAETTA_FEW_MAX=<n>
-    /// sends more than n rows to the 64-row tiles, which read the weights
-    /// once where qmm_few reads them once per 8 rows. At most FEW_MAX.
+    /// The FEW_MAX of the fast (qmm_dq) dense products: more rows go to the
+    /// 64-row tiles, which read the weights once where qmm_few reads them
+    /// once per 8 rows. bench-prefill (batch 6): qmm_few wins at 17 tokens
+    /// (0.093 against 0.110 s), qmm_dq at 48 (0.142 against 0.186 s); the
+    /// lines cross near 26. SAETTA_FEW_MAX=<n> sets it, at most FEW_MAX.
+    const FAST_FEW_MAX: usize = 24;
+
     fn fast_few_max() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
             std::env::var("SAETTA_FEW_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .map_or(FEW_MAX, |n: usize| n.min(FEW_MAX))
+                .map_or(FAST_FEW_MAX, |n: usize| n.min(FEW_MAX))
         })
     }
     /// x rows per qmm_few threadgroup; must match PREFILL_FEW.
