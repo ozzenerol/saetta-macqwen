@@ -363,12 +363,26 @@ mod mac {
                 rows: m as u32,
                 chunks: chunks as u32,
             }]);
+            let kernel = match ATTENTION_ROWS_DIAG.load(std::sync::atomic::Ordering::Relaxed) {
+                1 => "attention_partial_rows_nos",
+                2 => "attention_partial_rows_nov",
+                _ => "attention_partial_rows",
+            };
             plan.op(
-                "attention_partial_rows",
+                kernel,
                 &[q, keys, values, &self.part_o, &self.part_ml, &p, &params[0]],
                 MTLSize::new(chunks as u64, self.kv_heads as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
+            if REDUCE_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
+                plan.op(
+                    "attention_reduce_rows",
+                    &[&self.part_o, &self.part_ml, q_and_gate, out, &p, &params[0]],
+                    MTLSize::new(self.heads as u64, m as u64, 1),
+                    MTLSize::new(1024, 1, 1),
+                );
+                return;
+            }
             let p = plan.constant(&[DecodeParams {
                 heads: self.heads as u32,
                 kv_heads: self.kv_heads as u32,
@@ -402,6 +416,13 @@ mod mac {
             }
         }
     }
+
+    /// Timing only: 1 drops the score loop, 2 the value loop.
+    pub static ATTENTION_ROWS_DIAG: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    /// Use attention_reduce_rows, one launch for all rows.
+    pub static REDUCE_ROWS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// Simdgroups per threadgroup of moe_gate_up_mma3 and moe_down_mma3.
     pub static MOE_SPLIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8);
@@ -567,6 +588,89 @@ mod mac {
             (0..m * cols)
                 .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
                 .collect()
+        }
+
+        /// attention_partial_rows plus the per-row reduce against decode
+        /// attention run once per row, on made-up queries and caches, then
+        /// the time of both at a few context lengths. No model needed; take
+        /// the bench lock (timed.sh).
+        #[test]
+        #[ignore = "a timing run"]
+        fn attention_rows_match_decode_and_time() {
+            use crate::attention::DecodeAttention;
+            use crate::plan::TokenParams;
+            let gpu = Gpu::new().unwrap();
+            let (heads, kv_heads, dim) = (16, 2, 256);
+            let fill = |n: usize, seed: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| (((i * 7919 + seed * 104729) % 2003) as f32 / 2003.0 - 0.5) * 2.0)
+                    .collect()
+            };
+            for ctx in [40, 1024, 8192, 32768] {
+                let capacity = (ctx + MAX_ROWS).next_multiple_of(128);
+                let keys = View::new(gpu.buffer_from(&fill(capacity * kv_heads * dim, 1)));
+                let values = View::new(gpu.buffer_from(&fill(capacity * kv_heads * dim, 2)));
+                let q = View::new(gpu.buffer_from(&fill(MAX_ROWS * heads * dim, 3)));
+                let qg = View::new(gpu.buffer_from(&fill(MAX_ROWS * heads * 2 * dim, 4)));
+                let out = View::new(gpu.buffer(MAX_ROWS * heads * dim * 4));
+                let want = View::new(gpu.buffer(MAX_ROWS * heads * dim * 4));
+                let pos = ctx - 1;
+                let at = |v: &View, floats: usize| View {
+                    buffer: v.buffer.clone(),
+                    offset: v.offset + (floats * 4) as u64,
+                };
+                let row_params: Vec<View> = (0..MAX_ROWS)
+                    .map(|r| View::new(gpu.buffer_from(&[TokenParams::new(0, (pos + r) as u32)])))
+                    .collect();
+                let rows = AttentionRows::new(&gpu, heads, kv_heads, capacity, MAX_ROWS);
+                let decode = DecodeAttention::new(&gpu, heads, kv_heads, dim, capacity);
+                for (diag, reduce) in [(0, false), (0, true), (1, true), (2, true)] {
+                    ATTENTION_ROWS_DIAG.store(diag, std::sync::atomic::Ordering::Relaxed);
+                    REDUCE_ROWS.store(reduce, std::sync::atomic::Ordering::Relaxed);
+                    let what = ["all", "no scores", "no values"][diag];
+                    let mut line = format!("ctx {ctx:>5} {what:>9}, one reduce {reduce:>5}:");
+                    for m in [1, 2, 4, 8] {
+                        // The reference: one decode attention per row.
+                        let mut want_ms = 0.0;
+                        for r in 0..m {
+                            let mut plan = Plan::new(&gpu);
+                            plan.set_params(TokenParams::new(0, (pos + r) as u32));
+                            let o = at(&want, r * heads * dim);
+                            decode.record(
+                                &mut plan,
+                                &at(&q, r * heads * dim),
+                                &keys,
+                                &values,
+                                &at(&qg, r * 2 * heads * dim),
+                                &o,
+                            );
+                            let built = plan.build();
+                            built.run(&gpu);
+                            want_ms += built.run_timed(&gpu).1 * 1e3;
+                        }
+                        let mut plan = Plan::new(&gpu);
+                        rows.record(&mut plan, m, &q, &keys, &values, &qg, &out, &row_params);
+                        let built = plan.build();
+                        built.run(&gpu);
+                        let mut t: Vec<f64> =
+                            (0..11).map(|_| built.run_timed(&gpu).1 * 1e3).collect();
+                        t.sort_by(f64::total_cmp);
+                        let n = m * heads * dim;
+                        let (got, exp) = (
+                            contents::<f32>(&out.buffer, n),
+                            contents::<f32>(&want.buffer, n),
+                        );
+                        let err = got
+                            .iter()
+                            .zip(exp)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0, f32::max);
+                        assert!(diag > 0 || err < 1e-4, "ctx {ctx} m {m}: max error {err}");
+                        line += &format!("  m{m} {:.3} ms (decode x{m} {:.3})", t[5], want_ms);
+                    }
+                    println!("{line}");
+                }
+            }
         }
 
         /// Every row of qmv_rows equals qmv on that row, bit for bit.
