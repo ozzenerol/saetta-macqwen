@@ -42,62 +42,59 @@ struct RouteShape {
 
 // Softmax over the router logits, the top_k best (ties go to the lower id,
 // as the CPU's stable sort), and their weights rescaled to sum to 1.
-// One threadgroup with one thread per expert, at most 1024.
+// One simdgroup: lane l holds experts l, l + 32, ... in registers, so the
+// whole kernel runs without threadgroup memory or barriers.
+#define ROUTE_PER_LANE 8
+
 kernel void route_top_k(device const float *logits [[buffer(0)]],
                         device uint *ids [[buffer(1)]],
                         device float *weights [[buffer(2)]],
                         constant RouteShape &shape [[buffer(3)]],
-                        uint t [[thread_position_in_threadgroup]],
-                        uint simd [[simdgroup_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]],
-                        uint simds [[simdgroups_per_threadgroup]]) {
-    threadgroup float tmp[32];
-    threadgroup float best_p[32];
-    threadgroup uint best_id[32];
-    threadgroup float chosen_p[16];
-
-    bool live = t < shape.experts;
-    float v = live ? logits[t] : -INFINITY;
-    float m = group_max(v, tmp, simd, lane, simds);
-    float e = live ? exp(v - m) : 0.0f;
-    float z = group_sum(e, tmp, simd, lane, simds);
-    float p = live ? e / z : -1.0f;
-
-    for (uint k = 0; k < shape.top_k; k++) {
-        // Best in this simdgroup, lowest id on ties.
-        float sp = simd_max(p);
-        uint sid = simd_min(p == sp ? t : 0xffffffffu);
-        if (lane == 0) {
-            best_p[simd] = sp;
-            best_id[simd] = sid;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float bp = best_p[0];
-        uint bid = best_id[0];
-        for (uint i = 1; i < simds; i++) {
-            if (best_p[i] > bp || (best_p[i] == bp && best_id[i] < bid)) {
-                bp = best_p[i];
-                bid = best_id[i];
-            }
-        }
-        if (t == bid) {
-            p = -1.0f;
-        }
-        if (t == 0) {
-            ids[k] = bid;
-            chosen_p[k] = bp;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        uint lane [[thread_index_in_simdgroup]]) {
+    float p[ROUTE_PER_LANE];
+    float m = -INFINITY;
+    for (uint j = 0; j < ROUTE_PER_LANE; j++) {
+        uint e = lane + 32 * j;
+        p[j] = e < shape.experts ? logits[e] : -INFINITY;
+        m = max(m, p[j]);
+    }
+    m = simd_max(m);
+    float z = 0;
+    for (uint j = 0; j < ROUTE_PER_LANE; j++) {
+        p[j] = exp(p[j] - m);
+        z += p[j];
+    }
+    z = simd_sum(z);
+    for (uint j = 0; j < ROUTE_PER_LANE; j++) {
+        uint e = lane + 32 * j;
+        p[j] = e < shape.experts ? p[j] / z : -1.0f;
     }
 
-    if (t == 0) {
-        float sum = 0;
-        for (uint k = 0; k < shape.top_k; k++) {
-            sum += chosen_p[k];
+    float chosen[16];
+    float sum = 0;
+    for (uint k = 0; k < shape.top_k; k++) {
+        // This lane's best; j goes up with the id, so the first wins ties.
+        float bp = p[0];
+        uint bj = 0;
+        for (uint j = 1; j < ROUTE_PER_LANE; j++) {
+            if (p[j] > bp) {
+                bp = p[j];
+                bj = j;
+            }
         }
-        for (uint k = 0; k < shape.top_k; k++) {
-            weights[k] = chosen_p[k] / sum;
+        float best = simd_max(bp);
+        uint id = simd_min(bp == best ? lane + 32 * bj : 0xffffffffu);
+        if (id == lane + 32 * bj) {
+            p[bj] = -1.0f;
         }
+        chosen[k] = best;
+        sum += best;
+        if (lane == 0) {
+            ids[k] = id;
+        }
+    }
+    if (lane < shape.top_k) {
+        weights[lane] = chosen[lane] / sum;
     }
 }
 

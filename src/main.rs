@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -30,6 +30,20 @@ fn main() -> ExitCode {
             Ok(flags) => report(serve(Path::new(dir), flags)),
             Err(e) => {
                 eprintln!("{e}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        ["eval", dir, reference, ref options @ ..] => match eval_options(options) {
+            Some(options) => match eval(Path::new(dir), Path::new(reference), options) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("{USAGE}");
                 ExitCode::from(2)
             }
         },
@@ -95,14 +109,17 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
 
 struct ServeFlags {
     gpu: bool,
+    /// Tokens the MTP layer drafts per round; 0 turns drafting off.
+    draft: usize,
     port: u16,
     exact_history: bool,
 }
 
-/// `[--gpu] [--port N] [--exact-history]` after `serve <dir>`.
+/// `[--gpu] [--draft K] [--port N] [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut f = ServeFlags {
         gpu: false,
+        draft: 0,
         port: 8090,
         exact_history: false,
     };
@@ -110,6 +127,15 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     while let Some(&flag) = it.next() {
         match flag {
             "--gpu" => f.gpu = true,
+            "--draft" => {
+                let value = it.next().ok_or("--draft needs a number")?;
+                f.draft = value
+                    .parse()
+                    .map_err(|_| format!("bad draft count {value}"))?;
+                if f.draft > 7 {
+                    return Err("--draft takes 0 to 7".into());
+                }
+            }
             "--exact-history" => f.exact_history = true,
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
@@ -117,6 +143,9 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             }
             _ => return Err(format!("unknown flag {flag}")),
         }
+    }
+    if f.draft > 0 && !f.gpu {
+        return Err("--draft needs --gpu".into());
     }
     Ok(f)
 }
@@ -126,6 +155,7 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
 fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let ServeFlags {
         gpu,
+        draft,
         port,
         exact_history,
     } = flags;
@@ -148,7 +178,7 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
     if gpu {
-        return serve_gpu(config, weights, tokenizer, settings, listener, &what);
+        return serve_gpu(config, weights, tokenizer, settings, listener, &what, draft);
     }
     let model = Model::new(config, weights)?;
     let states = model.new_states();
@@ -174,6 +204,7 @@ fn serve_gpu(
     _: Settings,
     _: TcpListener,
     _: &str,
+    _: usize,
 ) -> Result<(), Box<dyn Error>> {
     Err("--gpu needs macOS".into())
 }
@@ -191,7 +222,29 @@ fn serve_gpu(
     settings: Settings,
     listener: TcpListener,
     what: &str,
+    draft: usize,
 ) -> Result<(), Box<dyn Error>> {
+    let served = load_gpu(config, weights, draft)?;
+    let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
+    let server = Arc::new(Server::new(model, tokenizer, settings)?);
+    let drafts = if draft > 0 {
+        format!(", MTP drafts {draft} per round")
+    } else {
+        String::new()
+    };
+    eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context{drafts})");
+    server.serve(listener)?;
+    Ok(())
+}
+
+/// The 40-layer GPU model with its prefill, snapshot pool and, with
+/// `draft` > 0, MTP drafting, as served.
+#[cfg(target_os = "macos")]
+fn load_gpu(
+    config: &'static Config,
+    weights: &'static Weights,
+    draft: usize,
+) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let model =
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
@@ -200,17 +253,24 @@ fn serve_gpu(
     let mut prefill =
         saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, GPU_CONTEXT)?;
     prefill.exact = exact_prefill();
-    let served = GpuServed {
+    let spec = if draft > 0 {
+        let mtp = saetta::gpu_mtp::GpuMtp::load(gpu, config, weights, GPU_CONTEXT)?;
+        let norm = weights.tensor("language_model.model.norm.weight")?.to_f32();
+        Some(Drafting {
+            spec: saetta::speculative::GpuSpec::new(&model, mtp, config.hidden_size, draft),
+            norm,
+            eps: config.rms_norm_eps,
+        })
+    } else {
+        None
+    };
+    Ok(GpuServed {
         model,
         prefill,
         pool,
         last_blit: RefCell::new(None),
-    };
-    let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
-    let server = Arc::new(Server::new(model, tokenizer, settings)?);
-    eprintln!("serving {what} (GPU model, {GPU_CONTEXT} tokens of context)");
-    server.serve(listener)?;
-    Ok(())
+        drafting: spec,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -221,7 +281,21 @@ struct GpuServed {
     /// before it writes the states, as `reset` does.
     last_blit: RefCell<Option<metal::CommandBuffer>>,
     prefill: saetta::prefill::Prefill<'static>,
+    drafting: Option<Drafting>,
 }
+
+/// The MTP drafter, with the final norm to turn prefill rows into the
+/// normed hidden states it reads.
+#[cfg(target_os = "macos")]
+struct Drafting {
+    spec: saetta::speculative::GpuSpec<'static>,
+    norm: Vec<f32>,
+    eps: f32,
+}
+
+/// Prompt tokens that get an MTP cache entry after a prefill.
+#[cfg(target_os = "macos")]
+const MTP_WINDOW: usize = 32;
 
 /// Tokens per prefill dispatch.
 #[cfg(target_os = "macos")]
@@ -251,10 +325,35 @@ impl server::Model for GpuServed {
         if tokens.is_empty() {
             return Vec::new();
         }
+        if let Some(d) = &mut self.drafting {
+            d.spec.report();
+        }
         let start = Instant::now();
         let pos = m.position();
         let states: Vec<_> = m.states().collect();
-        let logits = self.prefill.run(m.gpu(), tokens, pos, &states);
+        let logits = match &mut self.drafting {
+            None => self.prefill.run(m.gpu(), tokens, pos, &states),
+            Some(d) => {
+                // The same work as `run`, keeping the hidden states of the
+                // last tokens for the MTP cache.
+                let gpu = m.gpu();
+                let n = tokens.len();
+                let x = self.prefill.embed(gpu, tokens);
+                for (l, state) in states.iter().enumerate() {
+                    self.prefill.layer(gpu, l, &x, n, pos, state);
+                }
+                let logits = self.prefill.logits(gpu, &x, n);
+                let h = d.norm.len();
+                let first = n.saturating_sub(MTP_WINDOW + 1);
+                let mut rows = saetta::gpu::contents::<f32>(&x, n * h)[first * h..].to_vec();
+                for row in rows.chunks_exact_mut(h) {
+                    saetta::cpu::ops::rms_norm(row, &d.norm, d.eps);
+                }
+                d.spec
+                    .after_prefill(&tokens[first..], &rows, pos + first, MTP_WINDOW);
+                logits
+            }
+        };
         m.set_position(pos + tokens.len());
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
@@ -266,7 +365,24 @@ impl server::Model for GpuServed {
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
-        self.model.forward(token)
+        match &mut self.drafting {
+            Some(d) => d.spec.step(&mut self.model, token),
+            None => self.model.forward(token),
+        }
+    }
+
+    fn speculate(
+        &mut self,
+        pending: u32,
+        decide: &mut dyn saetta::speculative::Decider,
+    ) -> (Vec<u32>, u32) {
+        match &mut self.drafting {
+            Some(d) => d.spec.speculate(&mut self.model, pending, decide),
+            None => {
+                let logits = self.model.forward(pending);
+                (Vec::new(), decide.pick(&logits))
+            }
+        }
     }
 
     /// `Cached` goes back through snapshots instead.
@@ -279,34 +395,46 @@ impl server::Model for GpuServed {
             blit.wait_until_completed();
         }
         self.model.reset();
+        if let Some(d) = &mut self.drafting {
+            d.spec.reset();
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Restore for GpuServed {
-    type State = saetta::gpu_cache::GpuSnapshot;
+    /// The DeltaNet states, and with drafting the last hidden state, which
+    /// the MTP layer needs for its first entry after a restore.
+    type State = (saetta::gpu_cache::GpuSnapshot, Vec<f32>);
 
     fn save(&self) -> Self::State {
         let m = &self.model;
         let (snapshot, blit) = saetta::gpu_cache::save(m.gpu(), &self.pool, &m.deltanet_states());
         *self.last_blit.borrow_mut() = Some(blit);
-        snapshot
+        let last = self
+            .drafting
+            .as_ref()
+            .map_or(Vec::new(), |d| d.spec.last_hidden());
+        (snapshot, last)
     }
 
     fn restore(&mut self, state: &Self::State, len: usize) {
         let m = &mut self.model;
-        let blit = saetta::gpu_cache::restore(m.gpu(), state, &m.deltanet_states());
+        let blit = saetta::gpu_cache::restore(m.gpu(), &state.0, &m.deltanet_states());
         *self.last_blit.borrow_mut() = Some(blit);
         m.set_position(len);
+        if let Some(d) = &mut self.drafting {
+            d.spec.after_restore(len, &state.1);
+        }
     }
 }
 
-struct CpuModel {
-    model: Model<'static>,
+struct CpuModel<'a> {
+    model: Model<'a>,
     states: Vec<LayerState>,
 }
 
-impl CpuModel {
+impl CpuModel<'_> {
     fn run(&mut self, token: u32) -> Vec<f32> {
         self.model
             .forward(token, &mut self.states)
@@ -314,7 +442,7 @@ impl CpuModel {
     }
 }
 
-impl server::Model for CpuModel {
+impl server::Model for CpuModel<'_> {
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
         let start = Instant::now();
         let mut logits = Vec::new();
@@ -347,7 +475,7 @@ impl server::Model for CpuModel {
     }
 }
 
-impl Restore for CpuModel {
+impl Restore for CpuModel<'_> {
     type State = Vec<DeltaNetState>;
 
     fn save(&self) -> Self::State {
@@ -357,6 +485,73 @@ impl Restore for CpuModel {
     fn restore(&mut self, state: &Self::State, len: usize) {
         cache::restore_cpu(&mut self.states, state, len);
     }
+}
+
+struct EvalOptions {
+    gpu: bool,
+    gate: saetta::eval::Options,
+}
+
+/// `--gpu` runs the GPU model instead of the CPU one; `--long N` runs the
+/// first N tokens of the long prompt (default 0, off), through prefill, or
+/// one token at a time with `--decode`; `--no-ppl` skips the perplexity text.
+fn eval_options(options: &[&str]) -> Option<EvalOptions> {
+    let mut o = EvalOptions {
+        gpu: false,
+        gate: saetta::eval::Options {
+            ppl: true,
+            long: 0,
+            decode: false,
+        },
+    };
+    let mut rest = options.iter();
+    while let Some(&option) = rest.next() {
+        match option {
+            "--gpu" => o.gpu = true,
+            "--no-ppl" => o.gate.ppl = false,
+            "--decode" => o.gate.decode = true,
+            "--long" => o.gate.long = rest.next()?.parse().ok()?,
+            _ => return None,
+        }
+    }
+    Some(o)
+}
+
+fn eval(dir: &Path, reference: &Path, o: EvalOptions) -> Result<bool, Box<dyn Error>> {
+    let reference = saetta::eval::Reference::load(reference)?;
+    // The GPU model borrows these for the whole run, as in serve.
+    let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
+    let weights: &'static Weights = Box::leak(Box::new(Weights::open(dir)?));
+    if o.gpu {
+        return eval_gpu(config, weights, &reference, o);
+    }
+    let model = Model::new(config, weights)?;
+    let states = model.new_states();
+    let mut model = CpuModel { model, states };
+    saetta::eval::gate(&mut model, &reference, &o.gate)
+}
+
+#[cfg(target_os = "macos")]
+fn eval_gpu(
+    config: &'static Config,
+    weights: &'static Weights,
+    reference: &saetta::eval::Reference,
+    o: EvalOptions,
+) -> Result<bool, Box<dyn Error>> {
+    let mut model = load_gpu(config, weights, 0)?;
+    let prefill = if model.prefill.exact { "exact" } else { "fast" };
+    println!("GPU model, {prefill} prefill");
+    saetta::eval::gate(&mut model, reference, &o.gate)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn eval_gpu(
+    _: &'static Config,
+    _: &'static Weights,
+    _: &saetta::eval::Reference,
+    _: EvalOptions,
+) -> Result<bool, Box<dyn Error>> {
+    Err("--gpu needs macOS".into())
 }
 
 fn info(dir: &Path) -> Result<(), Box<dyn Error>> {

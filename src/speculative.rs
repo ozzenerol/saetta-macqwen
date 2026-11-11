@@ -323,6 +323,371 @@ fn truncate_mtp(state: &mut LayerState, len: usize) {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub use gpu::GpuSpec;
+
+#[cfg(target_os = "macos")]
+mod gpu {
+    //! The same rounds as `generate`, on the GPU model with the GPU MTP
+    //! layer.
+
+    use super::{Decider, Stats};
+    use crate::gpu::Gpu;
+    use crate::gpu_cache::{GpuSnapshot, SnapshotPool, restore, save};
+    use crate::gpu_model::GpuModel;
+    use crate::gpu_mtp::GpuMtp;
+    use crate::qmv::View;
+
+    /// The drafter and what a round needs to go back. The main model is
+    /// passed in, so the same model also serves without drafts.
+    pub struct GpuSpec<'a> {
+        pub mtp: GpuMtp<'a>,
+        gpu: &'a Gpu,
+        k: usize,
+        hidden: usize,
+        /// The normed hidden state after the last token the model ran.
+        last: View,
+        /// The normed hidden state after each token of a verify pass.
+        rows: Vec<View>,
+        pool: SnapshotPool,
+        /// For each MTP cache entry, the model position of its hidden state.
+        mtp_positions: Vec<usize>,
+        pub stats: Stats,
+    }
+
+    impl<'a> GpuSpec<'a> {
+        /// Drafts `k` tokens per round.
+        pub fn new(model: &GpuModel<'a>, mtp: GpuMtp<'a>, hidden: usize, k: usize) -> GpuSpec<'a> {
+            let gpu = model.gpu();
+            let pool = SnapshotPool::new(gpu, &model.deltanet_states(), k);
+            let view = || View::new(gpu.buffer(hidden * 4));
+            GpuSpec {
+                last: view(),
+                rows: (0..=k).map(|_| view()).collect(),
+                pool,
+                mtp_positions: Vec::new(),
+                stats: Stats {
+                    accepted_at: vec![0; k],
+                    ..Stats::default()
+                },
+                mtp,
+                gpu,
+                k,
+                hidden,
+            }
+        }
+
+        /// One MTP step from `h`, the normed hidden state at `position`,
+        /// with the token after it.
+        fn mtp_step(&mut self, h: &View, position: usize, token: u32) -> u32 {
+            self.mtp_positions.push(position);
+            self.mtp.step(h, token)
+        }
+
+        /// Records the prompt's last tokens in the MTP cache. `rows` holds
+        /// the normed hidden states of `tokens`, which ran at positions
+        /// `pos ..`; `last` must hold the state at `pos - 1` when `pos > 0`.
+        /// Only the last `window` tokens get an entry: an entry costs about
+        /// as much as a decode step, and older ones matter less.
+        pub fn after_prefill(&mut self, tokens: &[u32], rows: &[f32], pos: usize, window: usize) {
+            let n = tokens.len();
+            let h = self.hidden;
+            let start = n.saturating_sub(window).max(usize::from(pos == 0));
+            let staged = View::new(self.gpu.buffer_from(rows));
+            for r in start..n {
+                if r == 0 {
+                    let last = self.last.clone();
+                    self.mtp_step(&last, pos - 1, tokens[0]);
+                } else {
+                    let at = View {
+                        buffer: staged.buffer.clone(),
+                        offset: ((r - 1) * h * 4) as u64,
+                    };
+                    self.mtp_step(&at, pos + r - 1, tokens[r]);
+                }
+            }
+            write(&self.last, &rows[(n - 1) * h..n * h]);
+        }
+
+        /// After going back to `len` tokens: keeps the MTP entries made from
+        /// states before `len - 1` and sets the last hidden state.
+        pub fn after_restore(&mut self, len: usize, last: &[f32]) {
+            let keep = self
+                .mtp_positions
+                .iter()
+                .take_while(|&&p| p + 1 < len)
+                .count();
+            // Entries kept from another conversation with the same prefix
+            // would be stale; within one conversation they are exact.
+            eprintln!(
+                "MTP cache: kept {keep} entries going back to {len} tokens ({} dropped)",
+                self.mtp_positions.len() - keep
+            );
+            self.mtp.truncate(keep);
+            self.mtp_positions.truncate(keep);
+            write(&self.last, last);
+        }
+
+        /// Prints the drafting counts since the last call and clears them.
+        pub fn report(&mut self) {
+            let s = &self.stats;
+            if s.rounds > 0 {
+                eprintln!(
+                    "drafts: {} rounds, {} of {} accepted, {:.2} tokens per round, accepted at {:?}",
+                    s.rounds,
+                    s.accepted,
+                    s.drafted,
+                    s.tokens_per_round(),
+                    s.accepted_at
+                );
+            }
+            self.stats = Stats {
+                accepted_at: vec![0; self.k],
+                ..Stats::default()
+            };
+        }
+
+        /// A plain decode step that keeps the MTP cache and the last hidden
+        /// state up to date, for a token run outside `speculate` (the
+        /// prompt cache runs a prompt's last token this way).
+        pub fn step(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
+            let pos = model.position();
+            if pos > 0 {
+                let last = self.last.clone();
+                self.mtp_step(&last, pos - 1, token);
+            }
+            let logits = model.forward(token);
+            copy(model.final_hidden(), &self.last, self.hidden);
+            logits
+        }
+
+        /// `step` without the MTP entry, for prompt tokens before the MTP
+        /// window: the drafts only look back that far.
+        pub fn step_plain(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
+            let logits = model.forward(token);
+            copy(model.final_hidden(), &self.last, self.hidden);
+            logits
+        }
+
+        pub fn last_hidden(&self) -> Vec<f32> {
+            read(&self.last, self.hidden)
+        }
+
+        pub fn reset(&mut self) {
+            self.mtp.reset();
+            self.mtp_positions.clear();
+        }
+
+        /// One round: runs `pending` and the drafts, keeps the accepted
+        /// drafts and returns them with the next token, which is not run.
+        pub fn speculate(
+            &mut self,
+            model: &mut GpuModel<'a>,
+            pending: u32,
+            decide: &mut dyn Decider,
+        ) -> (Vec<u32>, u32) {
+            let k = self.k;
+            let base = model.position();
+            let mark = self.mtp.len();
+
+            let last = self.last.clone();
+            let mut drafts = vec![self.mtp_step(&last, base - 1, pending)];
+            for i in 1..k {
+                let own = self.mtp.output().clone();
+                let d = self.mtp_step(&own, base + i - 1, drafts[i - 1]);
+                drafts.push(d);
+            }
+
+            // Stand-in for a batched verify pass: one token at a time, with
+            // the DeltaNet states saved after each.
+            let mut logits = Vec::with_capacity(k + 1);
+            let mut saved: Vec<GpuSnapshot> = Vec::with_capacity(k);
+            for (i, t) in std::iter::once(pending)
+                .chain(drafts.iter().copied())
+                .enumerate()
+            {
+                logits.push(model.forward(t));
+                copy(model.final_hidden(), &self.rows[i], self.hidden);
+                if i < k {
+                    let (snapshot, blit) = save(self.gpu, &self.pool, &model.deltanet_states());
+                    blit.wait_until_completed();
+                    saved.push(snapshot);
+                }
+            }
+
+            let mut accepted = 0;
+            let mut next = None;
+            for (i, &d) in drafts.iter().enumerate() {
+                match decide.check(&logits[i], d) {
+                    None => accepted += 1,
+                    Some(t) => {
+                        next = Some(t);
+                        break;
+                    }
+                }
+            }
+            let next = next.unwrap_or_else(|| decide.pick(&logits[k]));
+
+            if accepted < k {
+                let blit = restore(self.gpu, &saved[accepted], &model.deltanet_states());
+                blit.wait_until_completed();
+                model.set_position(base + accepted + 1);
+            }
+            self.mtp.truncate(mark + 1);
+            self.mtp_positions.truncate(mark + 1);
+            for (i, &d) in drafts[..accepted].iter().enumerate() {
+                let row = self.rows[i].clone();
+                self.mtp_step(&row, base + i, d);
+            }
+            copy(&self.rows[accepted], &self.last, self.hidden);
+
+            self.stats.rounds += 1;
+            self.stats.drafted += k;
+            self.stats.accepted += accepted;
+            for a in &mut self.stats.accepted_at[..accepted] {
+                *a += 1;
+            }
+            drafts.truncate(accepted);
+            (drafts, next)
+        }
+    }
+
+    fn ptr(v: &View) -> *mut f32 {
+        unsafe { (v.buffer.contents() as *mut u8).add(v.offset as usize) as *mut f32 }
+    }
+
+    /// Copies `n` floats between shared buffers while the GPU is idle.
+    fn copy(from: &View, to: &View, n: usize) {
+        unsafe { std::ptr::copy(ptr(from), ptr(to), n) };
+    }
+
+    fn write(to: &View, values: &[f32]) {
+        unsafe { std::ptr::copy(values.as_ptr(), ptr(to), values.len()) };
+    }
+
+    fn read(from: &View, n: usize) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(ptr(from), n).to_vec() }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod gpu_real {
+    //! With the real model on the Mac, through the bench lock:
+    //!   ~/saetta/timed.sh E cargo test --release --lib speculative::gpu_real -- --ignored --nocapture
+
+    use super::*;
+    use crate::chat::{self, Message};
+    use crate::config::Config;
+    use crate::gpu::Gpu;
+    use crate::gpu_model::GpuModel;
+    use crate::gpu_mtp::GpuMtp;
+    use crate::tokenizer::Tokenizer;
+    use crate::weights::Weights;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
+
+    /// The two best logits' gap.
+    fn top2_gap(logits: &[f32]) -> f32 {
+        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &l in logits {
+            if l > a {
+                (a, b) = (l, a);
+            } else if l > b {
+                b = l;
+            }
+        }
+        a - b
+    }
+
+    fn contents(v: &crate::qmv::View, n: usize) -> Vec<f32> {
+        crate::gpu::contents::<f32>(&v.buffer, n + v.offset as usize / 4)[v.offset as usize / 4..]
+            .to_vec()
+    }
+
+    #[test]
+    #[ignore = "needs the model on the Mac"]
+    fn greedy_matches_plain_gpu_greedy() {
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+        let cfg = Config::load(&dir).unwrap();
+        let weights = Weights::open(&dir).unwrap();
+        let tok = Tokenizer::load(&dir).unwrap();
+        let gpu = Gpu::new().unwrap();
+        let h = cfg.hidden_size;
+        let count = 48;
+        let opts = chat::Options {
+            enable_thinking: false,
+            ..chat::Options::default()
+        };
+        let prompts = [
+            "Write a Rust function that parses a version string like 1.2.3 into a struct with major, minor and patch fields.",
+            "Explain in one short paragraph why the sky is blue.",
+        ];
+
+        for text in prompts {
+            let message = Message {
+                role: "user".into(),
+                content: text.into(),
+                ..Message::default()
+            };
+            let prompt = tok.encode(&chat::render(&[message], &[], &opts).unwrap());
+
+            // Plain greedy, keeping the gap of each step.
+            let mut plain = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 1024).unwrap();
+            let mut logits = Vec::new();
+            for &t in &prompt {
+                logits = plain.forward(t);
+            }
+            let (mut want, mut gaps) = (Vec::new(), Vec::new());
+            let start = Instant::now();
+            for _ in 0..count {
+                let t = argmax(&logits);
+                want.push(t);
+                gaps.push(top2_gap(&logits));
+                logits = plain.forward(t);
+            }
+            let plain_time = start.elapsed();
+            drop(plain);
+
+            let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 1024).unwrap();
+            let mtp = GpuMtp::load(&gpu, &cfg, &weights, 1024).unwrap();
+            let mut spec = GpuSpec::new(&model, mtp, h, 3);
+            let mut rows = Vec::with_capacity(prompt.len() * h);
+            let mut logits = Vec::new();
+            for &t in &prompt {
+                logits = model.forward(t);
+                rows.extend(contents(model.final_hidden(), h));
+            }
+            spec.after_prefill(&prompt, &rows, 0, 32);
+            let mut got = Vec::new();
+            let mut pending = argmax(&logits);
+            let start = Instant::now();
+            while got.len() < count {
+                got.push(pending);
+                let (accepted, next) = spec.speculate(&mut model, pending, &mut Greedy);
+                got.extend(accepted);
+                pending = next;
+            }
+            let spec_time = start.elapsed();
+            got.truncate(count);
+
+            println!(
+                "{:?}\n  plain {:.1} tok/s, stand-in speculative {:.1} tok/s, {:.2} tokens per round, {:?}",
+                tok.decode(&got),
+                count as f64 / plain_time.as_secs_f64(),
+                count as f64 / spec_time.as_secs_f64(),
+                spec.stats.tokens_per_round(),
+                spec.stats
+            );
+            if let Some(i) = (0..count).find(|&i| got[i] != want[i]) {
+                println!("first difference at {i}: top-2 gap {:.2e}", gaps[i]);
+                assert!(gaps[i] < 1e-4, "differs at {i} with gap {}", gaps[i]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod real {
     //! With the real model on the Mac:
