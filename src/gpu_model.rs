@@ -89,27 +89,27 @@ mod mac {
     }
 
     /// The scratch buffers of the MoE block, shared by all layers.
-    struct MoeScratch {
-        normed: View,
+    pub(crate) struct MoeScratch {
+        pub(crate) normed: View,
         /// The router's output: `num_experts` logits, then the shared
         /// expert gate logit, which `shared_logit` points at.
-        router: View,
-        ids: View,
-        weights: View,
-        shared_logit: View,
-        shared_gate: View,
-        shared_up: View,
-        shared_h: View,
-        shared: View,
-        experts_h: View,
-        routed: View,
+        pub(crate) router: View,
+        pub(crate) ids: View,
+        pub(crate) weights: View,
+        pub(crate) shared_logit: View,
+        pub(crate) shared_gate: View,
+        pub(crate) shared_up: View,
+        pub(crate) shared_h: View,
+        pub(crate) shared: View,
+        pub(crate) experts_h: View,
+        pub(crate) routed: View,
     }
 
     /// The scratch buffers of one layer step, shared by all layers.
     pub(crate) struct Scratch {
-        normed: View,
-        mixed: View,
-        moe: MoeScratch,
+        pub(crate) normed: View,
+        pub(crate) mixed: View,
+        pub(crate) moe: MoeScratch,
     }
 
     impl Scratch {
@@ -140,14 +140,14 @@ mod mac {
         }
     }
 
-    struct GpuMoe<'a> {
-        post_norm: View,
+    pub(crate) struct GpuMoe<'a> {
+        pub(crate) post_norm: View,
         /// Router logits then the shared expert gate, 257 values.
-        router: Router<'a>,
-        shared_gate: GpuQuant<'a>,
-        shared_up: GpuQuant<'a>,
-        shared_down: GpuQuant<'a>,
-        experts: Experts<'a>,
+        pub(crate) router: Router<'a>,
+        pub(crate) shared_gate: GpuQuant<'a>,
+        pub(crate) shared_up: GpuQuant<'a>,
+        pub(crate) shared_down: GpuQuant<'a>,
+        pub(crate) experts: Experts<'a>,
     }
 
     impl<'a> GpuMoe<'a> {
@@ -227,15 +227,15 @@ mod mac {
         }
     }
 
-    enum Mixer<'a> {
+    pub(crate) enum Mixer<'a> {
         Linear(GpuDeltaNet<'a>, GpuDeltaNetState),
         Full(GpuAttention<'a>, GpuKvCache),
     }
 
     pub(crate) struct GpuLayer<'a> {
-        input_norm: View,
-        mixer: Mixer<'a>,
-        moe: GpuMoe<'a>,
+        pub(crate) input_norm: View,
+        pub(crate) mixer: Mixer<'a>,
+        pub(crate) moe: GpuMoe<'a>,
     }
 
     impl<'a> GpuLayer<'a> {
@@ -359,16 +359,21 @@ mod mac {
     /// What a token reads back: the logits, and the hidden state before the
     /// final norm (for tests that run only some layers).
     pub struct GpuModel<'a> {
-        gpu: &'a Gpu,
-        cfg: &'a Config,
-        layers: Vec<GpuLayer<'a>>,
-        plan: Plan<'a>,
-        built: Built,
+        pub(crate) gpu: &'a Gpu,
+        pub(crate) cfg: &'a Config,
+        pub(crate) layers: Vec<GpuLayer<'a>>,
+        pub(crate) embed: GpuQuant<'a>,
+        pub(crate) final_norm: View,
+        pub(crate) lm_head: GpuQuant<'a>,
+        /// The multi-row verify, after `enable_verify`.
+        pub(crate) verify: Option<crate::gpu_verify::GpuVerify>,
+        pub(crate) plan: Plan<'a>,
+        pub(crate) built: Built,
         hidden: View,
         final_hidden: View,
         logits: View,
-        capacity: usize,
-        position: usize,
+        pub(crate) capacity: usize,
+        pub(crate) position: usize,
     }
 
     impl<'a> GpuModel<'a> {
@@ -415,6 +420,10 @@ mod mac {
                 gpu,
                 cfg,
                 layers: loaded,
+                embed,
+                final_norm,
+                lm_head,
+                verify: None,
                 plan,
                 built,
                 hidden: x,

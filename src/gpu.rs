@@ -10,6 +10,7 @@ pub const KERNELS: &str = concat!(
     include_str!("../kernels/qmv.metal"),
     include_str!("../kernels/moe.metal"),
     include_str!("../kernels/router.metal"),
+    include_str!("../kernels/rows.metal"),
     include_str!("../kernels/layers.metal"),
     include_str!("../kernels/attention.metal"),
     include_str!("../kernels/model.metal"),

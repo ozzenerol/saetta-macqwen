@@ -206,6 +206,7 @@ kernel void attention(device const float *q [[buffer(0)]],
 struct ResidualParams {
     uint dim;
     float eps;
+    uint logit_stride;  // mix_norm: floats between rows' shared logits
 };
 
 // The RMSNorm scale 1 / sqrt(mean(x^2) + eps) from each thread's part `sq`
@@ -217,18 +218,22 @@ inline float norm_scale(float sq, uint dim, float eps, threadgroup float *tmp, u
 }
 
 // x += y, then out = rms_norm(x) * w: the residual after the mixer and the
-// post-attention norm in one op. One threadgroup.
+// post-attention norm in one op. One threadgroup per row of x, y and out.
 kernel void add_norm(device float *x [[buffer(0)]],
                      device const float *y [[buffer(1)]],
                      device const float *w [[buffer(2)]],
                      device float *out [[buffer(3)]],
                      constant ResidualParams &p [[buffer(4)]],
+                     uint row [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]],
                      uint threads [[threads_per_threadgroup]],
                      uint simd [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
                      uint simds [[simdgroups_per_threadgroup]]) {
     threadgroup float tmp[32];
+    x += row * p.dim;
+    y += row * p.dim;
+    out += row * p.dim;
     float sq = 0;
     for (uint i = tid; i < p.dim; i += threads) {
         float v = x[i] + y[i];
@@ -243,7 +248,7 @@ kernel void add_norm(device float *x [[buffer(0)]],
 
 // x += sigmoid(shared_logit) * shared + routed, then out = rms_norm(x) * w:
 // the end of the MoE block and the next layer's input norm (or the final
-// norm) in one op. One threadgroup.
+// norm) in one op. One threadgroup per row.
 kernel void mix_norm(device float *x [[buffer(0)]],
                      device const float *shared_logit [[buffer(1)]],
                      device const float *shared [[buffer(2)]],
@@ -251,13 +256,18 @@ kernel void mix_norm(device float *x [[buffer(0)]],
                      device const float *w [[buffer(4)]],
                      device float *out [[buffer(5)]],
                      constant ResidualParams &p [[buffer(6)]],
+                     uint row [[threadgroup_position_in_grid]],
                      uint tid [[thread_position_in_threadgroup]],
                      uint threads [[threads_per_threadgroup]],
                      uint simd [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
                      uint simds [[simdgroups_per_threadgroup]]) {
     threadgroup float tmp[32];
-    float gate = sigmoid(shared_logit[0]);
+    x += row * p.dim;
+    shared += row * p.dim;
+    routed += row * p.dim;
+    out += row * p.dim;
+    float gate = sigmoid(shared_logit[row * p.logit_stride]);
     float sq = 0;
     for (uint i = tid; i < p.dim; i += threads) {
         float v = x[i] + gate * shared[i] + routed[i];
@@ -276,6 +286,8 @@ struct StepParams {
     uint v_dim;
     uint kernel_size;  // conv1d taps
     float eps;
+    uint rows;         // tokens, one after the other
+    uint snapshots;    // 1: save the states after each row
 };
 
 // The whole Gated DeltaNet step after the projections, for k_dim 128,
@@ -290,6 +302,11 @@ struct StepParams {
 // reads or writes its conv channels, so the state needs no ordering between
 // threadgroups. Each simdgroup owns state rows and each lane 4 of the 128
 // values of a row, so the state is read and written in whole cache lines.
+//
+// `rows` tokens go through in order; qkv, a, b, z and y hold one token per
+// row. The state stays in registers between rows. With `snapshots`, the
+// states after row r also go to conv_snaps[r] and state_snaps[r], so a
+// speculative verify can roll back to any row.
 kernel void deltanet_step(device const float *qkv [[buffer(0)]],
                           device const float *conv_w [[buffer(1)]],
                           device float *conv [[buffer(2)]],
@@ -302,6 +319,8 @@ kernel void deltanet_step(device const float *qkv [[buffer(0)]],
                           device const float *norm_w [[buffer(9)]],
                           device float *y [[buffer(10)]],
                           constant StepParams &p [[buffer(11)]],
+                          device float *conv_snaps [[buffer(12)]],
+                          device float *state_snaps [[buffer(13)]],
                           uint kh [[threadgroup_position_in_grid]],
                           uint tid [[thread_position_in_threadgroup]],
                           uint simd [[simdgroup_index_in_threadgroup]],
@@ -309,70 +328,101 @@ kernel void deltanet_step(device const float *qkv [[buffer(0)]],
                           uint simds [[simdgroups_per_threadgroup]]) {
     constexpr uint D = 128;     // k_dim and v_dim
     constexpr uint GROUP = 2;   // value heads per key head
+    constexpr uint MINE = 8;    // state rows per simdgroup: GROUP * D / 32
     threadgroup float tmp[32];
     threadgroup float mixed[(2 + GROUP) * D];  // q, k, then the v heads
     threadgroup float out[GROUP * D];
     uint key_size = p.k_heads * D;
     uint channels = 2 * key_size + p.v_heads * D;
+    uint values = p.v_heads * D;
     uint h0 = kh * GROUP;
+    uint past = p.kernel_size - 1;
+    uint conv_size = past * channels;
+    uint state_size = values * D;
 
-    if (tid < (2 + GROUP) * D) {
-        uint part = tid / D;
-        uint i = tid % D;
-        uint c = part == 0 ? kh * D + i
-               : part == 1 ? key_size + kh * D + i
-                           : 2 * key_size + (h0 + part - 2) * D + i;
-        uint past = p.kernel_size - 1;
-        device const float *wc = conv_w + c * p.kernel_size;
-        float x = qkv[c];
-        float acc = wc[past] * x;
-        for (uint t = 0; t < past; t++) {
-            acc += wc[t] * conv[t * channels + c];
-        }
-        for (uint t = 0; t + 1 < past; t++) {
-            conv[t * channels + c] = conv[(t + 1) * channels + c];
-        }
-        conv[(past - 1) * channels + c] = x;
-        mixed[tid] = silu(acc);
+    // This thread's conv channel.
+    uint part = tid / D;
+    uint c = part == 0 ? kh * D + tid % D
+           : part == 1 ? key_size + kh * D + tid % D
+                       : 2 * key_size + (h0 + part - 2) * D + tid % D;
+    bool convs = tid < (2 + GROUP) * D;
+
+    // State row j of this simdgroup is r = simd + 32 j, all of head
+    // h0 + r / D. Rows of a head share g and beta.
+    float4 s[MINE];
+    for (uint j = 0; j < MINE; j++) {
+        uint r = simd + simds * j;
+        s[j] = ((device float4 *)(state + (h0 * D + r) * D))[lane];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float4 qv = ((threadgroup const float4 *)mixed)[lane];
-    float4 kv = ((threadgroup const float4 *)(mixed + D))[lane];
-    // normalize_qk in MLX: rms_norm with eps / k_dim, q scaled by 1 / k_dim
-    // and k by 1 / sqrt(k_dim).
-    float eps = p.eps / D;
-    qv *= (1.0f / D) / sqrt(simd_sum(dot(qv, qv)) / D + eps);
-    kv *= rsqrt(float(D)) / sqrt(simd_sum(dot(kv, kv)) / D + eps);
+    for (uint row = 0; row < p.rows; row++) {
+        if (convs) {
+            device const float *wc = conv_w + c * p.kernel_size;
+            float x = qkv[row * channels + c];
+            float acc = wc[past] * x;
+            for (uint t = 0; t < past; t++) {
+                acc += wc[t] * conv[t * channels + c];
+            }
+            for (uint t = 0; t + 1 < past; t++) {
+                conv[t * channels + c] = conv[(t + 1) * channels + c];
+            }
+            conv[(past - 1) * channels + c] = x;
+            if (p.snapshots) {
+                for (uint t = 0; t < past; t++) {
+                    conv_snaps[row * conv_size + t * channels + c] = conv[t * channels + c];
+                }
+            }
+            mixed[tid] = silu(acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint r = simd; r < GROUP * D; r += simds) {
-        uint h = h0 + r / D;
-        uint i = r % D;
-        float x = a[h] + dt_bias[h];
-        float softplus = max(x, 0.0f) + log(1.0f + exp(-abs(x)));
-        float g = exp(-exp(a_log[h]) * softplus);
-        float beta = sigmoid(b[h]);
+        float4 qv = ((threadgroup const float4 *)mixed)[lane];
+        float4 kv = ((threadgroup const float4 *)(mixed + D))[lane];
+        // normalize_qk in MLX: rms_norm with eps / k_dim, q scaled by 1 / k_dim
+        // and k by 1 / sqrt(k_dim).
+        float eps = p.eps / D;
+        qv *= (1.0f / D) / sqrt(simd_sum(dot(qv, qv)) / D + eps);
+        kv *= rsqrt(float(D)) / sqrt(simd_sum(dot(kv, kv)) / D + eps);
 
-        device float4 *row = (device float4 *)(state + (h * D + i) * D) + lane;
-        float4 s = *row * g;
-        float delta = (mixed[(2 + r / D) * D + i] - simd_sum(dot(s, kv))) * beta;
-        s += kv * delta;
-        *row = s;
-        float o = simd_sum(dot(s, qv));
-        if (lane == 0) {
-            out[r] = o;
+        for (uint j = 0; j < MINE; j++) {
+            uint r = simd + simds * j;
+            uint h = h0 + r / D;
+            uint i = r % D;
+            float x = a[row * p.v_heads + h] + dt_bias[h];
+            float softplus = max(x, 0.0f) + log(1.0f + exp(-abs(x)));
+            float g = exp(-exp(a_log[h]) * softplus);
+            float beta = sigmoid(b[row * p.v_heads + h]);
+
+            float4 sj = s[j] * g;
+            float delta = (mixed[(2 + r / D) * D + i] - simd_sum(dot(sj, kv))) * beta;
+            sj += kv * delta;
+            s[j] = sj;
+            if (p.snapshots) {
+                device float4 *snap =
+                    (device float4 *)(state_snaps + row * state_size + (h * D + i) * D);
+                snap[lane] = sj;
+            }
+            float o = simd_sum(dot(sj, qv));
+            if (lane == 0) {
+                out[r] = o;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = 0; j < GROUP; j++) {
+            bool mine = tid / D == j;
+            float o = mine ? out[tid] : 0.0f;
+            float inv = norm_scale(o * o, D, p.eps, tmp, simd, lane, simds);
+            if (mine) {
+                uint n = row * values + (h0 + j) * D + tid % D;
+                y[n] = o * inv * norm_w[tid % D] * silu(z[n]);
+            }
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint j = 0; j < GROUP; j++) {
-        bool mine = tid / D == j;
-        float o = mine ? out[tid] : 0.0f;
-        float inv = norm_scale(o * o, D, p.eps, tmp, simd, lane, simds);
-        if (mine) {
-            uint n = (h0 + j) * D + tid % D;
-            y[n] = o * inv * norm_w[tid % D] * silu(z[n]);
-        }
+    for (uint j = 0; j < MINE; j++) {
+        uint r = simd + simds * j;
+        ((device float4 *)(state + (h0 * D + r) * D))[lane] = s[j];
     }
 }
 
