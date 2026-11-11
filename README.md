@@ -15,6 +15,8 @@ Measured with `mlx_lm.server` on that Mac (one run each):
 - decode ceiling from those numbers: about 190 tokens/s
 - MLX decode today: 76 tokens/s at short context, 66 at about 12k tokens
 
+`tools/bench.py` measures any OpenAI-compatible server the same way. MLX with it, 3 runs each: 71.4 tokens/s and 0.14 s to the first token on a 39-token prompt; 62.5 tokens/s and 13.4 s to the first token on a 15,429-token prompt.
+
 The gap comes from per-token overhead, not memory speed. The plan is fused kernels, one prebuilt command buffer per token, speculative decoding with the model's MTP layer, and saved recurrent state so a chat never reads its prompt twice. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Build
