@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -226,6 +226,11 @@ struct ServeFlags {
     /// Tokens the MTP layer drafts per round; 0 turns drafting off. With
     /// `--gpu` it is 3 unless `--draft` says otherwise.
     draft: usize,
+    /// Most tokens a round copies from the context (`speculative::lookup`);
+    /// `--draft` unless `--lookup` says otherwise, 0 turns it off. The verify
+    /// takes `max(draft, lookup) + 1` rows, and each row past `draft + 1`
+    /// adds 63 MB of DeltaNet snapshots plus 16 KB per 128 tokens of context.
+    lookup: usize,
     port: u16,
     exact_history: bool,
     memory: Memory,
@@ -255,13 +260,15 @@ impl Default for Memory {
     }
 }
 
-/// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N]
+/// `[--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N]
 /// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut draft = None;
+    let mut lookup = None;
     let mut f = ServeFlags {
         gpu: false,
         draft: 0,
+        lookup: 0,
         port: 8090,
         exact_history: false,
         memory: Memory::default(),
@@ -279,6 +286,16 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                     return Err("--draft takes 0 to 7".into());
                 }
                 draft = Some(k);
+            }
+            "--lookup" => {
+                let value = it.next().ok_or("--lookup needs a number")?;
+                let k: usize = value
+                    .parse()
+                    .map_err(|_| format!("bad lookup count {value}"))?;
+                if k > 7 {
+                    return Err("--lookup takes 0 to 7".into());
+                }
+                lookup = Some(k);
             }
             "--exact-history" => f.exact_history = true,
             "--context" => {
@@ -313,6 +330,11 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
         Some(k) => k,
         None if f.gpu => 3,
         None => 0,
+    };
+    f.lookup = match lookup {
+        Some(k) if k > 0 && f.draft == 0 => return Err("--lookup needs drafting".into()),
+        Some(k) => k,
+        None => f.draft,
     };
     Ok(f)
 }
@@ -395,8 +417,13 @@ fn serve_gpu(
     what: &str,
     flags: ServeFlags,
 ) -> Result<(), Box<dyn Error>> {
-    let ServeFlags { draft, memory, .. } = flags;
-    let served = load_gpu(config, weights, draft, memory)?;
+    let ServeFlags {
+        draft,
+        lookup,
+        memory,
+        ..
+    } = flags;
+    let served = load_gpu(config, weights, draft, lookup, memory)?;
     let snapshots = served.snapshots;
     let model = anchored(
         Cached::new(served, snapshots, SNAPSHOT_EVERY),
@@ -404,7 +431,7 @@ fn serve_gpu(
     );
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
     let drafts = if draft > 0 {
-        format!(", MTP drafts {draft} per round")
+        format!(", MTP drafts {draft} per round, lookup drafts {lookup}")
     } else {
         String::new()
     };
@@ -423,6 +450,7 @@ fn load_gpu(
     config: &'static Config,
     weights: &'static Weights,
     draft: usize,
+    lookup: usize,
     memory: Memory,
 ) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
@@ -446,13 +474,13 @@ fn load_gpu(
     let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
     prefill.exact = exact_prefill();
     if draft > 0 {
-        model.enable_verify(draft + 1);
+        model.enable_verify(draft.max(lookup) + 1);
     }
     let spec = if draft > 0 {
         let mtp = saetta::gpu_mtp::GpuMtp::load(gpu, config, weights, context)?;
         let norm = weights.tensor("language_model.model.norm.weight")?.to_f32();
         Some(Drafting {
-            spec: saetta::speculative::GpuSpec::new(&model, mtp, config, draft),
+            spec: saetta::speculative::GpuSpec::new(&model, mtp, config, draft).with_lookup(lookup),
             norm,
             eps: config.rms_norm_eps,
         })
@@ -901,7 +929,7 @@ fn eval_gpu(
         kv_bits: o.kv_bits,
         ..Memory::default()
     };
-    let mut model = load_gpu(config, weights, 0, memory)?;
+    let mut model = load_gpu(config, weights, 0, 0, memory)?;
     let prefill = if model.prefill.exact { "exact" } else { "fast" };
     println!("GPU model, {prefill} prefill, {:?} KV cache", o.kv_bits);
     saetta::eval::gate(&mut model, reference, &o.gate)
@@ -994,7 +1022,7 @@ fn bench_serve_prefill(dir: &str, tokens: usize, every: usize) -> Result<(), Box
         context: (tokens + 64).next_multiple_of(1024),
         ..Memory::default()
     };
-    let served = load_gpu(config, weights, 0, memory)?;
+    let served = load_gpu(config, weights, 0, 0, memory)?;
     let snapshots = served.snapshots;
     let mut model = Cached::new(served, snapshots, every);
     let prompt = saetta::prefill::test_tokens(tokens);
@@ -1040,5 +1068,17 @@ mod tests {
         assert_eq!(draft(&["--draft", "0"]), Ok(0));
         assert!(draft(&["--draft", "2"]).is_err());
         assert!(draft(&["--gpu", "--draft", "8"]).is_err());
+    }
+
+    #[test]
+    fn lookup_defaults_to_the_draft() {
+        let lookup = |flags: &[&str]| serve_flags(flags).map(|f| f.lookup);
+        assert_eq!(lookup(&["--gpu"]), Ok(3));
+        assert_eq!(lookup(&["--gpu", "--draft", "2"]), Ok(2));
+        assert_eq!(lookup(&["--gpu", "--lookup", "7"]), Ok(7));
+        assert_eq!(lookup(&["--gpu", "--lookup", "0"]), Ok(0));
+        assert_eq!(lookup(&[]), Ok(0));
+        assert!(lookup(&["--gpu", "--draft", "0", "--lookup", "3"]).is_err());
+        assert!(lookup(&["--gpu", "--lookup", "8"]).is_err());
     }
 }
