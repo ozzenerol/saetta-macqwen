@@ -231,18 +231,27 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     }
     let model = Model::new(config, weights)?;
     let states = model.new_states();
-    let server = Arc::new(Server::new(
-        Cached::new(
-            CpuModel { model, states },
-            cache::DEFAULT_LIMIT,
-            cache::DEFAULT_EVERY,
-        ),
-        tokenizer,
-        settings,
-    )?);
+    let model = Cached::new(
+        CpuModel { model, states },
+        cache::DEFAULT_LIMIT,
+        cache::DEFAULT_EVERY,
+    );
+    let model = anchored(model, &tokenizer);
+    let server = Arc::new(Server::new(model, tokenizer, settings)?);
     eprintln!("serving {what} (CPU model)");
     server.serve(listener)?;
     Ok(())
+}
+
+/// The cache keeps the snapshot at the end of the system prompt.
+fn anchored<M: saetta::server::Model + Restore>(
+    model: Cached<M>,
+    tokenizer: &Tokenizer,
+) -> Cached<M> {
+    match tokenizer.token_id("<|im_end|>") {
+        Some(end) => model.anchor_after(end),
+        None => model,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -271,7 +280,10 @@ fn serve_gpu(
     let ServeFlags { draft, memory, .. } = flags;
     let served = load_gpu(config, weights, draft, memory)?;
     let snapshots = served.snapshots;
-    let model = Cached::new(served, snapshots, cache::DEFAULT_EVERY);
+    let model = anchored(
+        Cached::new(served, snapshots, cache::DEFAULT_EVERY),
+        &tokenizer,
+    );
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
     let drafts = if draft > 0 {
         format!(", MTP drafts {draft} per round")

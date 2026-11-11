@@ -30,7 +30,7 @@ For each request:
 
 ## Memory
 
-Snapshots live in GPU buffers. A limit of 16 (about 1 GB) is the default; the least recently used goes first, except the one at the end of the last prompt. With qh, each turn adds the model's answer and a tool result to the end of the prompt, so rule 1 or 2 almost always gives a hit, and only the new tokens are read.
+Snapshots live in GPU buffers. A limit of 16 (about 1 GB) is the default; the least recently used goes first, except the one at the end of the last prompt and up to two at the end of a first message (the first `<|im_end|>`, the system prompt), which a new conversation in qh shares. With qh, each turn adds the model's answer and a tool result to the end of the prompt, so rule 1 or 2 almost always gives a hit, and only the new tokens are read.
 
 ## Cost on the GPU
 
