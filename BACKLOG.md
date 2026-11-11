@@ -3,6 +3,7 @@
 ## Track A: loading and reference data
 
 - A1 `src/config.rs` and `src/weights.rs`: read `config.json` (`text_config`) into a struct; mmap the safetensors shards through `model.safetensors.index.json`; look up a tensor by name and get dtype, shape and bytes. A quantized tensor is a view of weight, scales and biases. `saetta info <model dir>` prints the config and the tensor count.
+- A1b `saetta convert`: rewrite the MLX dir with text tensors only, the data section on a 16 KB boundary and every tensor 256-byte aligned, so Metal can bind tensors without a copy. MLX writes no padding, so most tensors are not even 4-byte aligned.
 - A2 `tools/golden.py`: run MLX on a fixed short prompt and write reference data to `golden/` on the Mac: token ids, the hidden state after the embedding and after each of layers 0 to 3, router choices for those layers, the Gated DeltaNet state after layer 0. Plain f32 files plus a small JSON index. Use lazy loading so only those layers are computed.
 - A3 `src/tokenizer.rs`: byte-level BPE from `tokenizer.json`, special tokens, encode and decode. Test against the MLX tokenizer on a set of strings (ASCII, code, Romanian, CJK, emoji).
 
