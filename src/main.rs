@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-attention";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -37,6 +37,10 @@ fn main() -> ExitCode {
         ["bench-qmv", dir] => report(saetta::qmv::bench(Path::new(dir), 5, 20)),
         #[cfg(target_os = "macos")]
         ["bench-moe", dir] => report(saetta::moe::bench(Path::new(dir), 5)),
+        #[cfg(target_os = "macos")]
+        ["bench-attention"] => {
+            report(saetta::attention::bench(&[1024, 8192, 16384, 32768], 10, 5).map_err(Into::into))
+        }
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
