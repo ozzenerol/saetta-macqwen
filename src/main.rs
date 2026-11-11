@@ -2,6 +2,7 @@ use saetta::cache::{self, Cached, Restore};
 use saetta::config::{Config, LayerType};
 use saetta::cpu::deltanet::DeltaNetState;
 use saetta::cpu::model::{LayerState, Model};
+use saetta::kv_quant::KvBits;
 use saetta::sample::Params;
 use saetta::server::{self, Server, Settings};
 use saetta::tokenizer::Tokenizer;
@@ -16,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--port N] [--context N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--port N] [--context N] [--kv-bits 16|8|4] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -142,17 +143,19 @@ struct ServeFlags {
     port: u16,
     /// Tokens the GPU model has room for.
     context: usize,
+    kv_bits: KvBits,
     exact_history: bool,
 }
 
-/// `[--gpu] [--draft K] [--port N] [--context N] [--exact-history]` after
-/// `serve <dir>`.
+/// `[--gpu] [--draft K] [--port N] [--context N] [--kv-bits 16|8|4]
+/// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut f = ServeFlags {
         gpu: false,
         draft: 0,
         port: 8090,
         context: DEFAULT_CONTEXT,
+        kv_bits: KvBits::Half,
         exact_history: false,
     };
     let mut it = flags.iter();
@@ -177,6 +180,10 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                     .filter(|&n| n > 0)
                     .ok_or(format!("bad context {value}"))?;
             }
+            "--kv-bits" => {
+                let value = it.next().ok_or("--kv-bits needs 16, 8 or 4")?;
+                f.kv_bits = KvBits::parse(value).ok_or(format!("bad --kv-bits {value}"))?;
+            }
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
                 f.port = value.parse().map_err(|_| format!("bad port {value}"))?;
@@ -186,6 +193,10 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     }
     if f.draft > 0 && !f.gpu {
         return Err("--draft needs --gpu".into());
+    }
+    if f.kv_bits != KvBits::Half {
+        // Prefill runs over it already (saetta eval --no-ppl --long N).
+        return Err("--kv-bits 8 and 4 need the decode attention kernels; use 16 for now".into());
     }
     Ok(f)
 }
@@ -198,6 +209,7 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
         draft,
         port,
         context,
+        kv_bits,
         exact_history,
     } = flags;
     // The model borrows these for as long as the server runs.
@@ -219,7 +231,11 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
     if gpu {
-        let gpu = GpuFlags { draft, context };
+        let gpu = GpuFlags {
+            draft,
+            context,
+            kv_bits,
+        };
         return serve_gpu(config, weights, tokenizer, settings, listener, &what, gpu);
     }
     let model = Model::new(config, weights)?;
@@ -263,6 +279,8 @@ struct GpuFlags {
     draft: usize,
     /// Tokens of context.
     context: usize,
+    /// How the KV cache stores keys and values.
+    kv_bits: KvBits,
 }
 
 #[cfg(target_os = "macos")]
@@ -275,7 +293,7 @@ fn serve_gpu(
     what: &str,
     flags: GpuFlags,
 ) -> Result<(), Box<dyn Error>> {
-    let GpuFlags { draft, context } = flags;
+    let GpuFlags { draft, context, .. } = flags;
     let served = load_gpu(config, weights, flags)?;
     let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
@@ -297,10 +315,16 @@ fn load_gpu(
     weights: &'static Weights,
     flags: GpuFlags,
 ) -> Result<GpuServed, Box<dyn Error>> {
-    let GpuFlags { draft, context } = flags;
+    let GpuFlags { draft, context, .. } = flags;
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
-    let model =
-        saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), context)?;
+    let model = saetta::gpu_model::GpuModel::load_with_bits(
+        gpu,
+        config,
+        weights,
+        config.num_layers(),
+        context,
+        flags.kv_bits,
+    )?;
     let layers = model.deltanet_states();
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
     let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
@@ -626,15 +650,18 @@ impl Restore for CpuModel<'_> {
 
 struct EvalOptions {
     gpu: bool,
+    kv_bits: KvBits,
     gate: saetta::eval::Options,
 }
 
 /// `--gpu` runs the GPU model instead of the CPU one; `--long N` runs the
 /// first N tokens of the long prompt (default 0, off), through prefill, or
-/// one token at a time with `--decode`; `--no-ppl` skips the perplexity text.
+/// one token at a time with `--decode`; `--no-ppl` skips the perplexity text;
+/// `--kv-bits 16|8|4` sets the GPU model's KV cache.
 fn eval_options(options: &[&str]) -> Option<EvalOptions> {
     let mut o = EvalOptions {
         gpu: false,
+        kv_bits: KvBits::Half,
         gate: saetta::eval::Options {
             ppl: true,
             long: 0,
@@ -648,6 +675,7 @@ fn eval_options(options: &[&str]) -> Option<EvalOptions> {
             "--no-ppl" => o.gate.ppl = false,
             "--decode" => o.gate.decode = true,
             "--long" => o.gate.long = rest.next()?.parse().ok()?,
+            "--kv-bits" => o.kv_bits = KvBits::parse(rest.next()?)?,
             _ => return None,
         }
     }
@@ -678,10 +706,11 @@ fn eval_gpu(
     let flags = GpuFlags {
         draft: 0,
         context: DEFAULT_CONTEXT,
+        kv_bits: o.kv_bits,
     };
     let mut model = load_gpu(config, weights, flags)?;
     let prefill = if model.prefill.exact { "exact" } else { "fast" };
-    println!("GPU model, {prefill} prefill");
+    println!("GPU model, {prefill} prefill, {:?} KV cache", o.kv_bits);
     saetta::eval::gate(&mut model, reference, &o.gate)
 }
 

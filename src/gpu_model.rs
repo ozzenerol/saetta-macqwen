@@ -17,6 +17,7 @@ mod mac {
     use crate::gpu_layers::{
         GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm, add_norm, mix_norm,
     };
+    use crate::kv_quant::KvBits;
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
@@ -249,6 +250,19 @@ mod mac {
             kind: LayerType,
             capacity: usize,
         ) -> Result<GpuLayer<'a>, String> {
+            GpuLayer::load_with_bits(gpu, cfg, weights, prefix, kind, capacity, KvBits::Half)
+        }
+
+        /// As `load`, with an attention layer's cache stored as `bits`.
+        pub(crate) fn load_with_bits(
+            gpu: &Gpu,
+            cfg: &Config,
+            weights: &'a Weights,
+            prefix: &str,
+            kind: LayerType,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Result<GpuLayer<'a>, String> {
             let mixer = match kind {
                 LayerType::LinearAttention => {
                     let m = GpuDeltaNet::load(gpu, cfg, weights, prefix)?;
@@ -257,7 +271,7 @@ mod mac {
                 }
                 LayerType::FullAttention => {
                     let m = GpuAttention::load(gpu, cfg, weights, prefix)?;
-                    let cache = GpuKvCache::new(gpu, &m.cfg, capacity);
+                    let cache = GpuKvCache::with_bits(gpu, &m.cfg, capacity, bits);
                     Mixer::Full(m, cache)
                 }
             };
@@ -369,6 +383,7 @@ mod mac {
         logits: View,
         scratch: Scratch,
         capacity: usize,
+        kv_bits: KvBits,
         position: usize,
     }
 
@@ -392,12 +407,33 @@ mod mac {
             layers: usize,
             capacity: usize,
         ) -> Result<GpuModel<'a>, String> {
+            GpuModel::load_with_bits(gpu, cfg, weights, layers, capacity, KvBits::Half)
+        }
+
+        /// As `load`, with the KV caches stored as `bits`. Prefill works on
+        /// such a model; decode needs track B's attention kernels first.
+        pub fn load_with_bits(
+            gpu: &'a Gpu,
+            cfg: &'a Config,
+            weights: &'a Weights,
+            layers: usize,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Result<GpuModel<'a>, String> {
             assert!(layers <= cfg.num_layers());
             let embed = load_embed(gpu, cfg, weights)?;
             let loaded = (0..layers)
                 .map(|l| {
                     let prefix = format!("{PREFIX}.layers.{l}");
-                    GpuLayer::load(gpu, cfg, weights, &prefix, cfg.layer_types[l], capacity)
+                    GpuLayer::load_with_bits(
+                        gpu,
+                        cfg,
+                        weights,
+                        &prefix,
+                        cfg.layer_types[l],
+                        capacity,
+                        bits,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let final_norm = vector(gpu, weights, &format!("{PREFIX}.norm.weight"))?;
@@ -433,6 +469,7 @@ mod mac {
                 logits,
                 scratch,
                 capacity,
+                kv_bits: bits,
                 position: 0,
             })
         }
@@ -480,6 +517,11 @@ mod mac {
 
         /// Runs one token and leaves the results on the GPU.
         pub fn run(&mut self, token: u32) {
+            assert!(
+                self.kv_bits == KvBits::Half,
+                "decode over a {:?} KV cache needs track B's attention kernels",
+                self.kv_bits
+            );
             assert!(
                 self.position < self.capacity,
                 "context is full ({} tokens)",

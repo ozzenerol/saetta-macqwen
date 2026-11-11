@@ -281,10 +281,11 @@ mod mac {
             self.k_proj.record(plan, x, &k, true);
             self.v_proj.record(plan, x, &v, true);
             self.record_store(plan, cache);
-            assert!(
-                cache.quant.is_none(),
-                "decode attention over a quantized KV cache needs track B's kernels"
-            );
+            if cache.quant.is_some() {
+                // Decode attention over a quantized cache comes with track B's
+                // kernels; GpuModel::run refuses to run until then.
+                return;
+            }
 
             let (keys, values) = (whole(&cache.keys), whole(&cache.values));
             cache
