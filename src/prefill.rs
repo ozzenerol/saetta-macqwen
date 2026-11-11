@@ -294,8 +294,9 @@ mod mac {
         std::env::var("SAETTA_QMM2").map_or(true, |v| v != "0")
     }
 
-    /// SAETTA_DELTA=1 runs the delta rule on delta_rows instead of
-    /// delta_prep and delta_rows2, to compare.
+    /// SAETTA_DELTA=1 runs the DeltaNet conv and delta rule on conv_rows and
+    /// delta_rows instead of conv_rows2 and delta_prep plus delta_rows2, to
+    /// compare.
     fn old_delta() -> bool {
         std::env::var("SAETTA_DELTA").is_ok_and(|v| v == "1")
     }
@@ -1183,7 +1184,24 @@ mod mac {
                 };
                 params(enc, 4, &p);
                 set_views(enc, 5, &[&whole(conv_snaps)]);
-                enc.dispatch_threads(MTLSize::new(channels as u64, 1, 1), MTLSize::new(256, 1, 1));
+                if old_delta() {
+                    enc.dispatch_threads(
+                        MTLSize::new(channels as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                } else {
+                    assert!(c.kernel <= 9);
+                    enc.set_compute_pipeline_state(&gpu.pipeline("conv_rows2"));
+                    enc.dispatch_threads(
+                        MTLSize::new(channels as u64, t as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    enc.set_compute_pipeline_state(&gpu.pipeline("conv_state"));
+                    enc.dispatch_threads(
+                        MTLSize::new(channels as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
             }
 
             if !self.on("deltanet delta") {

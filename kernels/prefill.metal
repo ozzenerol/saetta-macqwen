@@ -714,6 +714,57 @@ kernel void delta_rows(device const float *mixed [[buffer(0)]],
     }
 }
 
+// conv_rows with one thread per (channel, token), all tokens at once, then
+// conv_state moves the last kernel_size - 1 inputs into the state. Input i
+// of the window is x[i] for i >= 0, else state row i + kernel_size - 1.
+inline float prefill_conv_in(device const float *x, device const float *state, int i, uint c,
+                             constant ConvRowsParams &p) {
+    return i >= 0 ? x[ulong(i) * p.channels + c] : state[uint(i + int(p.kernel_size) - 1) * p.channels + c];
+}
+
+kernel void conv_rows2(device const float *x [[buffer(0)]],
+                       device const float *w [[buffer(1)]],
+                       device const float *state [[buffer(2)]],
+                       device float *out [[buffer(3)]],
+                       constant ConvRowsParams &p [[buffer(4)]],
+                       device float *snaps [[buffer(5)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.x, t = gid.y;
+    if (c >= p.channels || t >= p.tokens) {
+        return;
+    }
+    int past = int(p.kernel_size) - 1;
+    device const float *wc = w + c * p.kernel_size;
+    float acc = 0;
+    for (int j = 0; j <= past; j++) {
+        acc += wc[j] * prefill_conv_in(x, state, int(t) - past + j, c, p);
+    }
+    out[ulong(t) * p.channels + c] = silu(acc);
+    if (p.snapshots) {
+        device float *snap = snaps + ulong(t) * uint(past) * p.channels;
+        for (int j = 0; j < past; j++) {
+            snap[uint(j) * p.channels + c] = prefill_conv_in(x, state, int(t) - past + 1 + j, c, p);
+        }
+    }
+}
+
+kernel void conv_state(device const float *x [[buffer(0)]],
+                       device float *state [[buffer(2)]],
+                       constant ConvRowsParams &p [[buffer(4)]],
+                       uint c [[thread_position_in_grid]]) {
+    if (c >= p.channels) {
+        return;
+    }
+    int past = int(p.kernel_size) - 1;
+    float last[8];
+    for (int j = 0; j < past; j++) {
+        last[j] = prefill_conv_in(x, state, int(p.tokens) - past + j, c, p);
+    }
+    for (int j = 0; j < past; j++) {
+        state[uint(j) * p.channels + c] = last[j];
+    }
+}
+
 // delta_rows in two steps. delta_prep runs over all tokens at once: q and
 // k of each k head are normalized in place in `mixed` (q also scaled by
 // 1/sqrt(K_DIM)), and a and b become the decay g and the rate beta. Then
