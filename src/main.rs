@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -242,6 +242,9 @@ struct Memory {
     cache_bytes: usize,
     /// How the KV caches store keys and values.
     kv_bits: KvBits,
+    /// Snapshots unused for this long go when they keep the KV caches more
+    /// than twice as long as a request needs; None keeps them.
+    cache_idle: Option<std::time::Duration>,
 }
 
 impl Default for Memory {
@@ -251,11 +254,12 @@ impl Default for Memory {
             context: 262144,
             cache_bytes: 1 << 30,
             kv_bits: KvBits::Half,
+            cache_idle: Some(std::time::Duration::from_secs(15 * 60)),
         }
     }
 }
 
-/// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N]
+/// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N]
 /// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut draft = None;
@@ -300,6 +304,16 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                     .parse()
                     .map_err(|_| format!("bad cache size {value}"))?;
                 f.memory.cache_bytes = mb << 20;
+            }
+            "--cache-idle-min" => {
+                let value = it.next().ok_or("--cache-idle-min needs minutes")?;
+                let min: f64 = value
+                    .parse()
+                    .ok()
+                    .filter(|m: &f64| *m >= 0.0 && m.is_finite())
+                    .ok_or(format!("bad --cache-idle-min {value}"))?;
+                f.memory.cache_idle =
+                    (min > 0.0).then(|| std::time::Duration::from_secs_f64(min * 60.0));
             }
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
@@ -398,7 +412,10 @@ fn serve_gpu(
     let ServeFlags { draft, memory, .. } = flags;
     let served = load_gpu(config, weights, draft, memory)?;
     let snapshots = served.snapshots;
-    let model = anchored(Cached::new(served, snapshots, SNAPSHOT_EVERY), &tokenizer);
+    let mut model = anchored(Cached::new(served, snapshots, SNAPSHOT_EVERY), &tokenizer);
+    if let Some(idle) = memory.cache_idle {
+        model = model.expire_after(idle);
+    }
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
     let drafts = if draft > 0 {
         format!(", MTP drafts {draft} per round")

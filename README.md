@@ -41,7 +41,7 @@ cargo build --release
 ./target/release/saetta gpu-check
 ```
 
-`saetta serve <model dir> --gpu` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default, `--port N` to change it). Without `--gpu` it runs the CPU model, at about 375 ms per token. With `--gpu` the MTP layer drafts up to 3 tokens per step by default; `--draft K` sets the most it drafts, and `--draft 0` turns drafting off. `--context N` (default 262144, the model's full context) caps the context. The KV caches start at 32768 tokens and double as a conversation needs more, so a short chat takes about 2 GB besides the weights. `--cache-mb N` (default 1024) bounds the prompt cache. [docs/MEMORY.md](docs/MEMORY.md) has the numbers.
+`saetta serve <model dir> --gpu` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default, `--port N` to change it). Without `--gpu` it runs the CPU model, at about 375 ms per token. With `--gpu` the MTP layer drafts up to 3 tokens per step by default; `--draft K` sets the most it drafts, and `--draft 0` turns drafting off. `--context N` (default 262144, the model's full context) caps the context. The KV caches start at 32768 tokens and double as a conversation needs more, so a short chat takes about 2 GB besides the weights. `--cache-mb N` (default 1024) bounds the prompt cache, and `--cache-idle-min M` (default 15, 0 off) drops a long conversation's snapshots after M idle minutes so its KV memory can go. [docs/MEMORY.md](docs/MEMORY.md) has the numbers.
 
 ## License
 

@@ -9,6 +9,7 @@ use crate::cpu::deltanet::DeltaNetState;
 use crate::cpu::model::LayerState;
 use crate::server::Model;
 use crate::speculative::Decider;
+use std::time::{Duration, Instant};
 
 /// Saved snapshots by default: about 1 GB with the 66 MB states of the 35B model.
 pub const DEFAULT_LIMIT: usize = 16;
@@ -74,6 +75,8 @@ struct Snapshot<S> {
     tokens: Vec<u32>,
     state: S,
     used: u64,
+    /// When it was made or last used.
+    touched: Instant,
     /// The snapshot at the end of the last prompt, kept when evicting.
     pinned: bool,
     /// At the end of a first message, the system prompt that a new
@@ -123,6 +126,7 @@ impl<S> Snapshots<S> {
         match self.items.iter_mut().find(|s| s.tokens == tokens) {
             Some(s) => {
                 s.used = self.clock;
+                s.touched = Instant::now();
                 s.pinned |= pin;
                 s.anchored |= anchor;
             }
@@ -130,6 +134,7 @@ impl<S> Snapshots<S> {
                 tokens: tokens.to_vec(),
                 state: state(),
                 used: self.clock,
+                touched: Instant::now(),
                 pinned: pin,
                 anchored: anchor,
             }),
@@ -239,7 +244,26 @@ impl<S> Snapshots<S> {
             .filter(|s| tokens.starts_with(&s.tokens))
             .max_by_key(|s| s.tokens.len())?;
         best.used = clock;
+        best.touched = Instant::now();
         Some((best.tokens.len(), &best.state))
+    }
+
+    /// Drops the snapshots but anchors longer than `longer_than` tokens that
+    /// were not used for `idle` up to `now`, and returns how many went and the
+    /// longest of them.
+    pub fn expire(&mut self, now: Instant, idle: Duration, longer_than: usize) -> (usize, usize) {
+        let mut dropped = (0, 0);
+        self.items.retain(|s| {
+            // The pinned one too: a request that continues it is longer.
+            let keep = s.anchored
+                || s.tokens.len() <= longer_than
+                || now.saturating_duration_since(s.touched) < idle;
+            if !keep {
+                dropped = (dropped.0 + 1, dropped.1.max(s.tokens.len()));
+            }
+            keep
+        });
+        dropped
     }
 }
 
@@ -259,6 +283,9 @@ pub struct Cached<M: Restore> {
     rows: Vec<u32>,
     /// KV rows copied aside before a detour wrote over them.
     backup: Option<Backup>,
+    /// Snapshots unused for this long go when they hold more than twice
+    /// the tokens a request needs, so their KV rows can be freed.
+    idle: Option<Duration>,
 }
 
 struct Backup {
@@ -280,7 +307,15 @@ impl<M: Model + Restore> Cached<M> {
             message_end: None,
             rows: Vec::new(),
             backup: None,
+            idle: None,
         }
+    }
+
+    /// Drops snapshots unused for `idle` that keep the KV caches more than
+    /// twice as long as a request needs (see `expire_idle`).
+    pub fn expire_after(mut self, idle: Duration) -> Cached<M> {
+        self.idle = Some(idle);
+        self
     }
 
     /// Keeps a snapshot after the first `token`, the end of the system
@@ -298,6 +333,21 @@ impl<M: Model + Restore> Cached<M> {
             self.rows.resize(end, u32::MAX);
         }
         self.rows[at..end].copy_from_slice(tokens);
+    }
+
+    /// Drops the snapshots that went unused for `idle` and are more than
+    /// twice as long as the prompt being run and the state, so their rows
+    /// can go. Going back to such a conversation later runs its prompt again.
+    fn expire_idle(&mut self, prompt: usize) {
+        let Some(idle) = self.idle else { return };
+        let need = prompt.max(self.tokens.len()) + DRAFT_ROWS;
+        let (n, longest) = self.snapshots.expire(Instant::now(), idle, 2 * need);
+        if n > 0 {
+            eprintln!(
+                "prompt cache: dropped {n} snapshots unused for {} s, up to {longest} tokens",
+                idle.as_secs()
+            );
+        }
     }
 
     /// Lets the model free the KV rows that nothing can use: past the
@@ -498,6 +548,7 @@ impl<M: Model + Restore> Model for Cached<M> {
                 rows: self.rows[keep..keep + n].to_vec(),
             });
         }
+        self.expire_idle(prompt.len());
         // Free the backup once no snapshot past its start needs its rows.
         if let Some(b) = &self.backup {
             let from = b.from;
@@ -816,6 +867,47 @@ mod tests {
         let last = *c.model().released.last().unwrap();
         assert!(last < 300, "need {last}");
         assert!(c.model().rows.len() <= last);
+    }
+
+    /// Snapshots unused for the idle time go when they are more than twice
+    /// as long as the new request, and a later return to them runs again.
+    #[test]
+    fn idle_snapshots_of_a_long_conversation_go() {
+        let mut c = Cached::new(Toy::keeping(), 16, 16).expire_after(Duration::from_secs(900));
+        let long = tokens(300, 0);
+        request(&mut c, &long);
+        let short = tokens(20, 5);
+        request(&mut c, &short);
+        // Not idle yet: the long conversation stays.
+        assert!(c.snapshots().lengths().iter().any(|&n| n > 100));
+        assert!(*c.model().released.last().unwrap() >= 300);
+
+        let mut c = Cached::new(Toy::keeping(), 16, 16).expire_after(Duration::ZERO);
+        request(&mut c, &long);
+        let (logits, _) = request(&mut c, &short);
+        assert_eq!(logits, fresh(&short));
+        // The pinned snapshot is the short prompt's; nothing long is left.
+        assert!(c.snapshots().lengths().iter().all(|&n| n < 100));
+        let (logits, _) = request(&mut c, &long);
+        assert_eq!(logits, fresh(&long));
+    }
+
+    #[test]
+    fn expire_keeps_recent_short_and_anchored() {
+        let mut s: Snapshots<()> = Snapshots::new(16);
+        let all = tokens(400, 0);
+        s.insert(&all[..10], || (), false, false);
+        s.insert(&all[..20], || (), false, true);
+        s.insert(&all[..200], || (), false, false);
+        s.insert(&all[..300], || (), false, false);
+        s.insert(&all[..400], || (), true, false);
+        let idle = Duration::from_secs(900);
+        assert_eq!(s.expire(Instant::now(), idle, 50), (0, 0));
+        let later = Instant::now() + Duration::from_secs(901);
+        assert_eq!(s.expire(later, idle, 250), (2, 400));
+        assert_eq!(s.lengths(), vec![10, 20, 200]);
+        assert_eq!(s.expire(later, idle, 50), (1, 200));
+        assert_eq!(s.lengths(), vec![10, 20]);
     }
 
     /// Without kept rows, another branch is never used.

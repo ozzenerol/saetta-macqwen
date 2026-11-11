@@ -1,12 +1,16 @@
 # Memory of a running saetta server over a qh-like session, on the Mac:
 #   python3 tools/memory_bench.py --pid $(pgrep -f 'saetta serve') \
-#       --turns 20 --long 45k --others 4
+#       --turns 20 --long 45k --idle 90 --others 4
 # After each request it prints the footprint at once and --settle seconds
 # later, with the cached tokens of the request. Steps:
 # 1. a growing conversation of --turns turns (the last prompt, its answer
 #    and a tool result each time), as qh sends them
 # 2. one prompt of --long tokens
-# 3. --others short conversations with different system prompts, which push
+# 3. with --idle S: a wait of S seconds, then a short new conversation. With
+#    the server started with --cache-idle-min below S / 60, the long
+#    conversation's snapshots go and the KV caches shrink: the line
+#    "after idle" shows the footprint before the wait and after the request
+# 4. --others short conversations with different system prompts, which push
 #    the long one's snapshots out, so the KV caches can shrink
 # Thinking is off and temperature 0, so runs repeat.
 import argparse
@@ -70,6 +74,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=128, help="answer tokens per request")
     ap.add_argument("--turns", type=int, default=20)
     ap.add_argument("--long", default="45k")
+    ap.add_argument("--idle", type=float, default=0, help="seconds to wait after the long prompt; 0 skips it")
     ap.add_argument("--others", type=int, default=4)
     ap.add_argument("--settle", type=float, default=6)
     args = ap.parse_args()
@@ -88,6 +93,20 @@ def main():
     words = tokens_of(args.long) // 7
     long = " ".join(FILLER.format(i) for i in range(words))
     measure(args, f"long {args.long}", [{"role": "user", "content": long + "\nSummarize."}])
+
+    if args.idle > 0:
+        before = footprint_mb(args.pid)
+        time.sleep(args.idle)
+        convo = [{"role": "system", "content": "You are back after a break."},
+                 {"role": "user", "content": "Say hello."}]
+        chat(args.url, convo, args.tokens)
+        time.sleep(args.settle)
+        after = footprint_mb(args.pid)
+        fmt = lambda f: "?" if f[0] is None else f"{f[0]:.0f}"
+        print(f"after idle {args.idle:.0f} s: footprint {fmt(before)} MB before the wait, "
+              f"{fmt(after)} MB after a short new request (rss {before[1]:.0f} then {after[1]:.0f} MB); "
+              f"the server log says \"prompt cache: dropped\" when the idle snapshots went",
+              flush=True)
 
     for i in range(args.others):
         convo = [{"role": "system", "content": f"You are helper number {i}."},
