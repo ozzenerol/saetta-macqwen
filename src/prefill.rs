@@ -31,13 +31,18 @@ mod mac {
     /// Key block of attention_rows2 (attention_rows takes 32); the KV
     /// cache needs this much slack.
     const KEY_BLOCK: usize = 64;
+    const _: () = assert!(KEY_BLOCK.is_multiple_of(crate::attention_prefill::KEY_BLOCK));
 
     /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one and
     /// SAETTA_ATT=8 the one with 8 heads per threadgroup, to compare.
+    /// The fast-mode attention kernel: SAETTA_ATT=fa8 or fa4 picks B's flash
+    /// kernels in src/attention_prefill.rs, 1 and 8 older ones.
     fn attention_half_kernel() -> &'static str {
         match std::env::var("SAETTA_ATT").as_deref() {
             Ok("1") => "attention_rows_half",
             Ok("8") => "attention_rows2_half8",
+            Ok("fa8") => "attention_fa8",
+            Ok("fa4") => "attention_fa4",
             _ => "attention_rows2_half",
         }
     }
@@ -1421,6 +1426,22 @@ mod mac {
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
+                if kernel.starts_with("attention_fa") {
+                    let p = crate::attention_prefill::FlashParams {
+                        heads: c.heads as u32,
+                        kv_heads: c.kv_heads as u32,
+                        pos: pos as u32,
+                        tokens: t as u32,
+                        scale: 1.0 / (d as f32).sqrt(),
+                    };
+                    let (k, v) = (&cached[0], &cached[1]);
+                    crate::attention_prefill::encode(enc, gpu, kernel, &q_half, k, v, &q_and_gate, &y, p);
+                    self.record(gpu, enc, 2, &y, t * c.heads * d);
+                    if self.on("attention o_proj") {
+                        self.mm(gpu, enc, &w.o, &y, out, t);
+                    }
+                    return;
+                }
                 enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q_half, &cached[0], &cached[1]]);
             }
@@ -1995,7 +2016,13 @@ mod mac {
         #[test]
         fn kernels_compile() {
             let gpu = Gpu::new().unwrap();
-            for name in ["prefill_gate_up_5bit", "prefill_gate_up_8bit", "prefill_silu_few"] {
+            for name in [
+                "prefill_gate_up_5bit",
+                "prefill_gate_up_8bit",
+                "prefill_silu_few",
+                "attention_fa8",
+                "attention_fa4",
+            ] {
                 gpu.pipeline(name);
             }
         }

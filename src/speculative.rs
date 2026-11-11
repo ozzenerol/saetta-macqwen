@@ -653,7 +653,11 @@ mod gpu {
                 self.round(model, prefill, pending, decide, k)
             };
             let seconds = start.elapsed().as_secs_f64();
-            eprintln!("ROUND k {k} ctx {context} accepted {} {:.1} ms", drafts.len(), seconds * 1e3);
+            eprintln!(
+                "ROUND k {k} ctx {context} accepted {} {:.1} ms",
+                drafts.len(),
+                seconds * 1e3
+            );
             self.length.record(context, k, drafts.len(), seconds);
             self.lengths[k] += 1;
             (drafts, next)
