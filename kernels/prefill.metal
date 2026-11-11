@@ -864,7 +864,8 @@ template [[host_name("attention_rows")]] kernel decltype(attention_rows<float>) 
 template [[host_name("attention_rows_half")]] kernel decltype(attention_rows<half>) attention_rows<half>;
 
 // attention_rows over a half cache, with q held in registers for the whole
-// key loop and 64 keys per block. T is the type of q and of the
+// key loop and 64 keys per block, SIMDS heads of one kv head per
+// threadgroup. T is the type of q and of the
 // probabilities; the products accumulate in f32.
 constant uint PREFILL_ATT2_KB = 64;
 
@@ -878,7 +879,7 @@ inline simdgroup_matrix<T, 8, 8> prefill_att2_widen(simdgroup_half8x8 m) {
     return r;
 }
 
-template <typename T>
+template <typename T, uint SIMDS>
 kernel void attention_rows2(device const T *q [[buffer(0)]],
                             device const half *keys [[buffer(1)]],
                             device const half *values [[buffer(2)]],
@@ -890,14 +891,14 @@ kernel void attention_rows2(device const T *q [[buffer(0)]],
                             uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint KB = PREFILL_ATT2_KB;
     constexpr uint D = PREFILL_ATT_DIM;
-    threadgroup float s_all[PREFILL_ATT_SIMDS][8 * KB];
-    threadgroup T p_all[PREFILL_ATT_SIMDS][8 * KB];
-    threadgroup float a_all[PREFILL_ATT_SIMDS][8];
+    threadgroup float s_all[SIMDS][8 * KB];
+    threadgroup T p_all[SIMDS][8 * KB];
+    threadgroup float a_all[SIMDS][8];
     threadgroup float *sc = s_all[simd];
     threadgroup T *pt = p_all[simd];
     threadgroup float *al = a_all[simd];
 
-    uint h = tg.y * PREFILL_ATT_SIMDS + simd;
+    uint h = tg.y * SIMDS + simd;
     uint kv = h / (p.heads / p.kv_heads);
     uint q0 = tg.x * 8;
     uint q_stride = p.heads * D;
@@ -1007,8 +1008,9 @@ kernel void attention_rows2(device const T *q [[buffer(0)]],
     }
 }
 
-template [[host_name("attention_rows2")]] kernel decltype(attention_rows2<float>) attention_rows2<float>;
-template [[host_name("attention_rows2_half")]] kernel decltype(attention_rows2<half>) attention_rows2<half>;
+template [[host_name("attention_rows2")]] kernel decltype(attention_rows2<float, 4>) attention_rows2<float, 4>;
+template [[host_name("attention_rows2_half")]] kernel decltype(attention_rows2<half, 4>) attention_rows2<half, 4>;
+template [[host_name("attention_rows2_half8")]] kernel decltype(attention_rows2<half, 8>) attention_rows2<half, 8>;
 
 kernel void to_half(device const float *x [[buffer(0)]],
                     device half *y [[buffer(1)]],
@@ -1086,6 +1088,7 @@ struct GroupParams {
     uint pairs;  // tokens * top_k
     uint top_k;
     uint experts;
+    uint tile_rows;  // rows per tile at most
 };
 
 // One threadgroup sorts the (token, slot) pairs by expert. For each pair i:
@@ -1117,8 +1120,8 @@ kernel void moe_group(device const uint *ids [[buffer(0)]],
         for (uint e = 0; e < p.experts; e++) {
             uint count = atomic_load_explicit(&counts[e], memory_order_relaxed);
             offsets[e] = offset;
-            for (uint s = 0; s < count; s += PREFILL_MM_BM) {
-                tiles[n++] = uint4(e, offset + s, min(PREFILL_MM_BM, count - s), 0);
+            for (uint s = 0; s < count; s += p.tile_rows) {
+                tiles[n++] = uint4(e, offset + s, min(p.tile_rows, count - s), 0);
             }
             offset += count;
             atomic_store_explicit(&counts[e], 0, memory_order_relaxed);

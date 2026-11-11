@@ -32,13 +32,13 @@ mod mac {
     /// cache needs this much slack.
     const KEY_BLOCK: usize = 64;
 
-    /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one, to
-    /// compare.
+    /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one and
+    /// SAETTA_ATT=8 the one with 8 heads per threadgroup, to compare.
     fn attention_half_kernel() -> &'static str {
-        if std::env::var("SAETTA_ATT").is_ok_and(|v| v == "1") {
-            "attention_rows_half"
-        } else {
-            "attention_rows2_half"
+        match std::env::var("SAETTA_ATT").as_deref() {
+            Ok("1") => "attention_rows_half",
+            Ok("8") => "attention_rows2_half8",
+            _ => "attention_rows2_half",
         }
     }
 
@@ -247,6 +247,47 @@ mod mac {
         groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
     }
 
+    /// qmm_grouped on qmm2 (src/qmm.rs), which takes `x_half`, the half of
+    /// `x`; the tiles of FEW rows or fewer still go to qmm_few on `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn qmm2_grouped(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        x_half: &View,
+        y: &View,
+        g: &Grouped,
+        gather_x: bool,
+    ) {
+        assert_eq!(crate::qmm::FEW, FEW);
+        crate::qmm::encode_gather(
+            enc,
+            gpu,
+            crate::qmm::DEFAULT,
+            w,
+            x_half,
+            y,
+            g.tiles,
+            g.rows,
+            g.tile_count,
+            g.max_tiles,
+            gather_x,
+        );
+        enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
+        set_quant(enc, 0, w);
+        set_views(enc, 3, &[x, y]);
+        let shape = MmShape {
+            m: 0,
+            n: w.rows as u32,
+            k: w.cols as u32,
+            gather: if gather_x { 1 } else { 2 },
+        };
+        params(enc, 5, &shape);
+        set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
+        groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -345,6 +386,9 @@ mod mac {
         expert_g: Buffer,
         expert_u: Buffer,
         expert_out: Buffer,
+        /// normed and expert_g in half, the input of qmm2 in fast mode
+        normed_half: Buffer,
+        expert_half: Buffer,
         max_tiles: usize,
     }
 
@@ -359,7 +403,7 @@ mod mac {
             let narrow = (d.v_heads * d.v_dim).max(a.heads * a.head_dim);
             let pairs = chunk * cfg.num_experts_per_tok;
             let size = cfg.moe_intermediate_size;
-            let max_tiles = pairs.div_ceil(TILE) + cfg.num_experts;
+            let max_tiles = pairs.div_ceil(TILE.min(crate::qmm::tile_rows())) + cfg.num_experts;
             Scratch {
                 normed: f(chunk * h),
                 wide: f(chunk * wide),
@@ -384,6 +428,8 @@ mod mac {
                 expert_g: f(pairs * size),
                 expert_u: f(pairs * size),
                 expert_out: f(pairs * h),
+                normed_half: f(chunk * h / 2),
+                expert_half: f(pairs * size / 2),
                 max_tiles,
             }
         }
@@ -442,6 +488,7 @@ mod mac {
         pairs: u32,
         top_k: u32,
         experts: u32,
+        tile_rows: u32,
     }
 
     #[repr(C)]
@@ -1249,8 +1296,13 @@ mod mac {
                 }
                 return;
             }
+            let kernel = if self.exact {
+                "attention_rows"
+            } else {
+                attention_half_kernel()
+            };
             if self.exact {
-                enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows"));
+                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q, &whole(&cache.keys), &whole(&cache.values)]);
             } else {
                 let q_half = whole(&s.q_half);
@@ -1261,7 +1313,7 @@ mod mac {
                 );
                 to_half(gpu, enc, &keys, &hk, t * kv_size);
                 to_half(gpu, enc, &values, &hv, t * kv_size);
-                enc.set_compute_pipeline_state(&gpu.pipeline(attention_half_kernel()));
+                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q_half, &whole(&half.keys), &whole(&half.values)]);
             }
             set_views(enc, 3, &[&q_and_gate, &y]);
@@ -1273,8 +1325,10 @@ mod mac {
                 scale: 1.0 / (d as f32).sqrt(),
             };
             params(enc, 5, &p);
-            // 4 heads of one kv head per threadgroup.
-            groups(enc, (t.div_ceil(8), c.heads / 4), 128);
+            // Heads of one kv head per threadgroup.
+            let heads = if kernel.ends_with('8') { 8 } else { 4 };
+            assert!((c.heads / c.kv_heads).is_multiple_of(heads));
+            groups(enc, (t.div_ceil(8), c.heads / heads), 32 * heads);
             self.record(gpu, enc, 2, &y, t * c.heads * d);
             if self.on("attention o_proj") {
                 qmm(gpu, enc, &w.o, &y, out, t, self.exact);
@@ -1330,6 +1384,12 @@ mod mac {
                 qmm(gpu, enc, &layer.shared[2], &sg, &sd, t, self.exact);
             }
 
+            // Fast mode runs the experts on qmm2, with its tile size.
+            let tile_rows = if self.exact {
+                TILE
+            } else {
+                crate::qmm::tile_rows()
+            };
             let [ids, weights, order, rows, tiles, tile_count] = [
                 &s.ids,
                 &s.expert_weights,
@@ -1355,6 +1415,7 @@ mod mac {
                     pairs: (t * top_k) as u32,
                     top_k: top_k as u32,
                     experts: cfg.num_experts as u32,
+                    tile_rows: tile_rows as u32,
                 };
                 params(enc, 5, &p);
                 groups(enc, (1, 1), 1024);
@@ -1364,14 +1425,21 @@ mod mac {
                 tiles: &tiles,
                 rows: &rows,
                 tile_count: &tile_count,
-                max_tiles: (t * top_k).div_ceil(TILE) + cfg.num_experts,
+                max_tiles: (t * top_k).div_ceil(tile_rows) + cfg.num_experts,
             };
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
+            let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
             if self.on("experts gate, up") {
-                qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, self.exact);
-                qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, self.exact);
+                if self.exact {
+                    qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
+                    qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
+                } else {
+                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
+                    qmm2_grouped(gpu, enc, &e.up, normed, &normed_half, &eu, &g, true);
+                }
             }
             if self.on("experts silu") {
                 dispatch_1d(
@@ -1383,7 +1451,12 @@ mod mac {
                 self.record(gpu, enc, 4, &eg, t * top_k * e.size());
             }
             if self.on("experts down") {
-                qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, self.exact);
+                if self.exact {
+                    qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, true);
+                } else {
+                    to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    qmm2_grouped(gpu, enc, &e.down, &eg, &expert_half, &eo, &g, false);
+                }
             }
 
             if self.on("combine") {
