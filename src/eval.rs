@@ -12,12 +12,16 @@
 //!   top token.
 //!
 //! The long check passes on the median KL over all checkpoints, not on each
-//! one. A correct model can still fail a single checkpoint: at position
-//! 4051 of the 32k prompt, layer 1's router has two experts within 9e-7 of
-//! each other, so a 1e-6 difference in its input (normal f32 rounding)
-//! picks the other one, and the later layers carry that one token's change
-//! to KL 3.4e-2 at position 4095. MLX's own bf16 run is at 4.9e-3 there. A
-//! real bug moves most checkpoints and the perplexity; a near-tie moves one.
+//! one. Some positions are ill-conditioned: at position 4095 of the 32k
+//! prompt the GPU model's KL went from 3.4e-2 to 6.3e-2 between builds with
+//! small kernel changes, while the other checkpoints stayed below 6e-4 and
+//! the perplexity over the first 4096 tokens stayed within 0.042% of MLX
+//! float32. MLX's own bf16 run is at 4.9e-3 there. Rounding moves expert
+//! choices at near-ties (layer 1 at position 4051 has two experts within
+//! 9e-7), and the later layers carry that forward. Forcing the CPU's choice
+//! at 4051 did not bring 4095 down, so no single tie explains it. A real bug
+//! moves most checkpoints and the perplexity; an ill-conditioned position
+//! moves one.
 
 use crate::server::Model;
 use serde_json::Value;
