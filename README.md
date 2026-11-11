@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/logo.png" alt="saetta-macqwen" width="640"></p>
+<p align="center"><img src="docs/saetta-car.png" alt="saetta-macqwen" width="640"></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
