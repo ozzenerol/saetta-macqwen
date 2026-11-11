@@ -52,6 +52,7 @@ mod mac {
     const CONSTANT_BYTES: usize = 1 << 20;
 
     struct Op {
+        kernel: String,
         pipeline: ComputePipelineState,
         buffers: Vec<(Buffer, u64)>,
         grid: MTLSize,
@@ -110,6 +111,7 @@ mod mac {
             barrier: bool,
         ) {
             self.ops.push(Op {
+                kernel: kernel.to_string(),
                 pipeline: self.gpu.pipeline(kernel),
                 buffers: buffers
                     .iter()
@@ -164,24 +166,45 @@ mod mac {
             })
         }
 
+        /// Each kernel name in the plan with how many ops use it, in order of
+        /// first use.
+        pub fn kernels(&self) -> Vec<(String, usize)> {
+            let mut out: Vec<(String, usize)> = Vec::new();
+            for op in &self.ops {
+                match out.iter_mut().find(|(k, _)| *k == op.kernel) {
+                    Some((_, n)) => *n += 1,
+                    None => out.push((op.kernel.clone(), 1)),
+                }
+            }
+            out
+        }
+
         /// Encodes the plan into an indirect command buffer once.
         pub fn build(&self) -> Built {
+            self.build_where(|_| true, true)
+        }
+
+        /// `build` with only the ops whose kernel `keep` accepts, and with or
+        /// without the barriers. For profiling: the results are not the
+        /// plan's results.
+        pub fn build_where(&self, keep: impl Fn(&str) -> bool, barriers: bool) -> Built {
+            let ops: Vec<&Op> = self.ops.iter().filter(|o| keep(&o.kernel)).collect();
             let desc = IndirectCommandBufferDescriptor::new();
             // MTLIndirectCommandTypeConcurrentDispatch is 1 << 5 in the
             // Metal headers; the metal crate has it as 1 << 4, which crashes.
             desc.set_command_types(MTLIndirectCommandType::from_bits_retain(1 << 5));
             desc.set_inherit_buffers(false);
             desc.set_inherit_pipeline_state(false);
-            let binds = self.ops.iter().map(|o| o.buffers.len()).max().unwrap_or(1);
+            let binds = ops.iter().map(|o| o.buffers.len()).max().unwrap_or(1);
             desc.set_max_kernel_buffer_bind_count(binds as u64);
             let icb = self.gpu.device.new_indirect_command_buffer_with_descriptor(
                 &desc,
-                self.ops.len().max(1) as u64,
+                ops.len().max(1) as u64,
                 MTLResourceOptions::empty(),
             );
 
             let mut resources: Vec<Buffer> = Vec::new();
-            for (i, op) in self.ops.iter().enumerate() {
+            for (i, op) in ops.iter().enumerate() {
                 let cmd = icb.indirect_compute_command_at_index(i as u64);
                 cmd.set_compute_pipeline_state(&op.pipeline);
                 for (j, (buffer, offset)) in op.buffers.iter().enumerate() {
@@ -190,7 +213,7 @@ mod mac {
                         resources.push(buffer.clone());
                     }
                 }
-                if op.barrier {
+                if op.barrier && barriers {
                     cmd.set_barrier();
                 }
                 cmd.concurrent_dispatch_threadgroups(op.grid, op.threadgroup);
@@ -198,7 +221,7 @@ mod mac {
             Built {
                 icb,
                 resources,
-                count: self.ops.len(),
+                count: ops.len(),
             }
         }
     }
@@ -216,7 +239,15 @@ mod mac {
         // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
         #[allow(unexpected_cfgs)]
         pub fn run(&self, gpu: &Gpu) -> Duration {
-            gpu.run_with(MTLDispatchType::Concurrent, |enc| {
+            self.run_timed(gpu).0
+        }
+
+        /// `run`, also returning the GPU's own time for the command buffer
+        /// in seconds (GPUEndTime - GPUStartTime).
+        // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+        #[allow(unexpected_cfgs)]
+        pub fn run_timed(&self, gpu: &Gpu) -> (Duration, f64) {
+            gpu.run_timed(MTLDispatchType::Concurrent, |enc| {
                 let refs: Vec<&metal::ResourceRef> = self
                     .resources
                     .iter()

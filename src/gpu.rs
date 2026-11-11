@@ -14,6 +14,7 @@ pub const KERNELS: &str = concat!(
     include_str!("../kernels/attention.metal"),
     include_str!("../kernels/model.metal"),
     include_str!("../kernels/prefill.metal"),
+    include_str!("../kernels/sample.metal"),
 );
 
 #[cfg(target_os = "macos")]
@@ -162,6 +163,19 @@ mod mac {
             dispatch: MTLDispatchType,
             encode: impl FnOnce(&ComputeCommandEncoderRef),
         ) -> Duration {
+            self.run_timed(dispatch, encode).0
+        }
+
+        /// `run_with`, also returning the GPU's own time for the command
+        /// buffer in seconds (GPUEndTime - GPUStartTime).
+        // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+        #[allow(unexpected_cfgs)]
+        pub fn run_timed(
+            &self,
+            dispatch: MTLDispatchType,
+            encode: impl FnOnce(&ComputeCommandEncoderRef),
+        ) -> (Duration, f64) {
+            use metal::objc::{msg_send, sel, sel_impl};
             let commands = self.queue.new_command_buffer();
             let encoder = commands.compute_command_encoder_with_dispatch_type(dispatch);
             encode(encoder);
@@ -176,7 +190,13 @@ mod mac {
                     command_buffer_error(commands)
                 );
             }
-            elapsed
+            let (t0, t1): (f64, f64) = unsafe {
+                (
+                    msg_send![commands, GPUStartTime],
+                    msg_send![commands, GPUEndTime],
+                )
+            };
+            (elapsed, t1 - t0)
         }
     }
 
