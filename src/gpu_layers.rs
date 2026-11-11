@@ -178,8 +178,8 @@ mod mac {
 
     /// The keys (after norm and rope) and values on the GPU, each token
     /// `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p` goes in
-    /// slot `p`. A page of the buffers takes memory only once something is
-    /// written there, so the full context costs nothing up front.
+    /// slot `p`. Metal makes the whole of a buffer resident once a kernel
+    /// uses it, so a cache starts small and `grow`s with the context.
     pub struct GpuKvCache {
         /// Half values, or with `quant` the codes (src/kv_quant.rs).
         pub keys: Buffer,
@@ -189,6 +189,9 @@ mod mac {
         pub bits: KvBits,
         decode: DecodeAttention,
         pub capacity: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
     }
 
     /// The capacity is a multiple of this: the decode attention chunk, and a
@@ -219,6 +222,9 @@ mod mac {
                     bits,
                     decode,
                     capacity,
+                    heads: cfg.heads,
+                    kv_heads: cfg.kv_heads,
+                    head_dim: cfg.head_dim,
                 };
             }
             let k = QuantRows::new(gpu, bits, values, capacity);
@@ -230,6 +236,9 @@ mod mac {
                 bits,
                 decode,
                 capacity,
+                heads: cfg.heads,
+                kv_heads: cfg.kv_heads,
+                head_dim: cfg.head_dim,
             }
         }
 
@@ -241,6 +250,44 @@ mod mac {
                 out.extend([&k.scales, &k.biases, &v.scales, &v.biases]);
             }
             out
+        }
+
+        /// Moves to new buffers with room for at least `capacity` tokens and
+        /// copies every old row over: the prompt cache may still use rows
+        /// past the position (another branch, or a backup put back). Plans
+        /// recorded with the old buffers must be recorded again. Both sets
+        /// of buffers are held during the copy.
+        pub fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+            let capacity = capacity.next_multiple_of(KV_ALIGN);
+            assert!(capacity >= self.capacity);
+            let old = self.capacity as u64;
+            let moved: Vec<Buffer> = self
+                .buffers()
+                .iter()
+                .map(|b| gpu.buffer((b.length() / old) as usize * capacity))
+                .collect();
+            gpu.blit(|blit| {
+                for (from, to) in self.buffers().iter().zip(&moved) {
+                    blit.copy_from_buffer(from, 0, to, 0, from.length());
+                }
+            })
+            .wait_until_completed();
+            // In the order of `buffers`.
+            let mut moved = moved.into_iter();
+            let mut next = || moved.next().unwrap();
+            self.keys = next();
+            self.values = next();
+            if let Some((k, v)) = &mut self.quant {
+                k.data = self.keys.clone();
+                v.data = self.values.clone();
+                k.scales = next();
+                k.biases = next();
+                v.scales = next();
+                v.biases = next();
+            }
+            self.decode =
+                DecodeAttention::new(gpu, self.heads, self.kv_heads, self.head_dim, capacity);
+            self.capacity = capacity;
         }
     }
 

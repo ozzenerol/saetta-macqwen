@@ -79,7 +79,7 @@ mod mac {
     }
 
     pub struct GpuVerify<'a> {
-        rows: usize,
+        pub(crate) rows: usize,
         /// `plans[m - 1]` runs `m` rows.
         plans: Vec<(Plan<'a>, Built)>,
         /// `restores[r]` sets the DeltaNet states to the ones after row r.
@@ -195,6 +195,13 @@ mod mac {
                 "verify takes 1 to {MAX_ROWS} rows"
             );
             let (gpu, cfg) = (self.gpu, self.cfg);
+            assert!(
+                self.layers.iter().all(|l| match &l.mixer {
+                    Mixer::Full(_, c) => c.quant.is_none(),
+                    Mixer::Linear(..) => true,
+                }),
+                "the multi-row verify reads a half KV cache"
+            );
             let h = cfg.hidden_size;
             let vocab = self.lm_head.rows;
             let s = RowsScratch::new(gpu, cfg, self.capacity, rows);
@@ -299,6 +306,8 @@ mod mac {
             let m = tokens.len();
             assert!(m >= 1 && m <= v.rows, "verify takes 1 to {} tokens", v.rows);
             assert!(pos + m <= self.capacity, "context is full");
+            self.reserve(pos + m);
+            let v = self.verify.as_mut().unwrap();
             let p = v.params.contents() as *mut TokenParams;
             for (r, &t) in tokens.iter().enumerate() {
                 unsafe { *p.add(r) = TokenParams::new(t, (pos + r) as u32) };

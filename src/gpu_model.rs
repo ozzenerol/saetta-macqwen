@@ -343,6 +343,22 @@ mod mac {
             self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
         }
 
+        /// Grows an attention layer's cache to `capacity` tokens; a DeltaNet
+        /// layer has nothing to grow.
+        pub(crate) fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+            if let Mixer::Full(_, cache) = &mut self.mixer {
+                cache.grow(gpu, capacity);
+            }
+        }
+
+        /// Bytes of the attention cache as allocated now, 0 for DeltaNet.
+        pub(crate) fn kv_bytes(&self) -> u64 {
+            match &self.mixer {
+                Mixer::Full(_, c) => c.keys.length() + c.values.length(),
+                Mixer::Linear(..) => 0,
+            }
+        }
+
         /// Clears a DeltaNet state; an attention cache needs no clearing.
         pub(crate) fn reset(&self) {
             if let Mixer::Linear(_, state) = &self.mixer {
@@ -366,6 +382,30 @@ mod mac {
             ));
         }
         Ok(embed)
+    }
+
+    /// Tokens the attention caches start with: Metal makes a whole buffer
+    /// resident once a kernel uses it, so a short chat must not pay for the
+    /// full context.
+    pub const KV_START: usize = 32768;
+
+    /// The first capacity for a context of `limit` tokens.
+    pub fn kv_start(limit: usize) -> usize {
+        KV_START.min(limit)
+    }
+
+    /// The capacity to grow to from `capacity` for `need` tokens: doubled
+    /// until it fits, at most `limit`.
+    pub fn kv_grow(capacity: usize, need: usize, limit: usize) -> usize {
+        assert!(
+            need <= limit,
+            "{need} tokens do not fit in {limit} of context"
+        );
+        let mut c = capacity.max(1);
+        while c < need {
+            c *= 2;
+        }
+        c.min(limit)
     }
 
     /// `x = embed[params.token]`.
@@ -407,6 +447,9 @@ mod mac {
         scratch: Scratch,
         /// Samples the next token from `logits` in the same command buffer.
         pub(crate) sampler: GpuSampler,
+        /// Tokens the attention caches hold now.
+        pub(crate) allocated: usize,
+        /// Tokens they may grow to: the context.
         pub(crate) capacity: usize,
         pub(crate) position: usize,
     }
@@ -443,8 +486,30 @@ mod mac {
             capacity: usize,
             bits: KvBits,
         ) -> Result<GpuModel<'a>, String> {
+            Self::load_from(
+                gpu,
+                cfg,
+                weights,
+                layers,
+                capacity,
+                kv_start(capacity),
+                bits,
+            )
+        }
+
+        /// `load_with_bits` with caches that start at `start` tokens.
+        pub fn load_from(
+            gpu: &'a Gpu,
+            cfg: &'a Config,
+            weights: &'a Weights,
+            layers: usize,
+            capacity: usize,
+            start: usize,
+            bits: KvBits,
+        ) -> Result<GpuModel<'a>, String> {
             assert!(layers <= cfg.num_layers());
             let embed = load_embed(gpu, cfg, weights)?;
+            let allocated = start.min(capacity);
             let loaded = (0..layers)
                 .map(|l| {
                     let prefix = format!("{PREFIX}.layers.{l}");
@@ -454,7 +519,7 @@ mod mac {
                         weights,
                         &prefix,
                         cfg.layer_types[l],
-                        capacity,
+                        allocated,
                         bits,
                     )
                 })
@@ -467,29 +532,17 @@ mod mac {
             let x = view(gpu, hidden);
             let final_hidden = view(gpu, hidden);
             let logits = view(gpu, lm_head.rows);
-
-            let mut plan = Plan::new(gpu);
-            record_embed(&mut plan, &embed, &x);
-            loaded[0].record_input_norm(&mut plan, cfg, &x, &scratch);
-            for (l, layer) in loaded.iter().enumerate() {
-                let (next_norm, next_out) = match loaded.get(l + 1) {
-                    Some(next) => (next.input_norm(), &scratch.normed),
-                    None => (&final_norm, &final_hidden),
-                };
-                layer.record(&mut plan, cfg, &x, &scratch, next_norm, next_out);
-            }
-            lm_head.record(&mut plan, &final_hidden, &logits, false);
             let sampler = GpuSampler::new(gpu);
-            sampler.record(&mut plan, &logits);
             let greedy = Params {
                 temperature: 0.0,
                 top_p: 1.0,
                 top_k: 1,
             };
             sampler.set(lm_head.rows, &greedy, false);
+            let plan = Plan::new(gpu);
             let built = plan.build();
 
-            Ok(GpuModel {
+            let mut model = GpuModel {
                 gpu,
                 cfg,
                 layers: loaded,
@@ -504,9 +557,69 @@ mod mac {
                 logits,
                 scratch,
                 sampler,
+                allocated,
                 capacity,
                 position: 0,
-            })
+            };
+            model.record_plan();
+            Ok(model)
+        }
+
+        /// Records one token's run into `plan` and builds it.
+        fn record_plan(&mut self) {
+            let (cfg, s) = (self.cfg, &self.scratch);
+            let mut plan = Plan::new(self.gpu);
+            record_embed(&mut plan, &self.embed, &self.hidden);
+            self.layers[0].record_input_norm(&mut plan, cfg, &self.hidden, s);
+            for (l, layer) in self.layers.iter().enumerate() {
+                let (next_norm, next_out) = match self.layers.get(l + 1) {
+                    Some(next) => (next.input_norm(), &s.normed),
+                    None => (&self.final_norm, &self.final_hidden),
+                };
+                layer.record(&mut plan, cfg, &self.hidden, s, next_norm, next_out);
+            }
+            self.lm_head
+                .record(&mut plan, &self.final_hidden, &self.logits, false);
+            self.sampler.record(&mut plan, &self.logits);
+            self.built = plan.build();
+            self.plan = plan;
+        }
+
+        /// Makes room for `need` tokens in the attention caches, growing them
+        /// (and recording the plan again) if they are smaller. At most the
+        /// capacity.
+        pub fn reserve(&mut self, need: usize) {
+            if need <= self.allocated {
+                return;
+            }
+            let allocated = kv_grow(self.allocated, need, self.capacity);
+            let before = self.kv_bytes();
+            for layer in &mut self.layers {
+                layer.grow(self.gpu, allocated);
+            }
+            eprintln!(
+                "KV grows from {} to {} tokens: {} MB now, {} MB more for the copy",
+                self.allocated,
+                allocated,
+                self.kv_bytes() >> 20,
+                before >> 20
+            );
+            self.allocated = allocated;
+            self.record_plan();
+            // The verify plans hold the old buffers too.
+            if let Some(rows) = self.verify.as_ref().map(|v| v.rows) {
+                self.enable_verify(rows);
+            }
+        }
+
+        /// Tokens the attention caches hold now; `capacity` is the most.
+        pub fn allocated(&self) -> usize {
+            self.allocated
+        }
+
+        /// Bytes of the attention caches as allocated now.
+        pub fn kv_bytes(&self) -> u64 {
+            self.layers.iter().map(GpuLayer::kv_bytes).sum()
         }
 
         /// The recorded token, for profiling.
@@ -575,6 +688,7 @@ mod mac {
                 "context is full ({} tokens)",
                 self.capacity
             );
+            self.reserve(self.position + 1);
             self.plan
                 .set_params(TokenParams::new(token, self.position as u32));
             self.built.run(self.gpu);
@@ -745,6 +859,32 @@ mod mac {
             }
             model.run(TOKENS[0]);
             assert!(rel_rms(&model.hidden(), &x) < 1e-4, "after reset");
+        }
+
+        /// A cache that grows from 128 tokens gives bit for bit the hidden
+        /// states of one allocated whole, over the first four layers (one attention).
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn growing_cache_matches_whole() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            // A quantized cache grows its codes, scales and biases.
+            for bits in [KvBits::Half, KvBits::Eight] {
+                let load = |start| {
+                    GpuModel::load_from(&gpu, &cfg, &weights, 4, 1024, start, bits).unwrap()
+                };
+                let (mut grows, mut whole) = (load(128), load(1024));
+                assert_eq!((grows.allocated(), whole.allocated()), (128, 1024));
+                for t in 0..600u32 {
+                    let token = (t * 7919) % 50000;
+                    grows.run(token);
+                    whole.run(token);
+                    // The same kernels, and chunks past the length return at
+                    // once, so the capacity must not change a bit.
+                    assert_eq!(grows.hidden(), whole.hidden(), "{bits:?} token {t}");
+                }
+                assert_eq!(grows.allocated(), 1024);
+            }
         }
 
         /// All 40 layers: logits against the CPU model and the same greedy

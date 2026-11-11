@@ -14,9 +14,11 @@ mod mac {
     use crate::config::{Config, LayerType};
     use crate::gpu::{Gpu, contents};
     use crate::gpu_layers::Norm;
-    use crate::gpu_model::{GpuLayer, Scratch, load_embed, matrix, record_embed, vector, view};
+    use crate::gpu_model::{
+        GpuLayer, Scratch, kv_grow, kv_start, load_embed, matrix, record_embed, vector, view,
+    };
     use crate::plan::{Built, Plan, TokenParams};
-    use crate::qmv::View;
+    use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
     use metal::MTLSize;
 
@@ -33,10 +35,27 @@ mod mac {
         );
     }
 
+    /// What the step plans read and write, kept to record them again when
+    /// the cache grows.
+    struct Parts<'a> {
+        embed: GpuQuant<'a>,
+        pre_embedding: View,
+        pre_hidden: View,
+        norm: View,
+        fc: GpuQuant<'a>,
+        lm_head: GpuQuant<'a>,
+        scratch: Scratch,
+        /// fc's input: the normed embedding, then the normed hidden state.
+        cat: View,
+        x: View,
+        logits: View,
+    }
+
     pub struct GpuMtp<'a> {
         gpu: &'a Gpu,
         cfg: &'a Config,
         layer: GpuLayer<'a>,
+        parts: Parts<'a>,
         plan: Plan<'a>,
         built: Built,
         /// The same step without lm_head and the argmax, for `record`.
@@ -46,25 +65,23 @@ mod mac {
         output: View,
         token: View,
         capacity: usize,
+        /// The most the cache may grow to.
+        limit: usize,
         position: usize,
     }
 
     impl<'a> GpuMtp<'a> {
-        /// Loads the layer with room for `capacity` steps in its cache.
+        /// Loads the layer with room for up to `limit` steps in its cache,
+        /// which starts at `kv_start(limit)` and grows by `reserve`.
         pub fn load(
             gpu: &'a Gpu,
             cfg: &'a Config,
             weights: &'a Weights,
-            capacity: usize,
+            limit: usize,
         ) -> Result<GpuMtp<'a>, String> {
             let hidden = cfg.hidden_size;
-            let eps = cfg.rms_norm_eps;
-            let embed = load_embed(gpu, cfg, weights)?;
             let v = |n: &str| vector(gpu, weights, &format!("{PREFIX}.{n}.weight"));
-            let pre_embedding = v("pre_fc_norm_embedding")?;
-            let pre_hidden = v("pre_fc_norm_hidden")?;
-            let norm = v("norm")?;
-            let fc = matrix(gpu, weights, cfg, &format!("{PREFIX}.fc"))?;
+            let capacity = kv_start(limit);
             let layer = GpuLayer::load(
                 gpu,
                 cfg,
@@ -74,48 +91,31 @@ mod mac {
                 capacity,
             )?;
             let lm_head = matrix(gpu, weights, cfg, "language_model.lm_head")?;
-
-            let scratch = Scratch::new(gpu, cfg);
-            let input = view(gpu, hidden);
-            // fc's input: the normed embedding, then the normed hidden state.
-            let cat = view(gpu, 2 * hidden);
-            let cat_hidden = View {
-                buffer: cat.buffer.clone(),
-                offset: (hidden * 4) as u64,
-            };
-            let x = view(gpu, hidden);
-            let output = view(gpu, hidden);
             let logits = view(gpu, lm_head.rows);
-            let token = View::new(gpu.buffer(4));
-
-            // Everything up to the output hidden state; `step` adds lm_head
-            // and the argmax.
-            let layer_plan = || {
-                let mut plan = Plan::new(gpu);
-                record_embed(&mut plan, &embed, &cat);
-                Norm::rows(1, hidden, eps, &pre_hidden).record(
-                    &mut plan,
-                    &input,
-                    &cat_hidden,
-                    true,
-                );
-                Norm::rows(1, hidden, eps, &pre_embedding).record(&mut plan, &cat, &cat, false);
-                fc.record(&mut plan, &cat, &x, false);
-                layer.record_input_norm(&mut plan, cfg, &x, &scratch);
-                layer.record(&mut plan, cfg, &x, &scratch, &norm, &output);
-                plan
+            let parts = Parts {
+                embed: load_embed(gpu, cfg, weights)?,
+                pre_embedding: v("pre_fc_norm_embedding")?,
+                pre_hidden: v("pre_fc_norm_hidden")?,
+                norm: v("norm")?,
+                fc: matrix(gpu, weights, cfg, &format!("{PREFIX}.fc"))?,
+                lm_head,
+                scratch: Scratch::new(gpu, cfg),
+                cat: view(gpu, 2 * hidden),
+                x: view(gpu, hidden),
+                logits,
             };
-            let mut plan = layer_plan();
-            lm_head.record(&mut plan, &output, &logits, false);
-            record_argmax(&mut plan, &logits, lm_head.rows, &token);
-            let built = plan.build();
-            let record_plan = layer_plan();
-            let record_built = record_plan.build();
+            let input = view(gpu, hidden);
+            let output = view(gpu, hidden);
+            let token = View::new(gpu.buffer(4));
+            let (plan, record_plan) =
+                record_plans(gpu, cfg, &layer, &parts, &input, &output, &token);
+            let (built, record_built) = (plan.build(), record_plan.build());
 
             Ok(GpuMtp {
                 gpu,
                 cfg,
                 layer,
+                parts,
                 plan,
                 built,
                 record_plan,
@@ -124,8 +124,38 @@ mod mac {
                 output,
                 token,
                 capacity,
+                limit,
                 position: 0,
             })
+        }
+
+        /// Makes room for `need` steps, growing the cache if it is smaller,
+        /// up to the limit.
+        pub fn reserve(&mut self, need: usize) {
+            if need <= self.capacity {
+                return;
+            }
+            let capacity = kv_grow(self.capacity, need, self.limit);
+            self.layer.grow(self.gpu, capacity);
+            self.capacity = capacity;
+            let (plan, record_plan) = record_plans(
+                self.gpu,
+                self.cfg,
+                &self.layer,
+                &self.parts,
+                &self.input,
+                &self.output,
+                &self.token,
+            );
+            self.built = plan.build();
+            self.record_built = record_plan.build();
+            self.plan = plan;
+            self.record_plan = record_plan;
+        }
+
+        /// The KV cache's buffer bytes as allocated now.
+        pub fn kv_bytes(&self) -> u64 {
+            self.layer.kv_bytes()
         }
 
         /// One step at position `len()`: `hidden` is a normed hidden state,
@@ -145,10 +175,11 @@ mod mac {
 
         fn run(&mut self, hidden: &View, token: u32, draft: bool) {
             assert!(
-                self.position < self.capacity,
+                self.position < self.limit,
                 "MTP cache is full ({} steps)",
-                self.capacity
+                self.limit
             );
+            self.reserve(self.position + 1);
             copy(hidden, &self.input, self.cfg.hidden_size);
             let params = TokenParams::new(token, self.position as u32);
             if draft {
@@ -185,6 +216,38 @@ mod mac {
             self.layer.reset();
             self.position = 0;
         }
+    }
+
+    /// The step plan (with lm_head and the argmax) and the record plan
+    /// (without), both up to the output hidden state.
+    fn record_plans<'a>(
+        gpu: &'a Gpu,
+        cfg: &Config,
+        layer: &GpuLayer,
+        p: &Parts,
+        input: &View,
+        output: &View,
+        token: &View,
+    ) -> (Plan<'a>, Plan<'a>) {
+        let (hidden, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
+        let cat_hidden = View {
+            buffer: p.cat.buffer.clone(),
+            offset: p.cat.offset + (hidden * 4) as u64,
+        };
+        let layer_plan = || {
+            let mut plan = Plan::new(gpu);
+            record_embed(&mut plan, &p.embed, &p.cat);
+            Norm::rows(1, hidden, eps, &p.pre_hidden).record(&mut plan, input, &cat_hidden, true);
+            Norm::rows(1, hidden, eps, &p.pre_embedding).record(&mut plan, &p.cat, &p.cat, false);
+            p.fc.record(&mut plan, &p.cat, &p.x, false);
+            layer.record_input_norm(&mut plan, cfg, &p.x, &p.scratch);
+            layer.record(&mut plan, cfg, &p.x, &p.scratch, &p.norm, output);
+            plan
+        };
+        let mut plan = layer_plan();
+        p.lm_head.record(&mut plan, output, &p.logits, false);
+        record_argmax(&mut plan, &p.logits, p.lm_head.rows, token);
+        (plan, layer_plan())
     }
 
     /// Copies `n` floats between shared buffers while the GPU is idle.
