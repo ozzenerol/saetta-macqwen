@@ -38,6 +38,7 @@ mod mac {
         match std::env::var("SAETTA_ATT").as_deref() {
             Ok("1") => "attention_rows_half",
             Ok("8") => "attention_rows2_half8",
+            Ok("9") => "attention_flash",
             _ => "attention_rows2_half",
         }
     }
@@ -1313,6 +1314,30 @@ mod mac {
                 );
                 to_half(gpu, enc, &keys, &hk, t * kv_size);
                 to_half(gpu, enc, &values, &hv, t * kv_size);
+                if kernel == "attention_flash" {
+                    let p = crate::attention_prefill::FlashParams {
+                        heads: c.heads as u32,
+                        kv_heads: c.kv_heads as u32,
+                        pos: pos as u32,
+                        tokens: t as u32,
+                        scale: 1.0 / (d as f32).sqrt(),
+                    };
+                    crate::attention_prefill::encode(
+                        enc,
+                        gpu,
+                        &q_half,
+                        &whole(&half.keys),
+                        &whole(&half.values),
+                        &q_and_gate,
+                        &y,
+                        p,
+                    );
+                    self.record(gpu, enc, 2, &y, t * c.heads * d);
+                    if self.on("attention o_proj") {
+                        qmm(gpu, enc, &w.o, &y, out, t, self.exact);
+                    }
+                    return;
+                }
                 enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
                 set_views(enc, 0, &[&q_half, &whole(&half.keys), &whole(&half.values)]);
             }
