@@ -1593,6 +1593,7 @@ mod mac {
         chunk: usize,
         runs: usize,
         exact: bool,
+        bits: KvBits,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Config::load(dir)?;
         let weights = Weights::open(dir)?;
@@ -1601,7 +1602,7 @@ mod mac {
         let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
         prefill.exact = exact;
         let prompt = test_tokens(tokens);
-        let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+        let owned = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
         let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
         let mut times: Vec<f64> = (0..=runs)
             .map(|_| {
@@ -1619,7 +1620,7 @@ mod mac {
             .collect();
         times.sort_by(f64::total_cmp);
         println!(
-            "prefill {tokens} tokens, chunk {}, exact {exact}, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
+            "prefill {tokens} tokens, chunk {}, exact {exact}, {bits:?} KV, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
             prefill.chunk,
             times[0],
             tokens as f64 / times[0],

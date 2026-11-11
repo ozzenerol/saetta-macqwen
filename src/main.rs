@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta profile-prefill <model dir> <tokens> | saetta bench-attention | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta profile-prefill <model dir> <tokens> | saetta bench-attention | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -53,9 +53,11 @@ fn main() -> ExitCode {
         #[cfg(target_os = "macos")]
         ["bench-moe", dir] => report(saetta::moe::bench(Path::new(dir), 5)),
         #[cfg(target_os = "macos")]
-        ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
+        ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024", "16"),
         #[cfg(target_os = "macos")]
-        ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
+        ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk, "16"),
+        #[cfg(target_os = "macos")]
+        ["bench-prefill", dir, tokens, chunk, bits] => bench_prefill(dir, tokens, chunk, bits),
         #[cfg(target_os = "macos")]
         ["profile-prefill", dir, tokens] => match tokens.parse() {
             Ok(t) => report(saetta::prefill::bench_profile(
@@ -906,14 +908,15 @@ fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
-fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
-    match (tokens.parse(), chunk.parse()) {
-        (Ok(t), Ok(c)) => report(saetta::prefill::bench(
+fn bench_prefill(dir: &str, tokens: &str, chunk: &str, bits: &str) -> ExitCode {
+    match (tokens.parse(), chunk.parse(), KvBits::parse(bits)) {
+        (Ok(t), Ok(c), Some(b)) => report(saetta::prefill::bench(
             Path::new(dir),
             t,
             c,
             3,
             exact_prefill(),
+            b,
         )),
         _ => {
             eprintln!("{USAGE}");
