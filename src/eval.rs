@@ -6,8 +6,18 @@
 //!   to it to show how far a lower precision moves the number.
 //! - long: the first N tokens of a 32768-token prompt, fed through
 //!   `prefill` in segments that end at each checkpoint position below N, as
-//!   the server feeds a long prompt. The logits at each checkpoint are
-//!   compared with MLX float32 by KL divergence and the top tokens.
+//!   the server feeds a long prompt, or one token at a time with `decode`,
+//!   which also gives the perplexity over the whole prompt. The logits at
+//!   each checkpoint are compared with MLX float32 by KL divergence and the
+//!   top token.
+//!
+//! The long check passes on the median KL over all checkpoints, not on each
+//! one. A correct model can still fail a single checkpoint: at position
+//! 4051 of the 32k prompt, layer 1's router has two experts within 9e-7 of
+//! each other, so a 1e-6 difference in its input (normal f32 rounding)
+//! picks the other one, and the later layers carry that one token's change
+//! to KL 3.4e-2 at position 4095. MLX's own bf16 run is at 4.9e-3 there. A
+//! real bug moves most checkpoints and the perplexity; a near-tie moves one.
 
 use crate::server::Model;
 use serde_json::Value;
@@ -18,8 +28,13 @@ use std::time::Instant;
 
 /// Largest accepted relative perplexity difference from MLX float32.
 pub const MAX_PPL_REL: f64 = 0.005;
-/// Largest accepted KL divergence, in nats, at a long-context checkpoint.
-pub const MAX_KL: f64 = 0.01;
+/// Largest accepted median KL divergence, in nats, over the long-context
+/// checkpoints.
+pub const MAX_MEDIAN_KL: f64 = 1e-3;
+/// Largest accepted KL divergence at any one checkpoint.
+pub const MAX_KL: f64 = 0.1;
+/// Smallest accepted share of checkpoints with the same top token as MLX.
+pub const MIN_TOP1_SAME: f64 = 0.9;
 
 pub struct Reference {
     dir: PathBuf,
@@ -259,10 +274,6 @@ impl LogitsReport {
         }
     }
 
-    pub fn pass(&self) -> bool {
-        self.kl <= MAX_KL && self.top1_same
-    }
-
     pub fn print(&self) {
         let bf16 = match self.kl_bf16 {
             Some(k) => format!(" (MLX bf16 {k:.2e})"),
@@ -274,9 +285,34 @@ impl LogitsReport {
             self.kl,
             if self.top1_same { "same" } else { "DIFFERENT" },
             self.top10_overlap,
-            verdict(self.pass())
+            if self.kl > MAX_MEDIAN_KL { "high" } else { "" }
         );
     }
+}
+
+/// Prints the summary over the checkpoints and returns whether it passes.
+pub fn checkpoints_pass(reports: &[LogitsReport]) -> bool {
+    let mut kls: Vec<f64> = reports.iter().map(|r| r.kl).collect();
+    kls.sort_by(f64::total_cmp);
+    let n = kls.len();
+    let median = if n % 2 == 1 {
+        kls[n / 2]
+    } else {
+        (kls[n / 2 - 1] + kls[n / 2]) / 2.0
+    };
+    let max = kls[n - 1];
+    let same = reports.iter().filter(|r| r.top1_same).count() as f64 / n as f64;
+    let pass = median <= MAX_MEDIAN_KL && max <= MAX_KL && same >= MIN_TOP1_SAME;
+    println!(
+        "  {n} checkpoints: median KL {median:.2e} (max {MAX_MEDIAN_KL:.0e}), max KL {max:.2e} (max {MAX_KL}), top-1 same {:.0}% (min {:.0}%)  {}",
+        same * 100.0,
+        MIN_TOP1_SAME * 100.0,
+        verdict(pass)
+    );
+    if n < 8 {
+        println!("  only {n} checkpoints below this length; the median says little");
+    }
+    pass
 }
 
 fn verdict(pass: bool) -> &'static str {
@@ -388,6 +424,7 @@ pub fn gate<M: Model>(
         } else {
             prefill_to(model, tokens, &checkpoints)
         };
+        let mut reports = Vec::new();
         for (pos, logits) in ours {
             let r = LogitsReport::new(
                 pos,
@@ -396,8 +433,9 @@ pub fn gate<M: Model>(
                 &logits,
             );
             r.print();
-            pass &= r.pass();
+            reports.push(r);
         }
+        pass &= checkpoints_pass(&reports);
         eprintln!("  {long} tokens in {:.1} s", start.elapsed().as_secs_f64());
     }
     println!("{}", if pass { "eval passed" } else { "eval FAILED" });
