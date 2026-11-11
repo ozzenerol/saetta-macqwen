@@ -558,6 +558,13 @@ fn kv_caches<'m>(
 #[cfg(target_os = "macos")]
 const SHORT_PREFILL: usize = 8;
 
+/// SAETTA_TAIL_STEPS=1: with drafting, a prompt shorter than SHORT_PREFILL
+/// runs as decode steps, as before GpuSpec::run_rows.
+#[cfg(target_os = "macos")]
+fn tail_steps() -> bool {
+    std::env::var("SAETTA_TAIL_STEPS").is_ok_and(|v| v == "1")
+}
+
 /// The MTP drafter, with the final norm to turn prefill rows into the
 /// normed hidden states it reads.
 #[cfg(target_os = "macos")]
@@ -627,6 +634,9 @@ impl server::Model for GpuServed {
                     rest.iter().for_each(|&t| m.run(t));
                     m.forward(last)
                 }
+                // The multi-row verify, k + 1 tokens a pass, unless
+                // SAETTA_TAIL_STEPS=1 (to compare).
+                Some(d) if !tail_steps() => d.spec.run_rows(m, tokens),
                 Some(d) => {
                     // Only the last MTP_WINDOW tokens get an MTP entry, as
                     // after a prefill.
