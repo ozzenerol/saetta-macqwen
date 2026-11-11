@@ -124,8 +124,8 @@ mod mac {
             contents::<SampleRing>(&self.ring.buffer, 1)[0]
         }
 
-        fn ring_mut(&self) -> &mut SampleRing {
-            unsafe { &mut *(self.ring.buffer.contents() as *mut SampleRing) }
+        fn ring_ptr(&self) -> *mut SampleRing {
+            self.ring.buffer.contents() as *mut SampleRing
         }
 
         /// The token fed at `position`.
@@ -134,11 +134,11 @@ mod mac {
         }
 
         pub fn set_draft(&self, position: usize, draft: u32) {
-            self.ring_mut().draft[slot(position)] = draft;
+            unsafe { (*self.ring_ptr()).draft[slot(position)] = draft };
         }
 
         pub fn clear_drafts(&self) {
-            self.ring_mut().draft = [NO_DRAFT; RING];
+            unsafe { (*self.ring_ptr()).draft = [NO_DRAFT; RING] };
         }
     }
 }
