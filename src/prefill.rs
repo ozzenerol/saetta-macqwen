@@ -1937,8 +1937,15 @@ mod mac {
                 );
                 // The half path may pick another expert at a near tie for a
                 // token, as bf16 MLX does, so only the median token counts.
+                // So does a quantized cache: a key on the next code moves a
+                // few tokens far more than the rest (8 bits, layer 14: rms
+                // 2.2e-2, median 5.1e-3), and F's KL gate covers the whole.
                 // `bound` has the slack of a quantized cache in it.
-                let hidden = if exact { err } else { median };
+                let hidden = if exact && bits == KvBits::Half {
+                    err
+                } else {
+                    median
+                };
                 assert!(hidden < bound && state < bound * 1.25, "layer {l}");
             }
 
