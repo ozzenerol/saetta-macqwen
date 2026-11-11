@@ -332,7 +332,7 @@ pub struct DraftLength {
 
 /// Rounds between tries of the length that ran least recently, so every
 /// time and the acceptance stay current.
-const EXPLORE: usize = 32;
+const EXPLORE: usize = 64;
 /// Weight of a new round in the running averages.
 const TIME_WEIGHT: f64 = 0.1;
 const ACCEPT_WEIGHT: f64 = 0.05;
