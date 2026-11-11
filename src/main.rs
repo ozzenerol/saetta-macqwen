@@ -345,8 +345,15 @@ impl server::Model for GpuServed {
                     m.forward(last)
                 }
                 Some(d) => {
-                    for &t in rest {
-                        d.spec.step(m, t);
+                    // Only the last MTP_WINDOW tokens get an MTP entry, as
+                    // after a prefill.
+                    let plain = tokens.len().saturating_sub(MTP_WINDOW);
+                    for (i, &t) in rest.iter().enumerate() {
+                        if i < plain {
+                            d.spec.step_plain(m, t);
+                        } else {
+                            d.spec.step(m, t);
+                        }
                     }
                     d.spec.step(m, last)
                 }
