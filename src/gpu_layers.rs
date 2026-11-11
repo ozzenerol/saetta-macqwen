@@ -17,16 +17,9 @@ mod mac {
     use crate::gpu::Gpu;
     use crate::plan::Plan;
     use crate::qmv::{GpuQuant, View};
+    use crate::rows;
     use crate::weights::Weights;
     use metal::{Buffer, MTLSize};
-
-    /// A view `floats` values into `buffer`.
-    fn at(buffer: &Buffer, floats: usize) -> View {
-        View {
-            buffer: buffer.clone(),
-            offset: (floats * 4) as u64,
-        }
-    }
 
     fn whole(buffer: &Buffer) -> View {
         View::new(buffer.clone())
@@ -113,29 +106,57 @@ mod mac {
     struct ResidualParams {
         dim: u32,
         eps: f32,
+        logit_stride: u32,
     }
 
     /// Records `x += y; out = rms_norm(x) * w` as one op, for buffers
     /// `[x, y, w, out]` of `dim` values.
     pub fn add_norm(plan: &mut Plan, buffers: [&View; 4], dim: usize, eps: f32) {
-        residual(plan, "add_norm", &buffers, dim, eps);
+        residual(plan, "add_norm", &buffers, 1, dim, eps, 0);
+    }
+
+    /// `add_norm` over `rows` rows of x, y and out.
+    pub fn add_norm_rows(plan: &mut Plan, buffers: [&View; 4], rows: usize, dim: usize, eps: f32) {
+        residual(plan, "add_norm", &buffers, rows, dim, eps, 0);
     }
 
     /// Records `x += sigmoid(shared_logit[0]) * shared + routed;
     /// out = rms_norm(x) * w` as one op, for buffers
     /// `[x, shared_logit, shared, routed, w, out]`.
     pub fn mix_norm(plan: &mut Plan, buffers: [&View; 6], dim: usize, eps: f32) {
-        residual(plan, "mix_norm", &buffers, dim, eps);
+        residual(plan, "mix_norm", &buffers, 1, dim, eps, 0);
     }
 
-    fn residual(plan: &mut Plan, kernel: &str, buffers: &[&View], dim: usize, eps: f32) {
+    /// `mix_norm` over `rows` rows of x, shared, routed and out; row r's
+    /// shared logit is `shared_logit[r * logit_stride]`.
+    pub fn mix_norm_rows(
+        plan: &mut Plan,
+        buffers: [&View; 6],
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        logit_stride: usize,
+    ) {
+        residual(plan, "mix_norm", &buffers, rows, dim, eps, logit_stride);
+    }
+
+    fn residual(
+        plan: &mut Plan,
+        kernel: &str,
+        buffers: &[&View],
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        logit_stride: usize,
+    ) {
         let p = plan.constant(&[ResidualParams {
             dim: dim as u32,
             eps,
+            logit_stride: logit_stride as u32,
         }]);
         let mut all = buffers.to_vec();
         all.push(&p);
-        plan.op(kernel, &all, size(1, 1), size(dim.min(1024), 1));
+        plan.op(kernel, &all, size(rows, 1), size(dim.min(1024), 1));
     }
 
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
@@ -308,6 +329,101 @@ mod mac {
         }
     }
 
+    /// The attention buffers of `MAX_ROWS` tokens, shared by all attention
+    /// layers.
+    pub struct AttentionRowsScratch {
+        attention: rows::AttentionRows,
+        q_and_gate: Buffer,
+        q: Buffer,
+        k: Buffer,
+        v: Buffer,
+        out: Buffer,
+    }
+
+    impl AttentionRowsScratch {
+        /// For caches of `capacity` tokens and verifies of up to `rows`.
+        pub fn new(gpu: &Gpu, cfg: &Config, capacity: usize, rows: usize) -> AttentionRowsScratch {
+            let a = attention_config(cfg);
+            let size = a.heads * a.head_dim * 4 * rows::MAX_ROWS;
+            let kv = a.kv_heads * a.head_dim * 4 * rows::MAX_ROWS;
+            AttentionRowsScratch {
+                attention: rows::AttentionRows::new(gpu, a.heads, a.kv_heads, capacity, rows),
+                q_and_gate: gpu.buffer(2 * size),
+                q: gpu.buffer(size),
+                k: gpu.buffer(kv),
+                v: gpu.buffer(kv),
+                out: gpu.buffer(size),
+            }
+        }
+    }
+
+    impl GpuAttention<'_> {
+        /// Records `m` tokens at once: `x` and `out` are `[m, hidden]`, and
+        /// row r takes its position from `params[r]` (TokenParams views),
+        /// so it sees the keys of rows before it. Each weight and each chunk
+        /// of the cache is read once for all rows.
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_rows(
+            &self,
+            plan: &mut Plan,
+            m: usize,
+            x: &View,
+            out: &View,
+            cache: &GpuKvCache,
+            scratch: &AttentionRowsScratch,
+            params: &[View],
+        ) {
+            assert!(params.len() >= m);
+            let c = &self.cfg;
+            let d = c.head_dim;
+            let s = scratch;
+            let [q_and_gate, q, k, v, attn] = [&s.q_and_gate, &s.q, &s.k, &s.v, &s.out].map(whole);
+            rows::record_proj(plan, &self.q_proj, m, x, &q_and_gate, false);
+            rows::record_proj(plan, &self.k_proj, m, x, &k, true);
+            rows::record_proj(plan, &self.v_proj, m, x, &v, true);
+
+            let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+            let p = plan.constant(&[PrepParams {
+                heads: c.heads as u32,
+                kv_heads: c.kv_heads as u32,
+                dim: d as u32,
+                half_dims: (c.rope_dims / 2) as u32,
+                log2_theta: c.rope_theta.log2(),
+                eps: c.eps,
+            }]);
+            let (qs, kv) = (c.heads * d, c.kv_heads * d);
+            let row = |b: &View, r: usize, floats: usize| View {
+                buffer: b.buffer.clone(),
+                offset: b.offset + (r * floats * 4) as u64,
+            };
+            // Each row's key and value go in at its own position, so the
+            // rows' preps are independent of each other.
+            for (r, row_params) in params.iter().enumerate().take(m) {
+                let buffers = [
+                    &row(&q_and_gate, r, 2 * qs),
+                    &row(&k, r, kv),
+                    &row(&v, r, kv),
+                    &self.q_norm,
+                    &self.k_norm,
+                    &row(&q, r, qs),
+                    &keys,
+                    &values,
+                    &p,
+                    row_params,
+                ];
+                let (grid, group) = (size(c.heads + c.kv_heads, 1), size(d, 1));
+                if r == 0 {
+                    plan.op("attention_prep", &buffers, grid, group);
+                } else {
+                    plan.op_parallel("attention_prep", &buffers, grid, group);
+                }
+            }
+            s.attention
+                .record(plan, m, &q, &keys, &values, &q_and_gate, &attn, params);
+            rows::record_proj(plan, &self.o_proj, m, &attn, out, false);
+        }
+    }
+
     /// The conv and recurrent state of one DeltaNet layer on the GPU.
     pub struct GpuDeltaNetState {
         /// `[kernel - 1, conv channels]`, oldest first.
@@ -342,6 +458,18 @@ mod mac {
         eps: f32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RowsStepParams {
+        k_heads: u32,
+        v_heads: u32,
+        v_dim: u32,
+        kernel_size: u32,
+        eps: f32,
+        rows: u32,
+        snapshots: u32,
+    }
+
     /// Gated DeltaNet: projections, conv1d, q/k L2 norm, the delta rule,
     /// the gated RMSNorm and the output projection.
     pub struct GpuDeltaNet<'a> {
@@ -371,8 +499,11 @@ mod mac {
             prefix: &str,
         ) -> Result<GpuDeltaNet<'a>, String> {
             let c = deltanet_config(cfg);
-            if c.k_dim != 128 || c.v_dim > 256 {
-                return Err("deltanet_step is written for k_dim 128 and v_dim up to 256".into());
+            if c.k_dim != 128 || c.v_dim != 128 || c.v_heads != 2 * c.k_heads {
+                return Err(
+                    "deltanet_step is written for k_dim and v_dim 128, two value heads per key head"
+                        .into(),
+                );
             }
             let p = format!("{prefix}.linear_attn");
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
@@ -424,11 +555,11 @@ mod mac {
                 size(256, 1),
             );
 
-            let (q, k, v) = (
-                at(&self.mixed, 0),
-                at(&self.mixed, key_size),
-                at(&self.mixed, 2 * key_size),
-            );
+            let at = |floats: usize| View {
+                buffer: self.mixed.clone(),
+                offset: (floats * 4) as u64,
+            };
+            let (q, k, v) = (at(0), at(key_size), at(2 * key_size));
             let p = plan.constant(&[StepParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
@@ -456,6 +587,173 @@ mod mac {
             );
 
             self.out_proj.record(plan, &y, out, false);
+        }
+
+        /// Records `m` tokens one after the other, as `m` calls of `record`
+        /// would: `x` and `out` are `[m, hidden]`. With `snaps`, the states
+        /// after each row go there too (`GpuDeltaNetSnaps::restore`).
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_rows(
+            &self,
+            plan: &mut Plan,
+            m: usize,
+            x: &View,
+            out: &View,
+            state: &GpuDeltaNetState,
+            scratch: &DeltaNetRowsScratch,
+            snaps: Option<&GpuDeltaNetSnaps>,
+        ) {
+            assert!(snaps.is_none_or(|s| m <= s.rows));
+            let c = &self.cfg;
+            let DeltaNetRowsScratch {
+                qkv,
+                z,
+                a,
+                b,
+                y,
+                mixed,
+            } = scratch;
+            rows::record_proj(plan, &self.in_proj_qkv, m, x, qkv, false);
+            rows::record_proj(plan, &self.in_proj_z, m, x, z, true);
+            rows::record_proj(plan, &self.in_proj_b, m, x, b, true);
+            rows::record_proj(plan, &self.in_proj_a, m, x, a, true);
+
+            let p = plan.constant(&[RowsStepParams {
+                k_heads: c.k_heads as u32,
+                v_heads: c.v_heads as u32,
+                v_dim: c.v_dim as u32,
+                kernel_size: c.kernel as u32,
+                eps: c.eps,
+                rows: m as u32,
+                snapshots: snaps.is_some() as u32,
+            }]);
+            let (conv, recurrent) = (whole(&state.conv), whole(&state.recurrent));
+            // Without snapshots the last two buffers are never written.
+            let (conv_snaps, state_snaps) = match snaps {
+                Some(s) => (whole(&s.conv), whole(&s.recurrent)),
+                None => (conv.clone(), recurrent.clone()),
+            };
+            let simds = DN_SIMDS.load(std::sync::atomic::Ordering::Relaxed);
+            if simds == 0 {
+                plan.op(
+                    "deltanet_rows",
+                    &[
+                        qkv,
+                        &self.conv1d,
+                        &conv,
+                        a,
+                        b,
+                        &self.a_log,
+                        &self.dt_bias,
+                        &recurrent,
+                        z,
+                        &self.norm,
+                        y,
+                        &p,
+                        &conv_snaps,
+                        &state_snaps,
+                    ],
+                    size(c.k_heads, 1),
+                    size(1024, 1),
+                );
+            } else {
+                let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
+                plan.op(
+                    "deltanet_conv_rows",
+                    &[qkv, &self.conv1d, &conv, mixed, &p, &conv_snaps],
+                    size(channels.div_ceil(256), 1),
+                    size(256, 1),
+                );
+                plan.op(
+                    &format!("deltanet_step_rows_{simds}"),
+                    &[
+                        mixed,
+                        a,
+                        b,
+                        &self.a_log,
+                        &self.dt_bias,
+                        &recurrent,
+                        z,
+                        &self.norm,
+                        y,
+                        &p,
+                        &state_snaps,
+                    ],
+                    size(c.v_heads, 1),
+                    size(32 * simds, 1),
+                );
+            }
+
+            rows::record_proj(plan, &self.out_proj, m, y, out, false);
+        }
+    }
+
+    /// The projections and step outputs of `MAX_ROWS` tokens, shared by
+    /// all DeltaNet layers.
+    pub struct DeltaNetRowsScratch {
+        qkv: View,
+        z: View,
+        a: View,
+        b: View,
+        y: View,
+        mixed: View,
+    }
+
+    /// Simdgroups per value head of deltanet_step_rows (8, 16 or 32); 0
+    /// records the fused deltanet_rows instead.
+    pub static DN_SIMDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
+    impl DeltaNetRowsScratch {
+        pub fn new(gpu: &Gpu, cfg: &Config) -> DeltaNetRowsScratch {
+            let c = deltanet_config(cfg);
+            let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
+            let values = c.v_heads * c.v_dim;
+            let v = |floats: usize| View::new(gpu.buffer(rows::MAX_ROWS * floats * 4));
+            DeltaNetRowsScratch {
+                qkv: v(channels),
+                z: v(values),
+                a: v(c.v_heads),
+                b: v(c.v_heads),
+                y: v(values),
+                mixed: v(channels),
+            }
+        }
+    }
+
+    /// The DeltaNet state after each of up to `rows` tokens of one layer.
+    pub struct GpuDeltaNetSnaps {
+        pub rows: usize,
+        conv: Buffer,
+        recurrent: Buffer,
+    }
+
+    impl GpuDeltaNetSnaps {
+        /// About 2 MB per row.
+        pub fn new(gpu: &Gpu, cfg: &DeltaNetConfig, rows: usize) -> GpuDeltaNetSnaps {
+            let state = GpuDeltaNetState::new(gpu, cfg);
+            let size = |b: &Buffer| rows * b.length() as usize;
+            GpuDeltaNetSnaps {
+                rows,
+                conv: gpu.buffer(size(&state.conv)),
+                recurrent: gpu.buffer(size(&state.recurrent)),
+            }
+        }
+
+        /// Records copying the state after row `row` into `state`.
+        pub fn record_restore(&self, plan: &mut Plan, row: usize, state: &GpuDeltaNetState) {
+            for (from, to) in [
+                (&self.conv, &state.conv),
+                (&self.recurrent, &state.recurrent),
+            ] {
+                let n = to.length() as usize / 4;
+                // copy_u32 has no bounds check.
+                assert!(n.is_multiple_of(256));
+                let src = View {
+                    buffer: from.clone(),
+                    offset: (row * n * 4) as u64,
+                };
+                crate::gpu_model::elementwise(plan, "copy_u32", &[&src, &whole(to)], n, true);
+            }
         }
     }
 
@@ -628,6 +926,90 @@ mod mac {
                 bits(&read(&state.recurrent, rec_n)),
                 bits(&read(&runs[1].1.recurrent, rec_n))
             );
+        }
+
+        /// TOKENS tokens as one `record_rows` against one `record` per
+        /// token: outputs, and a restore to each row against the state after
+        /// that token.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn deltanet_rows_match_tokens() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let prefix = "language_model.model.layers.0";
+            let layer = GpuDeltaNet::load(&gpu, &cfg, &weights, prefix).unwrap();
+            let n = cfg.hidden_size;
+            let inputs: Vec<Vec<f32>> = (0..TOKENS)
+                .map(|t| input(&weights, prefix, t, cfg.rms_norm_eps))
+                .collect();
+
+            let state = GpuDeltaNetState::new(&gpu, &layer.cfg);
+            let x = View::new(gpu.buffer(n * 4));
+            let out = View::new(gpu.buffer(n * 4));
+            let mut plan = Plan::new(&gpu);
+            layer.record(&mut plan, &x, &out, &state);
+            let built = plan.build();
+            let mut want = Vec::new();
+            let mut states = Vec::new();
+            for input in &inputs {
+                write(&x.buffer, input);
+                built.run(&gpu);
+                want.extend(read(&out.buffer, n));
+                states.push((
+                    read(&state.conv, state.conv.length() as usize / 4),
+                    read(&state.recurrent, state.recurrent.length() as usize / 4),
+                ));
+            }
+
+            for simds in [0, 8, 16, 32] {
+                DN_SIMDS.store(simds, std::sync::atomic::Ordering::Relaxed);
+                let rows_state = GpuDeltaNetState::new(&gpu, &layer.cfg);
+                let scratch = DeltaNetRowsScratch::new(&gpu, &cfg);
+                let snaps = GpuDeltaNetSnaps::new(&gpu, &layer.cfg, TOKENS);
+                let mut padded = inputs.concat();
+                padded.resize(rows::MAX_ROWS * n, 0.0);
+                let xs = View::new(gpu.buffer_from(&padded));
+                let outs = View::new(gpu.buffer(TOKENS * n * 4));
+                let mut plan = Plan::new(&gpu);
+                layer.record_rows(
+                    &mut plan,
+                    TOKENS,
+                    &xs,
+                    &outs,
+                    &rows_state,
+                    &scratch,
+                    Some(&snaps),
+                );
+                plan.build().run(&gpu);
+                let close = |got: &[f32], want: &[f32], what: &str| {
+                    let err = rel_rms(got, want);
+                    assert!(err < BOUND, "{what}: rel rms {err}");
+                };
+                close(
+                    &read(&outs.buffer, TOKENS * n),
+                    &want,
+                    &format!("simds {simds} outputs"),
+                );
+                let conv_n = rows_state.conv.length() as usize / 4;
+                let rec_n = rows_state.recurrent.length() as usize / 4;
+                for (row, (conv, rec)) in states.iter().enumerate() {
+                    let mut plan = Plan::new(&gpu);
+                    snaps.record_restore(&mut plan, row, &rows_state);
+                    plan.build().run(&gpu);
+                    close(
+                        &read(&rows_state.conv, conv_n),
+                        conv,
+                        &format!("simds {simds} row {row} conv"),
+                    );
+                    close(
+                        &read(&rows_state.recurrent, rec_n),
+                        rec,
+                        &format!("simds {simds} row {row} recurrent"),
+                    );
+                }
+            }
+            DN_SIMDS.store(16, std::sync::atomic::Ordering::Relaxed);
+            println!("deltanet rows: {TOKENS} rows and their restores match {TOKENS} tokens");
         }
 
         #[test]

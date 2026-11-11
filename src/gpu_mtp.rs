@@ -331,12 +331,18 @@ mod mac {
             let gpu = Gpu::new().unwrap();
             let mut g = GpuMtp::load(&gpu, &cfg, &weights, 64).unwrap();
             let mut state = mtp.new_state();
+            // The GPU stores the MTP keys and values as half; so does the CPU.
+            if let LayerState::Full(c) = &mut state {
+                c.round_to_half();
+            }
             let main = |t: usize| View::new(gpu.buffer_from(&hidden(t)));
             let check = |what: &str, g: &GpuMtp, got: u32, want: &(Vec<f32>, u32)| {
                 let out = contents::<f32>(&g.output().buffer, 2048);
                 let err = rel_rms(out, &want.0);
                 println!("{what}: token {got}, rel rms {err:.2e}");
-                assert!(err < 1e-5, "{what}: rel rms {err}");
+                // As whole_model_matches_cpu: both round the keys to half, but
+                // a key now and then lands on the next half value (1.6e-5).
+                assert!(err < 1e-4, "{what}: rel rms {err}");
                 assert_eq!(got, want.1, "{what}");
             };
 

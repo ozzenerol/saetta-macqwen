@@ -79,39 +79,55 @@ mod mac {
         ids: &View,
         weights: &View,
     ) {
+        record_route_rows(plan, 1, logits, 0, experts, top_k, ids, weights);
+    }
+
+    /// `record_route` for `rows` rows of logits, `logit_stride` floats
+    /// apart; `ids` and `weights` get `[rows, top_k]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_route_rows(
+        plan: &mut Plan,
+        rows: usize,
+        logits: &View,
+        logit_stride: usize,
+        experts: usize,
+        top_k: usize,
+        ids: &View,
+        weights: &View,
+    ) {
         // ROUTE_PER_LANE values in each of 32 lanes.
         assert!(experts <= 256 && top_k <= 16);
-        let shape = plan.constant(&[experts as u32, top_k as u32]);
+        let shape = plan.constant(&[experts as u32, top_k as u32, logit_stride as u32]);
         plan.op(
             "route_top_k",
             &[logits, ids, weights, &shape],
-            MTLSize::new(1, 1, 1),
+            MTLSize::new(rows as u64, 1, 1),
             MTLSize::new(32, 1, 1),
         );
     }
 
     /// The scratch buffers of the MoE block, shared by all layers.
-    struct MoeScratch {
-        normed: View,
+    pub(crate) struct MoeScratch {
+        pub(crate) normed: View,
         /// The router's output: `num_experts` logits, then the shared
         /// expert gate logit, which `shared_logit` points at.
-        router: View,
-        ids: View,
-        weights: View,
-        shared_logit: View,
-        shared_gate: View,
-        shared_up: View,
-        shared_h: View,
-        shared: View,
-        experts_h: View,
-        routed: View,
+        pub(crate) router: View,
+        pub(crate) ids: View,
+        pub(crate) weights: View,
+        pub(crate) shared_logit: View,
+        pub(crate) shared_gate: View,
+        pub(crate) shared_up: View,
+        pub(crate) shared_h: View,
+        pub(crate) shared: View,
+        pub(crate) experts_h: View,
+        pub(crate) routed: View,
     }
 
     /// The scratch buffers of one layer step, shared by all layers.
     pub(crate) struct Scratch {
-        normed: View,
-        mixed: View,
-        moe: MoeScratch,
+        pub(crate) normed: View,
+        pub(crate) mixed: View,
+        pub(crate) moe: MoeScratch,
     }
 
     impl Scratch {
@@ -142,14 +158,14 @@ mod mac {
         }
     }
 
-    struct GpuMoe<'a> {
-        post_norm: View,
+    pub(crate) struct GpuMoe<'a> {
+        pub(crate) post_norm: View,
         /// Router logits then the shared expert gate, 257 values.
-        router: Router<'a>,
-        shared_gate: GpuQuant<'a>,
-        shared_up: GpuQuant<'a>,
-        shared_down: GpuQuant<'a>,
-        experts: Experts<'a>,
+        pub(crate) router: Router<'a>,
+        pub(crate) shared_gate: GpuQuant<'a>,
+        pub(crate) shared_up: GpuQuant<'a>,
+        pub(crate) shared_down: GpuQuant<'a>,
+        pub(crate) experts: Experts<'a>,
     }
 
     impl<'a> GpuMoe<'a> {
@@ -229,15 +245,15 @@ mod mac {
         }
     }
 
-    enum Mixer<'a> {
+    pub(crate) enum Mixer<'a> {
         Linear(GpuDeltaNet<'a>, GpuDeltaNetState),
         Full(GpuAttention<'a>, GpuKvCache),
     }
 
     pub(crate) struct GpuLayer<'a> {
-        input_norm: View,
-        mixer: Mixer<'a>,
-        moe: GpuMoe<'a>,
+        pub(crate) input_norm: View,
+        pub(crate) mixer: Mixer<'a>,
+        pub(crate) moe: GpuMoe<'a>,
     }
 
     impl<'a> GpuLayer<'a> {
@@ -401,25 +417,27 @@ mod mac {
     /// What a token reads back: the logits, and the hidden state before the
     /// final norm (for tests that run only some layers).
     pub struct GpuModel<'a> {
-        gpu: &'a Gpu,
-        cfg: &'a Config,
-        layers: Vec<GpuLayer<'a>>,
-        embed: GpuQuant<'a>,
-        final_norm: View,
-        lm_head: GpuQuant<'a>,
-        plan: Plan<'a>,
-        built: Built,
+        pub(crate) gpu: &'a Gpu,
+        pub(crate) cfg: &'a Config,
+        pub(crate) layers: Vec<GpuLayer<'a>>,
+        pub(crate) embed: GpuQuant<'a>,
+        pub(crate) final_norm: View,
+        pub(crate) lm_head: GpuQuant<'a>,
+        /// The multi-row verify, after `enable_verify`.
+        pub(crate) verify: Option<crate::gpu_verify::GpuVerify<'a>>,
+        pub(crate) plan: Plan<'a>,
+        pub(crate) built: Built,
         hidden: View,
         final_hidden: View,
         logits: View,
         scratch: Scratch,
         /// Samples the next token from `logits` in the same command buffer.
-        sampler: GpuSampler,
+        pub(crate) sampler: GpuSampler,
         /// Tokens the attention caches hold now.
-        allocated: usize,
+        pub(crate) allocated: usize,
         /// Tokens they may grow to: the context.
-        capacity: usize,
-        position: usize,
+        pub(crate) capacity: usize,
+        pub(crate) position: usize,
     }
 
     /// The MoE router of the last layer that ran, for debugging.
@@ -488,6 +506,7 @@ mod mac {
                 embed,
                 final_norm,
                 lm_head,
+                verify: None,
                 plan,
                 built,
                 hidden: x,
@@ -544,6 +563,10 @@ mod mac {
             );
             self.allocated = allocated;
             self.record_plan();
+            // The verify plans hold the old caches too.
+            if let Some(rows) = self.verify.as_ref().map(|v| v.rows) {
+                self.enable_verify(rows);
+            }
         }
 
         /// Tokens the attention caches hold now; `capacity` is the most.
