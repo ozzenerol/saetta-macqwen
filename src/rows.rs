@@ -188,7 +188,8 @@ mod mac {
     /// true: qmv_mma3 (split k over MMA2_SIMDS simdgroups) instead of qmv_mma2.
     pub static MMA3: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-    /// Weight tiles per simdgroup of qmv_mma4 (2 or 4); 1 means qmv_mma3.
+    /// Weight tiles per simdgroup of qmv_mma4 (2 or 4); 1 means qmv_mma3, 5
+    /// qmv_mma5.
     pub static MMA_T: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
     /// `qmv_mma2`: up to 8 rows with simdgroup matrices and x staged in
@@ -226,7 +227,10 @@ mod mac {
         );
         let simds = MMA2_SIMDS.load(std::sync::atomic::Ordering::Relaxed);
         let t = MMA_T.load(std::sync::atomic::Ordering::Relaxed);
-        let (kernel, tiles) = if split && t > 1 {
+        let (kernel, tiles) = if split && t == 5 {
+            assert!(w.cols.is_multiple_of(128));
+            (format!("qmv_mma5_{}bit_{simds}", w.bits), 8)
+        } else if split && t > 1 {
             (format!("qmv_mma4_{}bit_{simds}_{t}", w.bits), 8 * t)
         } else if split {
             (format!("qmv_mma3_{}bit_{simds}", w.bits), 8)
@@ -240,6 +244,25 @@ mod mac {
         let grid = MTLSize::new(w.rows.div_ceil(tiles) as u64, 1, 1);
         let threads = MTLSize::new(32 * simds as u64, 1, 1);
         op(plan, &kernel, &buffers, grid, threads, parallel);
+    }
+
+    /// A timing probe of qmv_mma3 (5-bit, split 4) with parts left out;
+    /// see MODE in kernels/rows.metal. The results are wrong.
+    #[cfg(test)]
+    fn record_qmv_probe(plan: &mut Plan, w: &GpuQuant, m: usize, x: &View, y: &View, mode: u32) {
+        let shape = plan.constant(&[w.rows as u32, w.cols as u32, m as u32]);
+        let stride = plan.constant(&[w.rows as u32]);
+        let buffers = [&w.words, &w.scales, &w.biases, x, y, &shape, &stride];
+        let grid = MTLSize::new(w.rows.div_ceil(8) as u64, 1, 1);
+        let kernel = format!("qmv_mma3_probe_{mode}");
+        op(
+            plan,
+            &kernel,
+            &buffers,
+            grid,
+            MTLSize::new(128, 1, 1),
+            false,
+        );
     }
 
     fn op(
@@ -601,7 +624,7 @@ mod mac {
                 println!("{module}: rows 1 to {MAX_ROWS} match qmv");
                 let xs = input(MAX_ROWS, w.cols);
                 let x = View::new(gpu.buffer_from(&xs));
-                for (mma, m) in [0, 1, 2, 4]
+                for (mma, m) in [0, 1, 5]
                     .into_iter()
                     .flat_map(|a| (1..=MAX_ROWS).map(move |m| (a, m)))
                 {
@@ -773,7 +796,8 @@ mod mac {
                             1..=8 => record_qmv(&mut plan, &w, m, &x, &y, false),
                             9..=16 => record_qmv_reg(&mut plan, &w, m - 8, &x, &y, false),
                             17..=24 => record_qmv_pk(&mut plan, &w, m - 16, &x, &y, w.rows, false),
-                            _ => record_qmv_mma2(&mut plan, &w, m - 24, &x, &y, false),
+                            25..=32 => record_qmv_mma2(&mut plan, &w, m - 24, &x, &y, false),
+                            _ => record_qmv_probe(&mut plan, &w, 4, &x, &y, (m - 100) as u32),
                         }
                     }
                     let built = plan.build();
@@ -804,6 +828,19 @@ mod mac {
                 }
                 MMA_T.store(1, std::sync::atomic::Ordering::Relaxed);
                 MMA2_SIMDS.store(4, std::sync::atomic::Ordering::Relaxed);
+                if w.bits == 5 {
+                    let t: Vec<String> = [0, 1, 2, 4, 8, 3, 7, 15]
+                        .map(|mode| {
+                            let us = if mode == 0 {
+                                time(28)
+                            } else {
+                                time(100 + mode)
+                            };
+                            format!("mode {mode} {us:.1}")
+                        })
+                        .to_vec();
+                    println!("{module}: m4 probes {}", t.join(", "));
+                }
                 let rows: Vec<String> = (1..=MAX_ROWS)
                     .map(|m| {
                         format!(

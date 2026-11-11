@@ -989,12 +989,29 @@ kernel void qmv_mma2(device const uint *words [[buffer(0)]],
         qmv_mma2<BITS, S>;
 QMV_MMA2(5, 2) QMV_MMA2(5, 4) QMV_MMA2(5, 8) QMV_MMA2(8, 2) QMV_MMA2(8, 4) QMV_MMA2(8, 8)
 
+// Shifts a lane's packed words right by off (0 or 16 for 5 bits, 0 for 8)
+// so the values start at bit 0 and unpack_at takes constant bit offsets.
+template <uint BITS, uint NW>
+inline void align_packed(thread uint *w, uint off) {
+    if (BITS == 5) {
+        bool sh = off != 0;
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < NW; i++) {
+            uint next = i + 1 < NW ? w[i + 1] : 0;
+            w[i] = sh ? (w[i] >> 16) | (next << 16) : w[i];
+        }
+    }
+}
+
 // qmv_mma2's tile order with split k instead of staging: a threadgroup of
 // SPLIT simdgroups owns 8 weight rows, simdgroup s takes groups s, s +
 // SPLIT, ... and reads x straight from device memory (it stays in cache).
 // The partial tiles are summed through threadgroup memory; rows of y are
 // y_stride floats apart. x must have 8 readable rows.
-template <uint BITS, uint SPLIT>
+// MODE != 0 only for timing probes (wrong results): 1 skips the dequant,
+// 2 loads x once per group, 4 replaces the MMA by lane FMAs, 8 skips the
+// weight loads.
+template <uint BITS, uint SPLIT, uint MODE = 0>
 kernel void qmv_mma3(device const uint *words [[buffer(0)]],
                      device const ushort *scales [[buffer(1)]],
                      device const ushort *biases [[buffer(2)]],
@@ -1035,9 +1052,10 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
             device const uint *w = wrow + bit0 / 32;
 #pragma clang loop unroll(full)
             for (uint i = 0; i < NW; i++) {
-                packed[u][i] = w[i];
+                packed[u][i] = (MODE & 8) ? g + i : w[i];
             }
-            off[u] = bit0 % 32;
+            align_packed<BITS, NW>(packed[u], bit0 % 32);
+            off[u] = 0;
             bool live = g0 + u < g_end;
             s[u] = live ? bf16_to_float(scales[row * groups + g]) : 0.0f;
             b[u] = live ? bf16_to_float(biases[row * groups + g]) : 0.0f;
@@ -1048,13 +1066,18 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
 #pragma clang loop unroll(full)
             for (uint i = 0; i < 8; i++) {
                 simdgroup_float8x8 wt, xt;
-                wt.thread_elements()[0] =
-                    s[u] * float(unpack_at<BITS>(packed[u], off[u] + (2 * i) * BITS)) + b[u];
-                wt.thread_elements()[1] =
-                    s[u] * float(unpack_at<BITS>(packed[u], off[u] + (2 * i + 1) * BITS)) + b[u];
-                xt.thread_elements()[0] = x0[k + 2 * i];
-                xt.thread_elements()[1] = x1[k + 2 * i];
-                simdgroup_multiply_accumulate(acc, wt, xt, acc);
+                float q0 = float(unpack_at<BITS>(packed[u], off[u] + (2 * i) * BITS));
+                float q1 = float(unpack_at<BITS>(packed[u], off[u] + (2 * i + 1) * BITS));
+                wt.thread_elements()[0] = (MODE & 1) ? q0 : s[u] * q0 + b[u];
+                wt.thread_elements()[1] = (MODE & 1) ? q1 : s[u] * q1 + b[u];
+                xt.thread_elements()[0] = x0[k + ((MODE & 2) ? 0 : 2 * i)];
+                xt.thread_elements()[1] = x1[k + ((MODE & 2) ? 0 : 2 * i)];
+                if (MODE & 4) {
+                    acc.thread_elements()[0] += wt.thread_elements()[0] * xt.thread_elements()[0];
+                    acc.thread_elements()[1] += wt.thread_elements()[1] * xt.thread_elements()[1];
+                } else {
+                    simdgroup_multiply_accumulate(acc, wt, xt, acc);
+                }
             }
         }
     }
@@ -1077,6 +1100,10 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
     template [[host_name("qmv_mma3_" #BITS "bit_" #S)]] kernel decltype(qmv_mma3<BITS, S>) \
         qmv_mma3<BITS, S>;
 QMV_MMA3(5, 2) QMV_MMA3(5, 4) QMV_MMA3(5, 8) QMV_MMA3(8, 2) QMV_MMA3(8, 4) QMV_MMA3(8, 8)
+#define QMV_PROBE(MODE) \
+    template [[host_name("qmv_mma3_probe_" #MODE)]] kernel decltype(qmv_mma3<5, 4, MODE>) \
+        qmv_mma3<5, 4, MODE>;
+QMV_PROBE(1) QMV_PROBE(2) QMV_PROBE(4) QMV_PROBE(8) QMV_PROBE(3) QMV_PROBE(7) QMV_PROBE(15)
 
 // One group of 64 values of k for the mma3 tile order: acc += W(8 rows,
 // group g) * X^T, X^T column f.y + e scaled by xs[e]. x0 and x1 point at
@@ -1100,7 +1127,8 @@ inline void mma3_group(device const uint *wrow,
     for (uint i = 0; i < NW; i++) {
         packed[i] = w[i];
     }
-    uint off = bit0 % 32;
+    align_packed<BITS, NW>(packed, bit0 % 32);
+    constexpr uint off = 0;
     float s = bf16_to_float(scales[sb]), b = bf16_to_float(biases[sb]);
     uint k = g * 64;
 #pragma clang loop unroll(full)
@@ -1332,3 +1360,76 @@ kernel void qmv_mma4(device const uint *words [[buffer(0)]],
 #define QMV_MMA4_T(BITS, S) QMV_MMA4(BITS, S, 2) QMV_MMA4(BITS, S, 4)
 QMV_MMA4_T(5, 2) QMV_MMA4_T(5, 4) QMV_MMA4_T(5, 8) QMV_MMA4_T(8, 2) QMV_MMA4_T(8, 4)
 QMV_MMA4_T(8, 8)
+
+// qmv_mma3 with 128 values of k per step: 16 MMAs, tile i's column t is k =
+// 32 (t / 2) + 2 i + t % 2, so a lane holds 32 contiguous values of its
+// weight row, word aligned (5 words for 5 bits, 8 for 8), with one scale
+// and bias. SPLIT simdgroups take contiguous runs of steps. cols must be a
+// multiple of 128; x needs 8 readable rows; rows of y are y_stride apart.
+template <uint BITS, uint SPLIT>
+kernel void qmv_mma5(device const uint *words [[buffer(0)]],
+                     device const ushort *scales [[buffer(1)]],
+                     device const ushort *biases [[buffer(2)]],
+                     device const float *x [[buffer(3)]],
+                     device float *y [[buffer(4)]],
+                     constant QmvRowsShape &shape [[buffer(5)]],
+                     constant uint &y_stride [[buffer(6)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint simd [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NW = BITS;  // 32 values of BITS bits
+    threadgroup float red[SPLIT * 64];
+    uint2 f = frag(lane);
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    uint row0 = tg * 8;
+    uint row = min(row0 + f.x, shape.rows - 1);
+    uint wk = 32 * (f.y / 2);
+    device const uint *wrow = words + row * row_words + wk * BITS / 32;
+    device const float *x0 = x + f.y * shape.cols + 32 * (f.x / 2) + f.x % 2;
+    device const float *x1 = x0 + shape.cols;
+    uint sb = row * groups + wk / 64;
+
+    simdgroup_float8x8 acc = simdgroup_float8x8(0);
+    uint steps = shape.cols / 128;
+    uint per = (steps + SPLIT - 1) / SPLIT;
+    uint end = min(steps, (simd + 1) * per);
+    for (uint st = simd * per; st < end; st++) {
+        uint packed[NW];
+        device const uint *w = wrow + st * 128 * BITS / 32;
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < NW; i++) {
+            packed[i] = w[i];
+        }
+        float s = bf16_to_float(scales[sb + 2 * st]);
+        float b = bf16_to_float(biases[sb + 2 * st]);
+        uint k = st * 128;
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < 16; i++) {
+            simdgroup_float8x8 wt, xt;
+            wt.thread_elements()[0] = s * float(unpack_at<BITS>(packed, (2 * i) * BITS)) + b;
+            wt.thread_elements()[1] = s * float(unpack_at<BITS>(packed, (2 * i + 1) * BITS)) + b;
+            xt.thread_elements()[0] = x0[k + 2 * i];
+            xt.thread_elements()[1] = x1[k + 2 * i];
+            simdgroup_multiply_accumulate(acc, wt, xt, acc);
+        }
+    }
+
+    simdgroup_store(acc, red + simd * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = simd * 32 + lane; e < 64; e += SPLIT * 32) {
+        float sum = 0;
+        for (uint s = 0; s < SPLIT; s++) {
+            sum += red[s * 64 + e];
+        }
+        uint r = row0 + e / 8, j = e % 8;
+        if (r < shape.rows && j < shape.m) {
+            y[j * y_stride + r] = sum;
+        }
+    }
+}
+
+#define QMV_MMA5(BITS, S) \
+    template [[host_name("qmv_mma5_" #BITS "bit_" #S)]] kernel decltype(qmv_mma5<BITS, S>) \
+        qmv_mma5<BITS, S>;
+QMV_MMA5(5, 2) QMV_MMA5(5, 4) QMV_MMA5(5, 8) QMV_MMA5(8, 2) QMV_MMA5(8, 4) QMV_MMA5(8, 8)
