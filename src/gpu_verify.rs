@@ -204,7 +204,7 @@ mod mac {
             );
             let h = cfg.hidden_size;
             let vocab = self.lm_head.rows;
-            let s = RowsScratch::new(gpu, cfg, self.capacity, rows);
+            let s = RowsScratch::new(gpu, cfg, self.allocated, rows);
             let x = view(gpu, MAX_ROWS * h);
             let final_hidden = view(gpu, MAX_ROWS * h);
             let logits = view(gpu, MAX_ROWS * vocab);
@@ -302,12 +302,11 @@ mod mac {
         /// by all of them; `accept` then keeps the first n.
         pub fn verify(&mut self, tokens: &[u32]) -> Vec<u32> {
             let pos = self.position;
-            let v = self.verify.as_mut().expect("enable_verify first");
             let m = tokens.len();
-            assert!(m >= 1 && m <= v.rows, "verify takes 1 to {} tokens", v.rows);
-            assert!(pos + m <= self.capacity, "context is full");
+            // The rows write their keys and values at pos..pos + m.
             self.reserve(pos + m);
-            let v = self.verify.as_mut().unwrap();
+            let v = self.verify.as_mut().expect("enable_verify first");
+            assert!(m >= 1 && m <= v.rows, "verify takes 1 to {} tokens", v.rows);
             let p = v.params.contents() as *mut TokenParams;
             for (r, &t) in tokens.iter().enumerate() {
                 unsafe { *p.add(r) = TokenParams::new(t, (pos + r) as u32) };
@@ -462,13 +461,37 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn verify_matches_decode() {
+            check_verify(512);
+        }
+
+        /// The same with caches that start at 302 tokens: the verify after
+        /// the 300-token prompt grows them, so its plans are recorded again.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn verify_grows_the_cache() {
+            check_verify(302);
+        }
+
+        /// Verify against decode, with caches that start at `start` tokens.
+        fn check_verify(start: usize) {
+            // The first verify runs right after the prompt, so a start below
+            // 300 + DRAFT.len() grows the caches inside it.
             let layers: usize = std::env::var("SAETTA_LAYERS")
                 .map(|v| v.parse().unwrap())
                 .unwrap_or(4);
             let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
             let (cfg, weights) = (Config::load(&dir).unwrap(), Weights::open(&dir).unwrap());
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load(&gpu, &cfg, &weights, layers, 512).unwrap();
+            let mut model = GpuModel::load_from(
+                &gpu,
+                &cfg,
+                &weights,
+                layers,
+                512,
+                start,
+                crate::kv_quant::KvBits::Half,
+            )
+            .unwrap();
             model.enable_verify(DRAFT.len());
 
             // 300 tokens, so the rows' keys cross a chunk boundary.
@@ -481,9 +504,12 @@ mod mac {
                     model.run(t);
                 }
             };
-            prompt(&mut model);
-            let want: Vec<Vec<f32>> = DRAFT.iter().map(|&t| model.forward(t)).collect();
-            let after: Vec<f32> = model.forward(13);
+            // The rows decoded one by one, by a model whose caches never grow.
+            let mut decode = GpuModel::load(&gpu, &cfg, &weights, layers, 512).unwrap();
+            prompt(&mut decode);
+            let want: Vec<Vec<f32>> = DRAFT.iter().map(|&t| decode.forward(t)).collect();
+            let after: Vec<f32> = decode.forward(13);
+            drop(decode);
 
             for n in 1..=DRAFT.len() {
                 prompt(&mut model);

@@ -606,7 +606,7 @@ mod mac {
             );
             self.allocated = allocated;
             self.record_plan();
-            // The verify plans hold the old buffers too.
+            // The verify plans hold the old caches too.
             if let Some(rows) = self.verify.as_ref().map(|v| v.rows) {
                 self.enable_verify(rows);
             }
