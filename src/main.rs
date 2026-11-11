@@ -5,7 +5,7 @@ use std::error::Error;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta bench-qmv <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -16,6 +16,8 @@ fn main() -> ExitCode {
         ["convert", src, out] => report(convert(Path::new(src), Path::new(out))),
         #[cfg(target_os = "macos")]
         ["bench-qmv", dir] => report(saetta::qmv::bench(Path::new(dir), 5, 20)),
+        #[cfg(target_os = "macos")]
+        ["bench-moe", dir] => report(saetta::moe::bench(Path::new(dir), 5)),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

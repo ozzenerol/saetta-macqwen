@@ -20,13 +20,16 @@ mod mac {
         pub offset: u64,
     }
 
-    /// A 2D quantized matrix ready for `encode`. When a tensor sits at an
+    /// A quantized matrix, or a stack of expert matrices `[experts, rows,
+    /// cols]`, ready for `encode` or the kernels in `moe`. When a tensor sits at an
     /// aligned address in its mmap, the buffer wraps it without a copy, so
     /// the matrix borrows the weights.
     pub struct GpuQuant<'a> {
         pub words: View,
         pub scales: View,
         pub biases: View,
+        /// 1 for a plain matrix.
+        pub experts: usize,
         pub rows: usize,
         pub cols: usize,
         pub bits: u32,
@@ -38,8 +41,8 @@ mod mac {
 
     impl<'a> GpuQuant<'a> {
         pub fn new(gpu: &Gpu, q: &QuantTensor<'a>) -> GpuQuant<'a> {
-            assert_eq!(q.weight.shape.len(), 2, "qmv takes 2D matrices");
             assert_eq!(q.params.group_size, 64);
+            let rank = q.weight.shape.len();
             let mut copies = 0;
             let mut view = |t: &Tensor<'a>| {
                 let (view, copied) = upload(gpu, t.bytes);
@@ -50,6 +53,7 @@ mod mac {
                 words: view(&q.weight),
                 scales: view(&q.scales),
                 biases: view(&q.biases),
+                experts: q.weight.shape[..rank - 2].iter().product(),
                 rows: q.out_features(),
                 cols: q.in_features(),
                 bits: q.params.bits,
@@ -58,25 +62,22 @@ mod mac {
             }
         }
 
-        /// The bytes the kernel reads from the matrix in one call.
+        /// The bytes the kernel reads from one matrix (one expert).
         pub fn bytes(&self) -> usize {
             self.rows * self.cols * self.bits as usize / 8 + self.rows * (self.cols / 64) * 4
         }
 
         /// Encodes y = W x. `x` holds `cols` f32 values, `y` gets `rows`.
         pub fn encode(&self, gpu: &Gpu, enc: &ComputeCommandEncoderRef, x: &View, y: &View) {
+            assert_eq!(self.experts, 1, "stacked experts go through moe");
             let name = match self.bits {
                 5 => "qmv_5bit",
                 8 => "qmv_8bit",
                 b => panic!("no qmv kernel for {b} bits"),
             };
             enc.set_compute_pipeline_state(&gpu.pipeline(name));
-            for (i, v) in [&self.words, &self.scales, &self.biases, x, y]
-                .iter()
-                .enumerate()
-            {
-                enc.set_buffer(i as u64, Some(&v.buffer), v.offset);
-            }
+            self.set_buffers(enc, 0);
+            set_views(enc, 3, &[x, y]);
             let shape = [self.rows as u32, self.cols as u32];
             enc.set_bytes(5, 8, shape.as_ptr().cast());
             let rows_per_group = ROWS_PER_SIMD * SIMDS;
@@ -85,6 +86,20 @@ mod mac {
                 MTLSize::new(groups as u64, 1, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),
             );
+        }
+    }
+
+    impl GpuQuant<'_> {
+        /// Binds words, scales and biases at indices `first` to `first + 2`.
+        pub fn set_buffers(&self, enc: &ComputeCommandEncoderRef, first: u64) {
+            set_views(enc, first, &[&self.words, &self.scales, &self.biases]);
+        }
+    }
+
+    /// Binds `views` at consecutive buffer indices from `first`.
+    pub fn set_views(enc: &ComputeCommandEncoderRef, first: u64, views: &[&View]) {
+        for (i, v) in views.iter().enumerate() {
+            enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
         }
     }
 
