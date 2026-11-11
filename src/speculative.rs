@@ -470,13 +470,11 @@ mod gpu {
 
     use super::{Decider, DraftLength, Stats};
     use crate::config::Config;
-    use crate::gpu::{Gpu, contents};
+    use crate::gpu::Gpu;
     use crate::gpu_model::GpuModel;
     use crate::gpu_mtp::GpuMtp;
-    use crate::prefill::Prefill;
     use crate::qmv::View;
-    use crate::sample::Sampler;
-    use crate::sample_gpu::{NO_DRAFT, slot, supports};
+    use crate::sample_gpu::supports;
     use std::time::Instant;
 
     /// The drafter and what a round needs to go back. The main model is
@@ -486,7 +484,6 @@ mod gpu {
         gpu: &'a Gpu,
         k: usize,
         hidden: usize,
-        vocab: usize,
         /// The normed hidden state after the last token the model ran.
         last: View,
         /// For each MTP cache entry, the model position of its hidden state.
@@ -498,8 +495,8 @@ mod gpu {
     }
 
     impl<'a> GpuSpec<'a> {
-        /// Drafts up to `k` tokens per round, as many as pays. `prefill`
-        /// checks them and needs `enable_verify` for `k + 1` rows.
+        /// Drafts up to `k` tokens per round, as many as pays. The model
+        /// checks them and needs `enable_verify(k + 1)`.
         pub fn new(model: &GpuModel<'a>, mtp: GpuMtp<'a>, cfg: &Config, k: usize) -> GpuSpec<'a> {
             let gpu = model.gpu();
             let hidden = cfg.hidden_size;
@@ -516,7 +513,6 @@ mod gpu {
                 gpu,
                 k,
                 hidden,
-                vocab: cfg.vocab_size,
             }
         }
 
@@ -640,7 +636,6 @@ mod gpu {
         pub fn speculate(
             &mut self,
             model: &mut GpuModel<'a>,
-            prefill: &Prefill,
             pending: u32,
             decide: &mut dyn Decider,
         ) -> (Vec<u32>, u32) {
@@ -650,10 +645,14 @@ mod gpu {
             let (drafts, next) = if k == 0 {
                 self.plain(model, pending, decide)
             } else {
-                self.round(model, prefill, pending, decide, k)
+                self.round(model, pending, decide, k)
             };
             let seconds = start.elapsed().as_secs_f64();
-            eprintln!("ROUND k {k} ctx {context} accepted {} {:.1} ms", drafts.len(), seconds * 1e3);
+            eprintln!(
+                "ROUND k {k} ctx {context} accepted {} {:.1} ms",
+                drafts.len(),
+                seconds * 1e3
+            );
             self.length.record(context, k, drafts.len(), seconds);
             self.lengths[k] += 1;
             (drafts, next)
@@ -682,12 +681,10 @@ mod gpu {
         fn round(
             &mut self,
             model: &mut GpuModel<'a>,
-            prefill: &Prefill,
             pending: u32,
             decide: &mut dyn Decider,
             k: usize,
         ) -> (Vec<u32>, u32) {
-            let vocab = self.vocab;
             let base = model.position();
             let mark = self.mtp.len();
 
@@ -703,78 +700,40 @@ mod gpu {
             let tokens: Vec<u32> = std::iter::once(pending)
                 .chain(drafts.iter().copied())
                 .collect();
-            // At temperature > 0 the GPU sampler applies the rejection rule
-            // to each row, in the verify's command buffer.
-            let on_gpu = match decide.sampling() {
-                Some((p, sampler)) if p.temperature > 0.0 && supports(&p) => {
-                    let s = model.sampler();
-                    s.set(vocab, &p, false);
-                    s.seed(sampler.state());
-                    for (i, &d) in drafts.iter().enumerate() {
-                        s.set_draft(base + i + 1, d);
-                    }
-                    s.set_draft(base + k + 1, NO_DRAFT);
-                    true
-                }
-                _ => false,
-            };
-            let states: Vec<_> = model.states().collect();
-            let sampler = on_gpu.then(|| model.sampler());
-            let v = prefill.verify(self.gpu, &tokens, base, &states, sampler);
-            let row = |i: usize| {
-                let at = v.logits.offset as usize / 4 + i * vocab;
-                &contents::<f32>(&v.logits.buffer, at + vocab)[at..]
-            };
-
-            let (accepted, next) = if on_gpu {
-                let s = model.sampler();
-                let ring = s.read();
-                s.clear_drafts();
-                if let Some((_, sampler)) = decide.sampling() {
-                    *sampler = Sampler::new(s.rng());
-                }
-                let accepted = (0..k)
-                    .take_while(|&i| ring.accepted[slot(base + i + 1)] == 1)
-                    .count();
-                (accepted, ring.ids[slot(base + accepted + 1)])
-            } else {
-                let mut accepted = 0;
-                let mut next = None;
-                for (i, &d) in drafts.iter().enumerate() {
-                    let verdict = if decide.greedy() {
-                        (v.argmax[i] != d).then_some(v.argmax[i])
-                    } else {
-                        decide.check(row(i), d)
-                    };
-                    match verdict {
-                        None => accepted += 1,
-                        Some(t) => {
-                            next = Some(t);
-                            break;
-                        }
+            // One verify of all rows; the states move on by all of them
+            // until `accept`.
+            let argmax = model.verify(&tokens);
+            let mut accepted = 0;
+            let mut next = None;
+            for (i, &d) in drafts.iter().enumerate() {
+                let verdict = if decide.greedy() {
+                    (argmax[i] != d).then_some(argmax[i])
+                } else {
+                    decide.check(&model.verify_logits(i), d)
+                };
+                match verdict {
+                    None => accepted += 1,
+                    Some(t) => {
+                        next = Some(t);
+                        break;
                     }
                 }
-                let next = next.unwrap_or_else(|| {
-                    if decide.greedy() {
-                        v.argmax[k]
-                    } else {
-                        decide.pick(row(k))
-                    }
-                });
-                (accepted, next)
-            };
-
-            if accepted < k {
-                prefill.restore(self.gpu, accepted, &states);
             }
-            drop(states);
-            model.set_position(base + accepted + 1);
+            let next = next.unwrap_or_else(|| {
+                if decide.greedy() {
+                    argmax[k]
+                } else {
+                    decide.pick(&model.verify_logits(k))
+                }
+            });
+            model.accept(accepted + 1);
+
             self.mtp.truncate(mark + 1);
             self.mtp_positions.truncate(mark + 1);
             for (i, &d) in drafts[..accepted].iter().enumerate() {
-                self.mtp_record(&v.hidden_row(i), base + i, d);
+                self.mtp_record(&model.verify_hidden(i), base + i, d);
             }
-            copy(&v.hidden_row(accepted), &self.last, self.hidden);
+            copy(&model.verify_hidden(accepted), &self.last, self.hidden);
 
             self.stats.rounds += 1;
             self.stats.drafted += k;
@@ -887,10 +846,8 @@ mod gpu_real {
 
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 1024).unwrap();
             let mtp = GpuMtp::load(&gpu, &cfg, &weights, 1024).unwrap();
+            model.enable_verify(4);
             let mut spec = GpuSpec::new(&model, mtp, &cfg, 3);
-            let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 64).unwrap();
-            prefill.exact = true;
-            prefill.enable_verify(&gpu, 4);
             let mut rows = Vec::with_capacity(prompt.len() * h);
             let mut logits = Vec::new();
             for &t in &prompt {
@@ -903,7 +860,7 @@ mod gpu_real {
             let start = Instant::now();
             while got.len() < count {
                 got.push(pending);
-                let (accepted, next) = spec.speculate(&mut model, &prefill, pending, &mut Greedy);
+                let (accepted, next) = spec.speculate(&mut model, pending, &mut Greedy);
                 got.extend(accepted);
                 pending = next;
             }

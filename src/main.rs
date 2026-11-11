@@ -329,7 +329,7 @@ fn load_gpu(
 ) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let context = memory.context;
-    let model =
+    let mut model =
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), context)?;
     let layers = model.deltanet_states();
     let snapshot: usize = layers
@@ -342,7 +342,7 @@ fn load_gpu(
     let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
     prefill.exact = exact_prefill();
     if draft > 0 {
-        prefill.enable_verify(gpu, draft + 1);
+        model.enable_verify(draft + 1);
     }
     let spec = if draft > 0 {
         let mtp = saetta::gpu_mtp::GpuMtp::load(gpu, config, weights, context)?;
@@ -570,9 +570,7 @@ impl server::Model for GpuServed {
         decide: &mut dyn saetta::speculative::Decider,
     ) -> (Vec<u32>, u32) {
         match &mut self.drafting {
-            Some(d) => d
-                .spec
-                .speculate(&mut self.model, &self.prefill, pending, decide),
+            Some(d) => d.spec.speculate(&mut self.model, pending, decide),
             None => match decide.sampling() {
                 Some((p, sampler)) if saetta::sample_gpu::supports(&p) => {
                     (Vec::new(), self.model.run_sampled(pending, &p, sampler))
