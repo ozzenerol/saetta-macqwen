@@ -795,8 +795,8 @@ mod mac {
             assert!(rel_rms(&model.hidden(), &x) < 1e-4, "after reset");
         }
 
-        /// A cache that grows from 128 tokens gives the same hidden states as
-        /// one allocated whole, over the first four layers (one attention).
+        /// A cache that grows from 128 tokens gives bit for bit the hidden
+        /// states of one allocated whole, over the first four layers (one attention).
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn growing_cache_matches_whole() {
@@ -805,16 +805,14 @@ mod mac {
             let mut grows = GpuModel::load_from(&gpu, &cfg, &weights, 4, 1024, 128).unwrap();
             let mut whole = GpuModel::load(&gpu, &cfg, &weights, 4, 1024).unwrap();
             assert_eq!((grows.allocated(), whole.allocated()), (128, 1024));
-            let mut worst = 0f32;
             for t in 0..600u32 {
                 let token = (t * 7919) % 50000;
                 grows.run(token);
                 whole.run(token);
-                let err = rel_rms(&grows.hidden(), &whole.hidden());
-                worst = worst.max(err);
-                assert!(err < 1e-6, "token {t}: rel rms {err}");
+                // The same kernels, and chunks past the length return at once,
+                // so the capacity must not change a bit.
+                assert_eq!(grows.hidden(), whole.hidden(), "token {t}");
             }
-            println!("worst rel rms {worst:.2e}, allocated {}", grows.allocated());
             assert_eq!(grows.allocated(), 1024);
         }
 
