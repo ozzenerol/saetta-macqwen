@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--port N] [--context N] [--kv-bits 16|8|4] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -56,6 +56,8 @@ fn main() -> ExitCode {
         ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
+        #[cfg(target_os = "macos")]
+        ["bench-qmm2", dir] => report(saetta::qmm::bench(Path::new(dir), &[512, 2048], 10)),
         #[cfg(target_os = "macos")]
         ["bench-qmm", dir, rows] => match rows.parse() {
             Ok(m) => report(saetta::prefill::bench_qmm(Path::new(dir), m, 10)),
@@ -136,27 +138,48 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 struct ServeFlags {
     gpu: bool,
     /// Tokens the MTP layer drafts per round; 0 turns drafting off.
     draft: usize,
     port: u16,
-    /// Tokens the GPU model has room for.
-    context: usize,
-    kv_bits: KvBits,
     exact_history: bool,
+    memory: Memory,
 }
 
-/// `[--gpu] [--draft K] [--port N] [--context N] [--kv-bits 16|8|4]
+/// What the GPU server may allocate besides the weights.
+#[derive(Clone, Copy)]
+struct Memory {
+    /// Tokens of context: the KV caches are allocated for this many. A page
+    /// of them takes memory only once a token is written there.
+    context: usize,
+    /// Bytes for prompt cache snapshots.
+    cache_bytes: usize,
+    /// How the KV caches store keys and values.
+    kv_bits: KvBits,
+}
+
+impl Default for Memory {
+    fn default() -> Memory {
+        Memory {
+            // The full context of Qwen3.6.
+            context: 262144,
+            cache_bytes: 1 << 30,
+            kv_bits: KvBits::Half,
+        }
+    }
+}
+
+/// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N]
 /// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut f = ServeFlags {
         gpu: false,
         draft: 0,
         port: 8090,
-        context: DEFAULT_CONTEXT,
-        kv_bits: KvBits::Half,
         exact_history: false,
+        memory: Memory::default(),
     };
     let mut it = flags.iter();
     while let Some(&flag) = it.next() {
@@ -173,16 +196,24 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             }
             "--exact-history" => f.exact_history = true,
             "--context" => {
-                let value = it.next().ok_or("--context needs a number")?;
-                f.context = value
-                    .parse()
-                    .ok()
-                    .filter(|&n| n > 0)
-                    .ok_or(format!("bad context {value}"))?;
+                let value = it.next().ok_or("--context needs a number of tokens")?;
+                let n: usize = value.parse().map_err(|_| format!("bad context {value}"))?;
+                if n < 1024 {
+                    return Err("--context takes at least 1024 tokens".into());
+                }
+                // Prefill's attention reads keys in blocks of 32.
+                f.memory.context = n.next_multiple_of(32);
             }
             "--kv-bits" => {
                 let value = it.next().ok_or("--kv-bits needs 16, 8 or 4")?;
-                f.kv_bits = KvBits::parse(value).ok_or(format!("bad --kv-bits {value}"))?;
+                f.memory.kv_bits = KvBits::parse(value).ok_or(format!("bad --kv-bits {value}"))?;
+            }
+            "--cache-mb" => {
+                let value = it.next().ok_or("--cache-mb needs a number")?;
+                let mb: usize = value
+                    .parse()
+                    .map_err(|_| format!("bad cache size {value}"))?;
+                f.memory.cache_bytes = mb << 20;
             }
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
@@ -194,7 +225,7 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     if f.draft > 0 && !f.gpu {
         return Err("--draft needs --gpu".into());
     }
-    if f.kv_bits != KvBits::Half {
+    if f.memory.kv_bits != KvBits::Half {
         // Prefill runs over it already (saetta eval --no-ppl --long N).
         return Err("--kv-bits 8 and 4 need the decode attention kernels; use 16 for now".into());
     }
@@ -206,11 +237,9 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
 fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let ServeFlags {
         gpu,
-        draft,
         port,
-        context,
-        kv_bits,
         exact_history,
+        ..
     } = flags;
     // The model borrows these for as long as the server runs.
     let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
@@ -231,12 +260,7 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
     if gpu {
-        let gpu = GpuFlags {
-            draft,
-            context,
-            kv_bits,
-        };
-        return serve_gpu(config, weights, tokenizer, settings, listener, &what, gpu);
+        return serve_gpu(config, weights, tokenizer, settings, listener, &what, flags);
     }
     let model = Model::new(config, weights)?;
     let states = model.new_states();
@@ -262,25 +286,9 @@ fn serve_gpu(
     _: Settings,
     _: TcpListener,
     _: &str,
-    _: GpuFlags,
+    _: ServeFlags,
 ) -> Result<(), Box<dyn Error>> {
     Err("--gpu needs macOS".into())
-}
-
-/// The full context of Qwen3.6. The KV cache is allocated for all of it,
-/// but a page of it takes memory only once a token is written there.
-const DEFAULT_CONTEXT: usize = 262144;
-
-/// How the GPU model is loaded.
-#[derive(Clone, Copy)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-struct GpuFlags {
-    /// Tokens the MTP layer drafts per round; 0 turns drafting off.
-    draft: usize,
-    /// Tokens of context.
-    context: usize,
-    /// How the KV cache stores keys and values.
-    kv_bits: KvBits,
 }
 
 #[cfg(target_os = "macos")]
@@ -291,18 +299,22 @@ fn serve_gpu(
     settings: Settings,
     listener: TcpListener,
     what: &str,
-    flags: GpuFlags,
+    flags: ServeFlags,
 ) -> Result<(), Box<dyn Error>> {
-    let GpuFlags { draft, context, .. } = flags;
-    let served = load_gpu(config, weights, flags)?;
-    let model = Cached::new(served, cache::DEFAULT_LIMIT, cache::DEFAULT_EVERY);
+    let ServeFlags { draft, memory, .. } = flags;
+    let served = load_gpu(config, weights, draft, memory)?;
+    let snapshots = served.snapshots;
+    let model = Cached::new(served, snapshots, cache::DEFAULT_EVERY);
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
     let drafts = if draft > 0 {
         format!(", MTP drafts {draft} per round")
     } else {
         String::new()
     };
-    eprintln!("serving {what} (GPU model, {context} tokens of context{drafts})");
+    eprintln!(
+        "serving {what} (GPU model, {} tokens of context{drafts})",
+        memory.context
+    );
     server.serve(listener)?;
     Ok(())
 }
@@ -313,20 +325,27 @@ fn serve_gpu(
 fn load_gpu(
     config: &'static Config,
     weights: &'static Weights,
-    flags: GpuFlags,
+    draft: usize,
+    memory: Memory,
 ) -> Result<GpuServed, Box<dyn Error>> {
-    let GpuFlags { draft, context, .. } = flags;
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
+    let context = memory.context;
     let model = saetta::gpu_model::GpuModel::load_with_bits(
         gpu,
         config,
         weights,
         config.num_layers(),
         context,
-        flags.kv_bits,
+        memory.kv_bits,
     )?;
     let layers = model.deltanet_states();
-    let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
+    let snapshot: usize = layers
+        .iter()
+        .map(|s| (s.conv.length() + s.recurrent.length()) as usize)
+        .sum();
+    // The cache adds a snapshot before it evicts one, so the pool has one more.
+    let snapshots = (memory.cache_bytes / snapshot).max(2) - 1;
+    let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, snapshots + 1);
     let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
     prefill.exact = exact_prefill();
     if draft > 0 {
@@ -343,14 +362,62 @@ fn load_gpu(
     } else {
         None
     };
+    report_memory(&model, memory, draft > 0, snapshots, snapshot);
     Ok(GpuServed {
         model,
         prefill,
         pool,
+        snapshots,
         last_blit: RefCell::new(None),
         drafting: spec,
         rows: saetta::gpu_cache::RowBackup::new(),
     })
+}
+
+/// Prints what the server allocates besides the weights, at most: the
+/// decode KV caches as allocated, prefill's f16 copy of them, the MTP
+/// layer's cache (one more attention layer), the snapshot pool, and the KV
+/// rows a detour keeps aside (`cache::BACKUP_ROWS`).
+#[cfg(target_os = "macos")]
+fn report_memory(
+    model: &saetta::gpu_model::GpuModel,
+    memory: Memory,
+    mtp: bool,
+    snapshots: usize,
+    snapshot: usize,
+) {
+    use saetta::gpu_model::State;
+    let caches: Vec<_> = model
+        .states()
+        .filter_map(|s| match s {
+            State::Full(c) => Some(c),
+            State::Linear(_) => None,
+        })
+        .collect();
+    let decode: usize = caches
+        .iter()
+        .map(|c| (c.keys.length() + c.values.length()) as usize)
+        .sum();
+    // Keys and values of one token in every attention layer; the caches
+    // round the context up to KV_ALIGN.
+    let row = decode / caches[0].capacity;
+    let one_layer = row / caches.len();
+    let mtp_kv = usize::from(mtp) * one_layer * memory.context;
+    let kv = decode + mtp_kv;
+    let cache = (snapshots + 1) * snapshot;
+    let backup = cache::BACKUP_ROWS * row;
+    let mb = |b: usize| b >> 20;
+    eprintln!(
+        "memory besides the weights: KV {} MB ({} tokens at {} KB), prompt cache {} MB ({} snapshots of {} MB) plus {} MB of KV rows, {} MB in all",
+        mb(kv),
+        memory.context,
+        (kv / memory.context) >> 10,
+        mb(cache),
+        snapshots + 1,
+        mb(snapshot),
+        mb(backup),
+        mb(kv + cache + backup)
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -361,6 +428,8 @@ struct GpuServed {
     /// before it writes the states, as `reset` does.
     last_blit: RefCell<Option<metal::CommandBuffer>>,
     prefill: saetta::prefill::Prefill<'static>,
+    /// The prompt cache's snapshot limit, from `--cache-mb`.
+    snapshots: usize,
     drafting: Option<Drafting>,
     /// KV rows kept aside during a detour (cache::Restore::backup_rows).
     rows: saetta::gpu_cache::RowBackup,
@@ -405,8 +474,10 @@ const MTP_WINDOW: usize = 32;
 const PREFILL_CHUNK: usize = 1024;
 
 #[cfg(target_os = "macos")]
+/// Fast prefill unless SAETTA_EXACT=1: track F's eval found it within
+/// 0.04% of the f32 perplexity, closer than MLX in bf16.
 fn exact_prefill() -> bool {
-    !saetta::prefill::fast_from_env()
+    saetta::prefill::exact_from_env()
 }
 
 // The server uses the model from one thread at a time, behind its engine
@@ -485,9 +556,10 @@ impl server::Model for GpuServed {
         };
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
-            "prefill {} tokens in {secs:.2} s ({:.1} ms/token)",
+            "prefill {} tokens in {secs:.2} s ({:.1} ms/token), GPU buffers {} MB",
             tokens.len(),
-            secs * 1e3 / tokens.len() as f64
+            secs * 1e3 / tokens.len() as f64,
+            m.gpu().device.current_allocated_size() >> 20
         );
         logits
     }
@@ -508,10 +580,15 @@ impl server::Model for GpuServed {
             Some(d) => d
                 .spec
                 .speculate(&mut self.model, &self.prefill, pending, decide),
-            None => {
-                let logits = self.model.forward(pending);
-                (Vec::new(), decide.pick(&logits))
-            }
+            None => match decide.sampling() {
+                Some((p, sampler)) if saetta::sample_gpu::supports(&p) => {
+                    (Vec::new(), self.model.run_sampled(pending, &p, sampler))
+                }
+                _ => {
+                    let logits = self.model.forward(pending);
+                    (Vec::new(), decide.pick(&logits))
+                }
+            },
         }
     }
 
@@ -703,12 +780,11 @@ fn eval_gpu(
     reference: &saetta::eval::Reference,
     o: EvalOptions,
 ) -> Result<bool, Box<dyn Error>> {
-    let flags = GpuFlags {
-        draft: 0,
-        context: DEFAULT_CONTEXT,
+    let memory = Memory {
         kv_bits: o.kv_bits,
+        ..Memory::default()
     };
-    let mut model = load_gpu(config, weights, flags)?;
+    let mut model = load_gpu(config, weights, 0, memory)?;
     let prefill = if model.prefill.exact { "exact" } else { "fast" };
     println!("GPU model, {prefill} prefill, {:?} KV cache", o.kv_bits);
     saetta::eval::gate(&mut model, reference, &o.gate)

@@ -53,7 +53,7 @@ mod mac {
     use crate::gpu::{Gpu, contents};
     use crate::plan::Plan;
     use crate::qmv::View;
-    use metal::MTLSize;
+    use metal::{ComputeCommandEncoderRef, MTLSize};
 
     const GROUPS: usize = 256;
 
@@ -109,6 +109,40 @@ mod mac {
             );
         }
 
+        /// `record` into an open encoder, for rows outside a plan: `tp` is
+        /// the TokenParams whose position + 1 picks the ring slot.
+        pub fn encode(&self, gpu: &Gpu, enc: &ComputeCommandEncoderRef, logits: &View, tp: &View) {
+            let ops: [(&str, &[&View], u64, u64); 2] = [
+                (
+                    "sample_partial",
+                    &[logits, &self.cand_v, &self.cand_i, &self.part, &self.params],
+                    GROUPS as u64,
+                    256,
+                ),
+                (
+                    "sample_final",
+                    &[
+                        &self.cand_v,
+                        &self.cand_i,
+                        &self.part,
+                        &self.params,
+                        &self.rng,
+                        &self.ring,
+                        tp,
+                    ],
+                    1,
+                    1024,
+                ),
+            ];
+            for (kernel, views, groups, threads) in ops {
+                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
+                for (i, v) in views.iter().enumerate() {
+                    enc.set_buffer(i as u64, Some(&v.buffer), v.offset);
+                }
+                enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(threads, 1, 1));
+            }
+        }
+
         /// Sets the params for the next runs. `advance` makes the sampled
         /// token the plan's next input. Greedy runs as top_k 1.
         pub fn set(&self, n: usize, p: &Params, advance: bool) {
@@ -126,6 +160,11 @@ mod mac {
 
         pub fn seed(&self, seed: u64) {
             unsafe { *(self.rng.buffer.contents() as *mut u64) = seed };
+        }
+
+        /// The splitmix64 state after the last draw.
+        pub fn rng(&self) -> u64 {
+            contents::<u64>(&self.rng.buffer, 1)[0]
         }
 
         pub fn read(&self) -> SampleRing {

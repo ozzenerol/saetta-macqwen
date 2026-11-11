@@ -75,11 +75,16 @@ mod mac {
                 .new_buffer(self.size, MTLResourceOptions::StorageModePrivate)
         }
 
-        /// A buffer from the pool, or a new one when the pool is empty.
+        /// A buffer from the pool, or a new one when the pool is empty. The
+        /// cache never holds more than the pool, so a new one means a bug;
+        /// it is logged, as it goes past `--cache-mb`.
         fn take(&self) -> GpuSnapshot {
             let buffer = self.free.lock().unwrap().pop();
             GpuSnapshot {
-                buffer: Some(buffer.unwrap_or_else(|| self.new_buffer())),
+                buffer: Some(buffer.unwrap_or_else(|| {
+                    eprintln!("snapshot pool is empty: allocating past the cache limit");
+                    self.new_buffer()
+                })),
                 free: Arc::clone(&self.free),
             }
         }

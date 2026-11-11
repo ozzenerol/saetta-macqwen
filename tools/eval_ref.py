@@ -130,14 +130,17 @@ def main():
     ap.add_argument("--text", help="the ppl text; without it there is no ppl sequence")
     ap.add_argument("--out", default=str(Path.home() / "saetta/eval"))
     ap.add_argument("--long", type=int, default=32768)
-    ap.add_argument("--checkpoints", default="1023,4095,8191,16383,32767")
+    ap.add_argument("--checkpoints", help="positions with full logits; default every 1024th, 1023 to the end")
     ap.add_argument("--dtypes", default="f32,bf16")
     ap.add_argument("--score-gb", type=float, default=2.0)
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the memory estimate only")
     args = ap.parse_args()
 
     out = Path(args.out).expanduser()
-    checkpoints = [int(p) for p in args.checkpoints.split(",")]
+    if args.checkpoints:
+        checkpoints = [int(p) for p in args.checkpoints.split(",")]
+    else:
+        checkpoints = list(range(1023, args.long, 1024))
     assert max(checkpoints) < args.long
     score_bytes = int(args.score_gb * 2**30)
 

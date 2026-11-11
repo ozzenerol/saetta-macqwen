@@ -245,20 +245,36 @@ impl<M: Model + Restore> Model for Cached<M> {
     /// The last one lets a retry of the same prompt rerun a single token,
     /// which goes through `step`.
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        match self.prefill_while(tokens, &mut || true) {
+            Ok(logits) => logits,
+            Err(_) => unreachable!("alive is always true"),
+        }
+    }
+
+    /// Asks `alive` before each piece. When it says false, the state ends
+    /// at the last piece run, with its snapshot saved.
+    fn prefill_while(
+        &mut self,
+        tokens: &[u32],
+        alive: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, usize> {
         self.save(false);
         if tokens.is_empty() {
-            return self.model.prefill(tokens);
+            return Ok(self.model.prefill(tokens));
         }
         let start = self.tokens.len();
-        self.write_rows(start, tokens);
         let last = start + tokens.len() - 1;
         let mut done = 0;
         // Lengths of the snapshots taken on the way that were new.
         let mut taken: Vec<usize> = Vec::new();
         while start + done < last {
+            if !alive() {
+                return Err(start + done);
+            }
             let next_stop = ((start + done) / self.every + 1) * self.every;
             let stop = next_stop.min(last);
             let chunk = &tokens[done..stop - start];
+            self.write_rows(start + done, chunk);
             self.model.prefill(chunk);
             self.tokens.extend_from_slice(chunk);
             done = stop - start;
@@ -279,8 +295,9 @@ impl<M: Model + Restore> Model for Cached<M> {
         // One token is left. A decode step runs it in a few ms, where a
         // prefill call has a fixed cost of about half a second on the GPU.
         let token = tokens[done];
+        self.write_rows(start + done, &[token]);
         self.tokens.push(token);
-        self.model.step(token)
+        Ok(self.model.step(token))
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
