@@ -40,7 +40,8 @@ impl Reference {
             .ok_or("bad checkpoint")?;
         Ok(Reference {
             dir: dir.to_path_buf(),
-            ppl_tokens: read_u32(&dir.join("ppl_tokens.bin"))?,
+            // A long-only reference has no ppl text.
+            ppl_tokens: read_u32(&dir.join("ppl_tokens.bin")).unwrap_or_default(),
             long_tokens: read_u32(&dir.join("long_tokens.bin"))?,
             checkpoints,
         })
@@ -57,6 +58,15 @@ impl Reference {
 
     pub fn logits(&self, run: &str, pos: usize) -> Result<Vec<f32>, Box<dyn Error>> {
         read_f32(&self.dir.join(format!("{run}_logits_{pos}.bin")))
+    }
+
+    /// The bf16 data, which long references may leave out.
+    fn bf16_nll(&self, seq: &str) -> Option<Vec<f32>> {
+        self.nll("bf16", seq).ok()
+    }
+
+    fn bf16_logits(&self, pos: usize) -> Option<Vec<f32>> {
+        self.logits("bf16", pos).ok()
     }
 }
 
@@ -155,14 +165,19 @@ pub fn run<M: Model>(model: &mut M, tokens: &[u32], keep: &[usize]) -> Run {
 pub struct PplReport {
     pub ours: f64,
     pub mlx_f32: f64,
-    pub mlx_bf16: f64,
+    pub mlx_bf16: Option<f64>,
     pub mean_abs_diff: f64,
     pub max_abs_diff: f64,
     pub top1_agree: f64,
 }
 
 impl PplReport {
-    pub fn new(ours: &Run, f32_nll: &[f32], f32_argmax: &[u32], bf16_nll: &[f32]) -> PplReport {
+    pub fn new(
+        ours: &Run,
+        f32_nll: &[f32],
+        f32_argmax: &[u32],
+        bf16_nll: Option<&[f32]>,
+    ) -> PplReport {
         let n = ours.nll.len();
         let diffs: Vec<f64> = ours
             .nll
@@ -179,7 +194,7 @@ impl PplReport {
         PplReport {
             ours: perplexity(&ours.nll),
             mlx_f32: perplexity(&f32_nll[..n]),
-            mlx_bf16: perplexity(&bf16_nll[..n]),
+            mlx_bf16: bf16_nll.map(|b| perplexity(&b[..n])),
             mean_abs_diff: diffs.iter().sum::<f64>() / n as f64,
             max_abs_diff: diffs.iter().fold(0.0, |m: f64, &d| m.max(d)),
             top1_agree: agree as f64 / n as f64,
@@ -195,13 +210,18 @@ impl PplReport {
     }
 
     pub fn print(&self, name: &str, tokens: usize) {
+        let bf16 = match self.mlx_bf16 {
+            Some(b) => format!(
+                ", MLX bf16 {b:.4} ({:+.3}%)",
+                (b / self.mlx_f32 - 1.0) * 100.0
+            ),
+            None => String::new(),
+        };
         println!(
-            "{name}: {tokens} tokens, ppl {:.4} vs MLX f32 {:.4} ({:+.3}%), MLX bf16 {:.4} ({:+.3}%)",
+            "{name}: {tokens} tokens, ppl {:.4} vs MLX f32 {:.4} ({:+.3}%){bf16}",
             self.ours,
             self.mlx_f32,
             (self.ours / self.mlx_f32 - 1.0) * 100.0,
-            self.mlx_bf16,
-            (self.mlx_bf16 / self.mlx_f32 - 1.0) * 100.0
         );
         println!(
             "  per token |NLL diff| mean {:.5} max {:.4}, top-1 agrees {:.2}%  {}",
@@ -216,19 +236,24 @@ impl PplReport {
 pub struct LogitsReport {
     pub pos: usize,
     pub kl: f64,
-    pub kl_bf16: f64,
+    pub kl_bf16: Option<f64>,
     pub top1_same: bool,
     pub top10_overlap: usize,
 }
 
 impl LogitsReport {
-    pub fn new(pos: usize, f32_ref: &[f32], bf16_ref: &[f32], ours: &[f32]) -> LogitsReport {
+    pub fn new(
+        pos: usize,
+        f32_ref: &[f32],
+        bf16_ref: Option<&[f32]>,
+        ours: &[f32],
+    ) -> LogitsReport {
         let ref_top = top_k(f32_ref, 10);
         let our_top = top_k(ours, 10);
         LogitsReport {
             pos,
             kl: kl_divergence(f32_ref, ours),
-            kl_bf16: kl_divergence(f32_ref, bf16_ref),
+            kl_bf16: bf16_ref.map(|b| kl_divergence(f32_ref, b)),
             top1_same: ref_top[0] == our_top[0],
             top10_overlap: our_top.iter().filter(|id| ref_top.contains(id)).count(),
         }
@@ -239,11 +264,14 @@ impl LogitsReport {
     }
 
     pub fn print(&self) {
+        let bf16 = match self.kl_bf16 {
+            Some(k) => format!(" (MLX bf16 {k:.2e})"),
+            None => String::new(),
+        };
         println!(
-            "  position {:5}: KL {:.2e} (MLX bf16 {:.2e}), top-1 {}, top-10 overlap {}/10  {}",
+            "  position {:6}: KL {:.2e}{bf16}, top-1 {}, top-10 overlap {}/10  {}",
             self.pos,
             self.kl,
-            self.kl_bf16,
             if self.top1_same { "same" } else { "DIFFERENT" },
             self.top10_overlap,
             verdict(self.pass())
@@ -311,13 +339,16 @@ pub fn gate<M: Model>(
     let long = options.long;
     if options.ppl {
         let tokens = &reference.ppl_tokens;
+        if tokens.is_empty() {
+            return Err("this reference has no ppl text; use --no-ppl".into());
+        }
         eprintln!("ppl: {} tokens", tokens.len());
         let ours = run(model, tokens, &[]);
         let report = PplReport::new(
             &ours,
             &reference.nll("f32", "ppl")?,
             &reference.argmax("f32", "ppl")?,
-            &reference.nll("bf16", "ppl")?,
+            reference.bf16_nll("ppl").as_deref(),
         );
         report.print("ppl", tokens.len());
         pass &= report.pass();
@@ -348,7 +379,7 @@ pub fn gate<M: Model>(
                 &ours,
                 &f32_nll,
                 &reference.argmax("f32", "long")?,
-                &reference.nll("bf16", "long")?,
+                reference.bf16_nll("long").as_deref(),
             );
             report.print("long", long);
             pass &= report.pass();
@@ -361,7 +392,7 @@ pub fn gate<M: Model>(
             let r = LogitsReport::new(
                 pos,
                 &reference.logits("f32", pos)?,
-                &reference.logits("bf16", pos)?,
+                reference.bf16_logits(pos).as_deref(),
                 &logits,
             );
             r.print();

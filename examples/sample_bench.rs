@@ -23,12 +23,20 @@ fn main() {
     let built = plan.build();
     for k in ["sample_partial", "sample_final"] {
         let p = gpu.pipeline(k);
-        println!("{k}: max threads {}, simd width {}", p.max_total_threads_per_threadgroup(), p.thread_execution_width());
+        println!(
+            "{k}: max threads {}, simd width {}",
+            p.max_total_threads_per_threadgroup(),
+            p.thread_execution_width()
+        );
     }
     let only_partial = plan.build_where(|k| k == "sample_partial", true);
     let only_final = plan.build_where(|k| k == "sample_final", true);
     for k in [1, 20, 64] {
-        let p = Params { temperature: 0.7, top_p: 0.95, top_k: k };
+        let p = Params {
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: k,
+        };
         sampler.set(n, &p, false);
         let mut t: Vec<f64> = (0..50)
             .map(|_| {

@@ -16,7 +16,11 @@ fn logits(n: usize, seed: u64) -> Vec<f32> {
     (0..n)
         .map(|_| {
             let u = s.next_f32();
-            if u < 0.001 { 10.0 + 8.0 * s.next_f32() } else { 12.0 * s.next_f32() - 6.0 }
+            if u < 0.001 {
+                10.0 + 8.0 * s.next_f32()
+            } else {
+                12.0 * s.next_f32() - 6.0
+            }
         })
         .collect()
 }
@@ -35,11 +39,31 @@ fn matches_cpu_draws() {
     let x = logits(VOCAB, 3);
     let (plan, sampler) = setup(&gpu, &x);
     let cases = [
-        Params { temperature: 0.0, top_p: 1.0, top_k: 0 },
-        Params { temperature: 0.6, top_p: 0.95, top_k: 20 },
-        Params { temperature: 1.0, top_p: 1.0, top_k: 64 },
-        Params { temperature: 0.7, top_p: 0.8, top_k: 40 },
-        Params { temperature: 2.0, top_p: 0.5, top_k: 1 },
+        Params {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+        },
+        Params {
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 20,
+        },
+        Params {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 64,
+        },
+        Params {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 40,
+        },
+        Params {
+            temperature: 2.0,
+            top_p: 0.5,
+            top_k: 1,
+        },
     ];
     for p in &cases {
         sampler.set(VOCAB, p, false);
@@ -62,7 +86,11 @@ fn advance_feeds_the_next_position() {
     let gpu = Gpu::new().unwrap();
     let x = logits(VOCAB, 5);
     let (plan, sampler) = setup(&gpu, &x);
-    let p = Params { temperature: 0.0, top_p: 1.0, top_k: 0 };
+    let p = Params {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+    };
     sampler.set(VOCAB, &p, true);
     plan.set_params(TokenParams::new(0, 10));
     let built = plan.build();
@@ -82,10 +110,17 @@ fn draft_rule_keeps_the_distribution() {
     let gpu = Gpu::new().unwrap();
     let x = [1.0f32, 3.0, 2.0, 0.0, 3.0, -1.0, 2.5, 0.5];
     let (plan, sampler) = setup(&gpu, &x);
-    let p = Params { temperature: 0.8, top_p: 0.9, top_k: 6 };
+    let p = Params {
+        temperature: 0.8,
+        top_p: 0.9,
+        top_k: 6,
+    };
     let want: Vec<f64> = {
         let c = Sampler::new(0).candidates(&x, &p);
-        let w: Vec<f64> = c.iter().map(|&(_, l)| ((l - c[0].1) as f64 / 0.8).exp()).collect();
+        let w: Vec<f64> = c
+            .iter()
+            .map(|&(_, l)| ((l - c[0].1) as f64 / 0.8).exp())
+            .collect();
         let t: f64 = w.iter().sum();
         let mut want = vec![0.0; x.len()];
         for (&(id, _), w) in c.iter().zip(&w) {
@@ -111,9 +146,16 @@ fn draft_rule_keeps_the_distribution() {
         }
         for i in 0..x.len() {
             let got = counts[i] as f64 / n as f64;
-            assert!((got - want[i]).abs() < 0.015, "draft {draft} token {i}: {got} vs {}", want[i]);
+            assert!(
+                (got - want[i]).abs() < 0.015,
+                "draft {draft} token {i}: {got} vs {}",
+                want[i]
+            );
         }
         let k = kept as f64 / n as f64;
-        assert!((k - want[draft as usize]).abs() < 0.015, "draft {draft} kept {k}");
+        assert!(
+            (k - want[draft as usize]).abs() < 0.015,
+            "draft {draft} kept {k}"
+        );
     }
 }
