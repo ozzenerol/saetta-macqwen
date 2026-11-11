@@ -404,7 +404,8 @@ mod mac {
         lm_head: GpuQuant<'a>,
         chunk: usize,
         scratch: Scratch,
-        /// Use the split qmm kernels: slower, close to f32.
+        /// Use the split qmm kernels and f32 attention: within f32 rounding
+        /// of decode. With false, half inputs: faster, about 1e-3 off.
         pub exact: bool,
         /// Largest |x| seen at each of `RANGES`, when tracked.
         ranges: Option<Buffer>,
@@ -515,7 +516,7 @@ mod mac {
                 lm_head: matrix("language_model.lm_head")?,
                 scratch: Scratch::new(gpu, cfg, chunk),
                 chunk,
-                exact: false,
+                exact: true,
                 ranges: None,
             })
         }
@@ -916,7 +917,8 @@ mod mac {
                 &s.shared_out,
             ]
             .map(whole);
-            qmm(gpu, enc, &layer.router, normed, &router, t, self.exact);
+            // Routing stays close to f32 so it picks the experts decode would.
+            qmm(gpu, enc, &layer.router, normed, &router, t, true);
             qmm(
                 gpu,
                 enc,
@@ -928,7 +930,7 @@ mod mac {
             );
             qmm(gpu, enc, &layer.shared[0], normed, &sg, t, self.exact);
             qmm(gpu, enc, &layer.shared[1], normed, &su, t, self.exact);
-            let silu_mul = gpu.pipeline("silu_mul");
+            let silu_mul = gpu.pipeline("silu_mul_rows");
             dispatch_1d(
                 enc,
                 &silu_mul,
@@ -1000,6 +1002,11 @@ mod mac {
     /// Prompt tokens for tests and benchmarks: a fixed spread of ids.
     pub fn test_tokens(n: usize) -> Vec<u32> {
         (0..n).map(|i| ((i * 7919 + 13) % 150_000) as u32).collect()
+    }
+
+    /// SAETTA_FAST=1 picks the half-input prefill kernels.
+    pub fn fast_from_env() -> bool {
+        std::env::var("SAETTA_FAST").is_ok_and(|v| v == "1")
     }
 
     /// Layer states for prefill without a `GpuModel`, for tests and
@@ -1130,7 +1137,7 @@ mod mac {
                     View::new(gpu.buffer_from(&x)),
                     View::new(gpu.buffer(want.len() * 4)),
                 );
-                for (split, bound) in [(true, 1e-5), (false, 2e-3)] {
+                for (split, bound) in [(true, 1e-5), (false, 5e-3)] {
                     gpu.run(|enc| qmm(&gpu, enc, &w, &xv, &yv, m, split));
                     let err = rel_rms(contents::<f32>(&yv.buffer, want.len()), &want);
                     println!(
@@ -1246,6 +1253,7 @@ mod mac {
             let mut by_token = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
             let mut with_prefill = GpuModel::load(&gpu, &cfg, &weights, n, capacity).unwrap();
             let prefill = Prefill::new(&gpu, &cfg, &weights, 64, capacity).unwrap();
+            assert!(prefill.exact);
             let tokens = test_tokens(50);
             // prefill 30, decode 5, prefill 10, decode 5
             let plan = [(30, true), (5, false), (10, true), (5, false)];
@@ -1276,7 +1284,7 @@ mod mac {
                     argmax(&got),
                     argmax(&want)
                 );
-                assert!(err < 1e-2);
+                assert!(err < 1e-4);
                 assert_eq!(argmax(&got), argmax(&want));
             }
         }
@@ -1317,7 +1325,7 @@ mod mac {
                 .iter()
                 .map(|w| u32::from_le_bytes(*w))
                 .collect();
-            let exact = std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1");
+            let exact = !fast_from_env();
             let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
             let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024, capacity).unwrap();
             prefill.exact = exact;

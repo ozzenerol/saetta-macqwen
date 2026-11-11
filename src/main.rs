@@ -200,11 +200,9 @@ struct GpuServed {
 #[cfg(target_os = "macos")]
 const PREFILL_CHUNK: usize = 1024;
 
-/// SAETTA_EXACT=1 picks the prefill kernels that stay within f32 rounding
-/// of decode, at about half the speed.
 #[cfg(target_os = "macos")]
 fn exact_prefill() -> bool {
-    std::env::var("SAETTA_EXACT").is_ok_and(|v| v == "1")
+    !saetta::prefill::fast_from_env()
 }
 
 // The server uses the model from one thread at a time, behind its engine

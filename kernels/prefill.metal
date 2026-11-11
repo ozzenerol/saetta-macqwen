@@ -273,7 +273,7 @@ kernel void add_in_place(device float *x [[buffer(0)]],
 }
 
 // g = silu(g) * u
-kernel void silu_mul(device float *g [[buffer(0)]],
+kernel void silu_mul_rows(device float *g [[buffer(0)]],
                      device const float *u [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) {
     g[i] = silu(g[i]) * u[i];
