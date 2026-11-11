@@ -26,7 +26,7 @@
 - C5 All 40 layers and the logits on the CPU, greedy generation, compared with `mlx_lm.server` greedy output.
 - C6 Metal versions of the Gated DeltaNet step, full attention and RMSNorm, checked against the CPU layers.
 
-- C7 GPU prefill: chunks of tokens per dispatch, quantized matrix-matrix kernel, chunked Gated DeltaNet.
+- G1 (track G) GPU prefill: chunks of tokens per dispatch, quantized matrix-matrix kernel, chunked Gated DeltaNet.
 
 ## Track D: prompt cache
 

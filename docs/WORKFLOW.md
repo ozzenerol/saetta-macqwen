@@ -1,6 +1,6 @@
 # Workflow
 
-Six agents work in parallel, one per track (A to F). The coordinator reviews, merges into `main` and assigns the next items in `BACKLOG.md`.
+Six agents work in parallel, one per track (A to G). The coordinator reviews, merges into `main` and assigns the next items in `BACKLOG.md`.
 
 ## Checkouts
 
@@ -32,6 +32,7 @@ Pure CPU code can also be tested on the PC with plain `cargo test`.
 - D: `src/cache.rs`
 - E: `src/mtp.rs`, `src/speculative.rs`
 - F: `tools/eval*`, `tests/eval.rs`
+- G: `src/prefill.rs`, `kernels/prefill*.metal`
 
 Ask the coordinator before editing a file another track owns. Adding a `mod` line to `src/lib.rs` is fine.
 
