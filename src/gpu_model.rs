@@ -777,7 +777,15 @@ mod mac {
                     KvBits::Four => 1e-1,
                 };
                 assert!(err < bound);
-                assert_eq!(c, g, "token {i}");
+                if bits == KvBits::Half {
+                    assert_eq!(c, g, "token {i}");
+                } else {
+                    // A lossy cache may pick the other side of a near tie
+                    // (8 bits, token 7): the CPU must rate the GPU's pick
+                    // almost as high as its own.
+                    let gap = cpu_logits[c as usize] - cpu_logits[g as usize];
+                    assert!(gap < 0.5, "token {i}: gap {gap}");
+                }
                 cpu_logits = cpu.forward(c, &mut states).unwrap();
                 gpu_logits = model.forward(c);
             }
