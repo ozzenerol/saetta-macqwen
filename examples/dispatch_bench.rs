@@ -1,5 +1,5 @@
 //! How much does one dependent dispatch cost? A chain of N small kernels,
-//! each reading the previous one's output, encoded five ways.
+//! each reading the previous one's output, encoded six ways.
 
 // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
 #![allow(unexpected_cfgs)]
