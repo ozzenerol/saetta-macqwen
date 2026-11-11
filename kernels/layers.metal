@@ -450,6 +450,7 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
     // State row j of this simdgroup is r = simd + 32 j, all of head
     // h0 + r / D. Rows of a head share g and beta.
     float4 s[MINE];
+#pragma clang loop unroll(full)
     for (uint j = 0; j < MINE; j++) {
         uint r = simd + simds * j;
         s[j] = ((device float4 *)(state + (h0 * D + r) * D))[lane];
@@ -484,6 +485,7 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
         qv *= (1.0f / D) / sqrt(simd_sum(dot(qv, qv)) / D + eps);
         kv *= rsqrt(float(D)) / sqrt(simd_sum(dot(kv, kv)) / D + eps);
 
+#pragma clang loop unroll(full)
         for (uint j = 0; j < MINE; j++) {
             uint r = simd + simds * j;
             uint h = h0 + r / D;
@@ -509,6 +511,7 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+#pragma clang loop unroll(full)
         for (uint j = 0; j < GROUP; j++) {
             bool mine = tid / D == j;
             float o = mine ? out[tid] : 0.0f;
@@ -520,6 +523,7 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
         }
     }
 
+#pragma clang loop unroll(full)
     for (uint j = 0; j < MINE; j++) {
         uint r = simd + simds * j;
         ((device float4 *)(state + (h0 * D + r) * D))[lane] = s[j];
