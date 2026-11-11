@@ -303,7 +303,7 @@ struct RowsStepParams {
     uint kernel_size;  // conv1d taps
     float eps;
     uint rows;         // tokens, one after the other
-    uint snapshots;    // 1: save the states after each row
+    uint snapshots;    // 1: save the states after each row but the last
 };
 
 // deltanet_conv and deltanet_step for `rows` tokens one after the other,
@@ -384,7 +384,7 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
                 conv[t * channels + c] = conv[(t + 1) * channels + c];
             }
             conv[(past - 1) * channels + c] = x;
-            if (p.snapshots) {
+            if (p.snapshots && row + 1 < p.rows) {
                 for (uint t = 0; t < past; t++) {
                     conv_snaps[row * conv_size + t * channels + c] = conv[t * channels + c];
                 }
@@ -415,7 +415,7 @@ kernel void deltanet_rows(device const float *qkv [[buffer(0)]],
             float delta = (mixed[(2 + r / D) * D + i] - simd_sum(dot(sj, kv))) * beta;
             sj += kv * delta;
             s[j] = sj;
-            if (p.snapshots) {
+            if (p.snapshots && row + 1 < p.rows) {
                 device float4 *snap =
                     (device float4 *)(state_snaps + row * state_size + (h * D + i) * D);
                 snap[lane] = sj;
@@ -473,7 +473,7 @@ kernel void deltanet_conv_rows(device const float *qkv [[buffer(0)]],
             conv[t * channels + c] = conv[(t + 1) * channels + c];
         }
         conv[(past - 1) * channels + c] = x;
-        if (p.snapshots) {
+        if (p.snapshots && row + 1 < p.rows) {
             for (uint t = 0; t < past; t++) {
                 conv_snaps[row * conv_size + t * channels + c] = conv[t * channels + c];
             }
@@ -539,7 +539,7 @@ kernel void deltanet_step_rows(device const float *mixed [[buffer(0)]],
             float delta = (vv[i] - simd_sum(dot(sj, kv))) * beta;
             sj += kv * delta;
             s[j] = sj;
-            if (p.snapshots) {
+            if (p.snapshots && row + 1 < p.rows) {
                 device float4 *snap =
                     (device float4 *)(state_snaps + row * state_size + (h * D + i) * D);
                 snap[lane] = sj;

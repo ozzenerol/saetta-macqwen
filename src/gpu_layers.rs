@@ -562,7 +562,9 @@ mod mac {
 
         /// Records `m` tokens one after the other, as `m` calls of `record`
         /// would: `x` and `out` are `[m, hidden]`. With `snaps`, the states
-        /// after each row go there too (`GpuDeltaNetSnaps::restore`).
+        /// after each row but the last go there too
+        /// (`GpuDeltaNetSnaps::record_restore`); after the last row they are
+        /// the live states.
         #[allow(clippy::too_many_arguments)]
         pub fn record_rows(
             &self,
@@ -963,7 +965,19 @@ mod mac {
                 );
                 let conv_n = rows_state.conv.length() as usize / 4;
                 let rec_n = rows_state.recurrent.length() as usize / 4;
-                for (row, (conv, rec)) in states.iter().enumerate() {
+                // The last row has no snapshot: its states are the live ones.
+                let (conv, rec) = states.last().unwrap();
+                close(
+                    &read(&rows_state.conv, conv_n),
+                    conv,
+                    &format!("simds {simds} last conv"),
+                );
+                close(
+                    &read(&rows_state.recurrent, rec_n),
+                    rec,
+                    &format!("simds {simds} last recurrent"),
+                );
+                for (row, (conv, rec)) in states.iter().enumerate().take(TOKENS - 1) {
                     let mut plan = Plan::new(&gpu);
                     snaps.record_restore(&mut plan, row, &rows_state);
                     plan.build().run(&gpu);
