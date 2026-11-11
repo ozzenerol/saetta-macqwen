@@ -540,8 +540,8 @@ mod mac {
         verify_rows: Option<VerifyRows>,
         /// Set while `verify` encodes, so the DeltaNet layers write snapshots.
         snapshot_run: Cell<bool>,
-        /// Set by `profile`: only the dispatches of this stage run.
-        only: Cell<Option<&'static str>>,
+        /// Set by `profile`: only the stages up to this index in STAGES run.
+        only: Cell<Option<usize>>,
     }
 
     /// Per-row outputs of `verify`: the DeltaNet state after each row, one
@@ -579,7 +579,7 @@ mod mac {
     }
 
     /// The stages `profile` times, in the order they run.
-    pub const STAGES: [&str; 17] = [
+    pub const STAGES: [&str; 18] = [
         "norm",
         "deltanet in_proj",
         "deltanet conv",
@@ -590,6 +590,7 @@ mod mac {
         "attention norm, rope",
         "attention",
         "attention o_proj",
+        "add, post norm",
         "router",
         "shared expert",
         "route, group",
@@ -874,15 +875,21 @@ mod mac {
         /// Whether the dispatches of `stage` run: all do unless `profile`
         /// picked one.
         fn on(&self, stage: &str) -> bool {
-            self.only.get().is_none_or(|o| o == stage)
+            self.only.get().is_none_or(|last| {
+                STAGES
+                    .iter()
+                    .position(|&s| s == stage)
+                    .expect("a stage in STAGES")
+                    <= last
+            })
         }
 
         /// Runs `tokens` from position 0 as `run` does, and returns the GPU
         /// time of each of `STAGES`, summed over the layers, then the time
         /// of whole layers and of the logits. Each layer runs once for real,
-        /// then each stage again alone in its own command buffer on the
-        /// layer's data, with x put back after, so the stage times are close
-        /// to what they cost inside the layer.
+        /// then once for every stage k with only stages 0 ..= k, from the
+        /// same input; stage k gets the difference to the run up to k - 1.
+        /// So every stage sees the data the earlier ones made for its chunk.
         pub fn profile(
             &self,
             gpu: &Gpu,
@@ -892,28 +899,31 @@ mod mac {
             let n = tokens.len();
             let x = self.embed(gpu, tokens);
             let bytes = n * self.cfg.hidden_size * 4;
-            let mut keep = vec![0u8; bytes];
+            let ptr = x.contents() as *mut u8;
+            let (mut input, mut output) = (vec![0u8; bytes], vec![0u8; bytes]);
             let mut times: Vec<(&'static str, f64)> = STAGES.iter().map(|&s| (s, 0.0)).collect();
             let mut layers = 0.0;
+            let serial = metal::MTLDispatchType::Serial;
             for (l, state) in states.iter().enumerate() {
-                let serial = metal::MTLDispatchType::Serial;
-                layers += gpu
-                    .run_timed(serial, |enc| {
+                unsafe { std::ptr::copy_nonoverlapping(ptr, input.as_mut_ptr(), bytes) };
+                let run = || {
+                    gpu.run_timed(serial, |enc| {
                         self.encode_layer(gpu, enc, l, &x, n, 0, state)
                     })
-                    .1;
-                let ptr = x.contents() as *mut u8;
-                unsafe { std::ptr::copy_nonoverlapping(ptr, keep.as_mut_ptr(), bytes) };
-                for (stage, total) in times.iter_mut() {
-                    self.only.set(Some(stage));
-                    *total += gpu
-                        .run_timed(serial, |enc| {
-                            self.encode_layer(gpu, enc, l, &x, n, 0, state)
-                        })
-                        .1;
+                    .1
+                };
+                layers += run();
+                unsafe { std::ptr::copy_nonoverlapping(ptr, output.as_mut_ptr(), bytes) };
+                let mut before = 0.0;
+                for (k, (_, total)) in times.iter_mut().enumerate() {
+                    unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), ptr, bytes) };
+                    self.only.set(Some(k));
+                    let upto = run();
+                    *total += upto - before;
+                    before = upto;
                 }
                 self.only.set(None);
-                unsafe { std::ptr::copy_nonoverlapping(keep.as_ptr(), ptr, bytes) };
+                unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), ptr, bytes) };
             }
             let logits = gpu.buffer(self.lm_head.rows * 4);
             let head = gpu
@@ -1136,7 +1146,7 @@ mod mac {
                 ),
                 _ => panic!("layer {l}: state does not match the layer type"),
             }
-            if self.on("norm") {
+            if self.on("add, post norm") {
                 dispatch_1d(
                     enc,
                     &gpu.pipeline("add_in_place"),
@@ -1909,6 +1919,47 @@ mod mac {
             if exact {
                 assert_eq!(argmax(&got), argmax(&want));
             }
+        }
+
+        /// Fast prefill of 1100 tokens in chunks of 1024 against exact
+        /// prefill, which check_prefill holds to the CPU. A 1024-token chunk
+        /// gives about 32 rows per expert, so this covers the large-m and
+        /// gather kernels the short tests leave to qmm_few.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn fast_matches_exact_long() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let tokens = test_tokens(1100);
+            let h = cfg.hidden_size;
+            let capacity = tokens.len().next_multiple_of(KEY_BLOCK);
+            let mut runs = Vec::new();
+            for exact in [true, false] {
+                let mut prefill = Prefill::new(&gpu, &cfg, &weights, 1024, capacity).unwrap();
+                prefill.exact = exact;
+                let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+                let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
+                let (logits, x) = prefill.run_hidden(&gpu, &tokens, 0, &states);
+                runs.push((logits, contents::<f32>(&x, tokens.len() * h).to_vec()));
+            }
+            let [(want_logits, want), (got_logits, got)] = [&runs[0], &runs[1]];
+            let mut per_token: Vec<f32> = got
+                .chunks_exact(h)
+                .zip(want.chunks_exact(h))
+                .map(|(g, w)| rel_rms(g, w))
+                .collect();
+            per_token.sort_by(f32::total_cmp);
+            let median = per_token[per_token.len() / 2];
+            let worst = per_token[per_token.len() - 1];
+            let logits = rel_rms(got_logits, want_logits);
+            println!(
+                "fast vs exact, 1100 tokens: hidden median token {median:.2e}, worst {worst:.2e}, logits {logits:.2e}, argmax {} vs {}",
+                argmax(got_logits),
+                argmax(want_logits)
+            );
+            // fast_prefill_matches_token_by_token measures a median of 2e-4
+            // to 2.5e-3 at layer 39 of a short prompt.
+            assert!(median < 2e-2 && logits < 5e-2);
         }
 
         /// Prefill into a GpuModel's states, then decode with it: the logits
