@@ -43,7 +43,8 @@ mod mac {
         }
     }
 
-    /// The m-row projection the verify uses: `record_qmv_reg`.
+    /// The m-row projection the verify uses: qmv for one row, else
+    /// `qmv_mma3`. x needs MAX_ROWS readable rows.
     pub fn record_proj(
         plan: &mut Plan,
         w: &GpuQuant,
@@ -52,7 +53,11 @@ mod mac {
         y: &View,
         parallel: bool,
     ) {
-        record_qmv_reg(plan, w, m, x, y, parallel);
+        if m == 1 {
+            record_qmv(plan, w, m, x, y, parallel);
+        } else {
+            record_qmv_mma2(plan, w, m, x, y, parallel);
+        }
     }
 
     /// `record_qmv` with the packed weights in registers (`qmv_pk`), rows of
@@ -177,6 +182,66 @@ mod mac {
         op(plan, kernel, &buffers, grid, threads, parallel);
     }
 
+    /// SIMDS of qmv_mma2: 2, 4 or 8 simdgroups of 8 weight rows each.
+    pub static MMA2_SIMDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+
+    /// true: qmv_mma3 (split k over MMA2_SIMDS simdgroups) instead of qmv_mma2.
+    pub static MMA3: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    /// Weight tiles per simdgroup of qmv_mma4 (2 or 4); 1 means qmv_mma3.
+    pub static MMA_T: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+    /// `qmv_mma2`: up to 8 rows with simdgroup matrices and x staged in
+    /// threadgroup memory. x needs MAX_ROWS readable rows.
+    pub fn record_qmv_mma2(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        parallel: bool,
+    ) {
+        record_qmv_mma2_strided(plan, w, m, x, y, w.rows, parallel);
+    }
+
+    /// `record_qmv_mma2` with rows of y `y_stride` floats apart (qmv_mma3
+    /// only).
+    pub fn record_qmv_mma2_strided(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        y_stride: usize,
+        parallel: bool,
+    ) {
+        assert_eq!(w.experts, 1, "stacked experts go through moe");
+        assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
+        let split = MMA3.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(w.cols.is_multiple_of(if split { 64 } else { 256 }));
+        let readable = x.buffer.length() - x.offset;
+        assert!(
+            readable as usize >= MAX_ROWS * w.cols * 4,
+            "x needs {MAX_ROWS} rows"
+        );
+        let simds = MMA2_SIMDS.load(std::sync::atomic::Ordering::Relaxed);
+        let t = MMA_T.load(std::sync::atomic::Ordering::Relaxed);
+        let (kernel, tiles) = if split && t > 1 {
+            (format!("qmv_mma4_{}bit_{simds}_{t}", w.bits), 8 * t)
+        } else if split {
+            (format!("qmv_mma3_{}bit_{simds}", w.bits), 8)
+        } else {
+            (format!("qmv_mma2_{}bit_{simds}", w.bits), 8 * simds)
+        };
+        assert!(split || y_stride == w.rows, "qmv_mma2 has no y stride");
+        let shape = plan.constant(&[w.rows as u32, w.cols as u32, m as u32]);
+        let stride = plan.constant(&[y_stride as u32]);
+        let buffers = [&w.words, &w.scales, &w.biases, x, y, &shape, &stride];
+        let grid = MTLSize::new(w.rows.div_ceil(tiles) as u64, 1, 1);
+        let threads = MTLSize::new(32 * simds as u64, 1, 1);
+        op(plan, &kernel, &buffers, grid, threads, parallel);
+    }
+
     fn op(
         plan: &mut Plan,
         kernel: &str,
@@ -206,12 +271,12 @@ mod mac {
         parallel: bool,
     ) {
         let n = r.outputs();
-        record_qmv_reg_strided(plan, &r.gate, m, x, out, n, parallel);
+        record_qmv_mma2_strided(plan, &r.gate, m, x, out, n, parallel);
         let shared = View {
             buffer: out.buffer.clone(),
             offset: out.offset + (r.gate.rows * 4) as u64,
         };
-        record_qmv_reg_strided(plan, &r.shared_gate, m, x, &shared, n, true);
+        record_qmv_mma2_strided(plan, &r.shared_gate, m, x, &shared, n, true);
     }
 
     /// Must match RowsAttentionParams in kernels/attention_rows.metal.
@@ -338,6 +403,9 @@ mod mac {
         }
     }
 
+    /// Simdgroups per threadgroup of moe_gate_up_mma3 and moe_down_mma3.
+    pub static MOE_SPLIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+
     /// The distinct experts of `m` rows, for `MoeRows::record`.
     pub struct MoeRows {
         list: View,
@@ -387,11 +455,12 @@ mod mac {
             if self.mma {
                 let readable = (x.buffer.length() - x.offset) as usize;
                 assert!(readable >= MAX_ROWS * g.cols * 4, "x needs {MAX_ROWS} rows");
-                let threads = MTLSize::new(32 * MMA_SIMDS as u64, 1, 1);
+                let split = MOE_SPLIT.load(std::sync::atomic::Ordering::Relaxed);
+                let threads = MTLSize::new(32 * split as u64, 1, 1);
                 let rows = plan.constant(&[m as u32]);
                 let shape = plan.constant(&[g.rows as u32, g.cols as u32, top_k as u32]);
                 plan.op(
-                    "moe_gate_up_mma",
+                    &format!("moe_gate_up_mma3_{split}"),
                     &[
                         &g.words,
                         &g.scales,
@@ -411,7 +480,7 @@ mod mac {
                 );
                 let shape = plan.constant(&[d.rows as u32, d.cols as u32, top_k as u32]);
                 plan.op(
-                    "moe_down_mma",
+                    &format!("moe_down_mma3_{split}"),
                     &[
                         &d.words,
                         &d.scales,
@@ -532,17 +601,18 @@ mod mac {
                 println!("{module}: rows 1 to {MAX_ROWS} match qmv");
                 let xs = input(MAX_ROWS, w.cols);
                 let x = View::new(gpu.buffer_from(&xs));
-                for (mma, m) in [false, true]
+                for (mma, m) in [0, 1, 2, 4]
                     .into_iter()
                     .flat_map(|a| (1..=MAX_ROWS).map(move |m| (a, m)))
                 {
+                    MMA_T.store(mma.max(1), std::sync::atomic::Ordering::Relaxed);
                     let (y, want) = (
                         View::new(gpu.buffer(m * w.rows * 4)),
                         View::new(gpu.buffer(m * w.rows * 4)),
                     );
                     let mut plan = Plan::new(&gpu);
-                    if mma {
-                        record_qmv_mma(&mut plan, &w, m, &x, &y, false);
+                    if mma > 0 {
+                        record_qmv_mma2(&mut plan, &w, m, &x, &y, false);
                     } else if m % 2 == 0 {
                         record_qmv_reg(&mut plan, &w, m, &x, &y, false);
                     } else {
@@ -559,6 +629,7 @@ mod mac {
                     let rel = (err / norm).sqrt();
                     assert!(rel < 1e-6, "{module} mma {mma} m {m}: rel rms {rel}");
                 }
+                MMA_T.store(1, std::sync::atomic::Ordering::Relaxed);
                 println!("{module}: reg and mma rows 1 to {MAX_ROWS} within 1e-6");
             }
         }
@@ -669,6 +740,13 @@ mod mac {
                 t[5]
             };
             let base = time(0, false);
+            for split in [2, 8, 4] {
+                MOE_SPLIT.store(split, std::sync::atomic::Ordering::Relaxed);
+                let t: Vec<String> = [1, 2, 4, 8]
+                    .map(|m| format!("m{m} {:.1}", time(m, true)))
+                    .to_vec();
+                println!("moe mma3 split {split}: {}", t.join(", "));
+            }
             let all: Vec<String> = (1..=MAX_ROWS)
                 .map(|m| format!("m{m} {:.1}/{:.1}", time(m, false), time(m, true)))
                 .collect();
@@ -694,7 +772,7 @@ mod mac {
                             1..=8 => record_qmv(&mut plan, &w, m, &x, &y, false),
                             9..=16 => record_qmv_reg(&mut plan, &w, m - 8, &x, &y, false),
                             17..=24 => record_qmv_pk(&mut plan, &w, m - 16, &x, &y, w.rows, false),
-                            _ => record_qmv_mma(&mut plan, &w, m - 24, &x, &y, false),
+                            _ => record_qmv_mma2(&mut plan, &w, m - 24, &x, &y, false),
                         }
                     }
                     let built = plan.build();
@@ -705,14 +783,26 @@ mod mac {
                     t[5]
                 };
                 let base = time(0);
-                for qr in [2, 4] {
-                    REG_QR.store(qr, std::sync::atomic::Ordering::Relaxed);
-                    let t: Vec<String> = (1..=MAX_ROWS)
-                        .map(|m| format!("m{m} {:.1}", time(m + 8)))
-                        .collect();
-                    println!("{module}: reg qr {qr}: {}", t.join(", "));
+                for (t, simds) in [
+                    (1, 2),
+                    (1, 4),
+                    (1, 8),
+                    (2, 2),
+                    (2, 4),
+                    (2, 8),
+                    (4, 2),
+                    (4, 4),
+                    (4, 8),
+                ] {
+                    MMA_T.store(t, std::sync::atomic::Ordering::Relaxed);
+                    MMA2_SIMDS.store(simds, std::sync::atomic::Ordering::Relaxed);
+                    let times: Vec<String> = [1, 4, 8]
+                        .map(|m| format!("m{m} {:.1}", time(m + 24)))
+                        .to_vec();
+                    println!("{module}: mma t {t} split {simds}: {}", times.join(", "));
                 }
-                REG_QR.store(8, std::sync::atomic::Ordering::Relaxed);
+                MMA_T.store(1, std::sync::atomic::Ordering::Relaxed);
+                MMA2_SIMDS.store(4, std::sync::atomic::Ordering::Relaxed);
                 let rows: Vec<String> = (1..=MAX_ROWS)
                     .map(|m| {
                         format!(

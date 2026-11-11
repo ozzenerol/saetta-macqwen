@@ -904,3 +904,426 @@ kernel void qmv_pk(device const uint *words [[buffer(0)]],
     QMV_PK(BITS, 5) QMV_PK(BITS, 6) QMV_PK(BITS, 7) QMV_PK(BITS, 8)
 QMV_PK_ALL(5)
 QMV_PK_ALL(8)
+
+// qmv for up to 8 rows with simdgroup matrices, loads like qmv's. Per group
+// of 64 values of k, a simdgroup does 8 MMAs of an 8x8 W tile (8 weight
+// rows) by an 8x8 X^T tile (8 rows of x). The sum over k does not care in
+// which order k goes, so tile i's column t stands for k = 16 (t / 2) + 2 i
+// + t % 2: then the 16 values of W a lane holds are 16 contiguous values of
+// its row (3 words, one scale and bias). X is staged in threadgroup memory
+// for MMA2_KB values of k at a time and shared by the MMA2_SIMDS
+// simdgroups, which own one 8-row tile each. x must have 8 readable rows;
+// cols must be a multiple of MMA2_KB.
+constant uint MMA2_KB = 256;
+
+template <uint BITS, uint SIMDS>
+kernel void qmv_mma2(device const uint *words [[buffer(0)]],
+                     device const ushort *scales [[buffer(1)]],
+                     device const ushort *biases [[buffer(2)]],
+                     device const float *x [[buffer(3)]],
+                     device float *y [[buffer(4)]],
+                     constant QmvRowsShape &shape [[buffer(5)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]],
+                     uint simd [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NW = BITS == 5 ? 3 : 4;
+    threadgroup float xs[8 * MMA2_KB];
+    uint2 f = frag(lane);
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    uint row0 = (tg * SIMDS + simd) * 8;
+    uint row = min(row0 + f.x, shape.rows - 1);
+    // This lane's 16 values of a group start here; for X^T it holds k row
+    // f.x of each tile: 16 (f.x / 2) + 2 i + f.x % 2.
+    uint wk = 16 * (f.y / 2);
+    uint xk = 16 * (f.x / 2) + f.x % 2;
+    device const uint *wrow = words + row * row_words;
+
+    simdgroup_float8x8 acc = simdgroup_float8x8(0);
+    for (uint kb = 0; kb < shape.cols; kb += MMA2_KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 8 * MMA2_KB / 4; i += 32 * SIMDS) {
+            uint j = i / (MMA2_KB / 4), c = i % (MMA2_KB / 4);
+            ((threadgroup float4 *)xs)[i] =
+                ((device const float4 *)(x + j * shape.cols + kb))[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint g = 0; g < MMA2_KB; g += 64) {
+            uint k = kb + g + wk;
+            uint bit0 = k * BITS;
+            device const uint *w = wrow + bit0 / 32;
+            uint packed[NW];
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < NW; i++) {
+                packed[i] = w[i];
+            }
+            uint off = bit0 % 32;
+            uint grp = row * groups + (kb + g) / 64;
+            float s = bf16_to_float(scales[grp]), b = bf16_to_float(biases[grp]);
+            threadgroup const float *x0 = xs + f.y * MMA2_KB + g + xk;
+            threadgroup const float *x1 = x0 + MMA2_KB;
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) {
+                simdgroup_float8x8 wt, xt;
+                wt.thread_elements()[0] = s * float(unpack_at<BITS>(packed, off + (2 * i) * BITS)) + b;
+                wt.thread_elements()[1] =
+                    s * float(unpack_at<BITS>(packed, off + (2 * i + 1) * BITS)) + b;
+                xt.thread_elements()[0] = x0[2 * i];
+                xt.thread_elements()[1] = x1[2 * i];
+                simdgroup_multiply_accumulate(acc, wt, xt, acc);
+            }
+        }
+    }
+
+    for (uint e = 0; e < 2; e++) {
+        uint r = row0 + f.x, j = f.y + e;
+        if (r < shape.rows && j < shape.m) {
+            y[j * shape.rows + r] = acc.thread_elements()[e];
+        }
+    }
+}
+
+#define QMV_MMA2(BITS, S) \
+    template [[host_name("qmv_mma2_" #BITS "bit_" #S)]] kernel decltype(qmv_mma2<BITS, S>) \
+        qmv_mma2<BITS, S>;
+QMV_MMA2(5, 2) QMV_MMA2(5, 4) QMV_MMA2(5, 8) QMV_MMA2(8, 2) QMV_MMA2(8, 4) QMV_MMA2(8, 8)
+
+// qmv_mma2's tile order with split k instead of staging: a threadgroup of
+// SPLIT simdgroups owns 8 weight rows, simdgroup s takes groups s, s +
+// SPLIT, ... and reads x straight from device memory (it stays in cache).
+// The partial tiles are summed through threadgroup memory; rows of y are
+// y_stride floats apart. x must have 8 readable rows.
+template <uint BITS, uint SPLIT>
+kernel void qmv_mma3(device const uint *words [[buffer(0)]],
+                     device const ushort *scales [[buffer(1)]],
+                     device const ushort *biases [[buffer(2)]],
+                     device const float *x [[buffer(3)]],
+                     device float *y [[buffer(4)]],
+                     constant QmvRowsShape &shape [[buffer(5)]],
+                     constant uint &y_stride [[buffer(6)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint simd [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NW = BITS == 5 ? 3 : 4;
+    threadgroup float red[SPLIT * 64];
+    uint2 f = frag(lane);
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    uint row0 = tg * 8;
+    uint row = min(row0 + f.x, shape.rows - 1);
+    uint wk = 16 * (f.y / 2);
+    uint xk = 16 * (f.x / 2) + f.x % 2;
+    device const uint *wrow = words + row * row_words;
+    device const float *x0 = x + f.y * shape.cols + xk;
+    device const float *x1 = x0 + shape.cols;
+
+    simdgroup_float8x8 acc = simdgroup_float8x8(0);
+    // Two groups per step, loads first, so two are in flight.
+    for (uint g0 = 2 * simd; g0 < groups; g0 += 2 * SPLIT) {
+        uint packed[2][NW];
+        float s[2], b[2];
+        uint off[2];
+#pragma clang loop unroll(full)
+        for (uint u = 0; u < 2; u++) {
+            uint g = min(g0 + u, groups - 1);
+            uint bit0 = (g * 64 + wk) * BITS;
+            device const uint *w = wrow + bit0 / 32;
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < NW; i++) {
+                packed[u][i] = w[i];
+            }
+            off[u] = bit0 % 32;
+            bool live = g0 + u < groups;
+            s[u] = live ? bf16_to_float(scales[row * groups + g]) : 0.0f;
+            b[u] = live ? bf16_to_float(biases[row * groups + g]) : 0.0f;
+        }
+#pragma clang loop unroll(full)
+        for (uint u = 0; u < 2; u++) {
+            uint k = min(g0 + u, groups - 1) * 64;
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) {
+                simdgroup_float8x8 wt, xt;
+                wt.thread_elements()[0] =
+                    s[u] * float(unpack_at<BITS>(packed[u], off[u] + (2 * i) * BITS)) + b[u];
+                wt.thread_elements()[1] =
+                    s[u] * float(unpack_at<BITS>(packed[u], off[u] + (2 * i + 1) * BITS)) + b[u];
+                xt.thread_elements()[0] = x0[k + 2 * i];
+                xt.thread_elements()[1] = x1[k + 2 * i];
+                simdgroup_multiply_accumulate(acc, wt, xt, acc);
+            }
+        }
+    }
+
+    simdgroup_store(acc, red + simd * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = simd * 32 + lane; e < 64; e += SPLIT * 32) {
+        float sum = 0;
+        for (uint s = 0; s < SPLIT; s++) {
+            sum += red[s * 64 + e];
+        }
+        uint r = row0 + e / 8, j = e % 8;
+        if (r < shape.rows && j < shape.m) {
+            y[j * y_stride + r] = sum;
+        }
+    }
+}
+
+#define QMV_MMA3(BITS, S) \
+    template [[host_name("qmv_mma3_" #BITS "bit_" #S)]] kernel decltype(qmv_mma3<BITS, S>) \
+        qmv_mma3<BITS, S>;
+QMV_MMA3(5, 2) QMV_MMA3(5, 4) QMV_MMA3(5, 8) QMV_MMA3(8, 2) QMV_MMA3(8, 4) QMV_MMA3(8, 8)
+
+// One group of 64 values of k for the mma3 tile order: acc += W(8 rows,
+// group g) * X^T, X^T column f.y + e scaled by xs[e]. x0 and x1 point at
+// this lane's first value of k (xk) in rows f.y and f.y + 1 of x.
+template <uint BITS>
+inline void mma3_group(device const uint *wrow,
+                       device const ushort *scales,
+                       device const ushort *biases,
+                       uint sb,
+                       uint g,
+                       uint wk,
+                       device const float *x0,
+                       device const float *x1,
+                       float2 xs,
+                       thread simdgroup_float8x8 &acc) {
+    constexpr uint NW = BITS == 5 ? 3 : 4;
+    uint bit0 = (g * 64 + wk) * BITS;
+    device const uint *w = wrow + bit0 / 32;
+    uint packed[NW];
+#pragma clang loop unroll(full)
+    for (uint i = 0; i < NW; i++) {
+        packed[i] = w[i];
+    }
+    uint off = bit0 % 32;
+    float s = bf16_to_float(scales[sb]), b = bf16_to_float(biases[sb]);
+    uint k = g * 64;
+#pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; i++) {
+        simdgroup_float8x8 wt, xt;
+        wt.thread_elements()[0] = s * float(unpack_at<BITS>(packed, off + (2 * i) * BITS)) + b;
+        wt.thread_elements()[1] = s * float(unpack_at<BITS>(packed, off + (2 * i + 1) * BITS)) + b;
+        xt.thread_elements()[0] = xs.x * x0[k + 2 * i];
+        xt.thread_elements()[1] = xs.y * x1[k + 2 * i];
+        simdgroup_multiply_accumulate(acc, wt, xt, acc);
+    }
+}
+
+// Sums the SPLIT partial tiles in red; thread tid < 64 gets element (tid /
+// 8, tid % 8). Every thread of the threadgroup must call it.
+template <uint SPLIT>
+inline float mma3_sum(simdgroup_float8x8 acc, threadgroup float *red, uint simd, uint tid) {
+    simdgroup_store(acc, red + simd * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0;
+    if (tid < 64) {
+        for (uint s = 0; s < SPLIT; s++) {
+            sum += red[s * 64 + tid];
+        }
+    }
+    return sum;
+}
+
+// moe_gate_up_mma with qmv_mma3's layout: threadgroup (8 rows, distinct
+// expert u), SPLIT simdgroups over the groups of k. x needs 8 readable rows.
+template <uint SPLIT>
+kernel void moe_gate_up_mma3(device const uint *gate_w [[buffer(0)]],
+                             device const ushort *gate_s [[buffer(1)]],
+                             device const ushort *gate_b [[buffer(2)]],
+                             device const uint *up_w [[buffer(3)]],
+                             device const ushort *up_s [[buffer(4)]],
+                             device const ushort *up_b [[buffer(5)]],
+                             device const float *x [[buffer(6)]],
+                             device float *h [[buffer(7)]],
+                             constant MoeShape &shape [[buffer(8)]],
+                             device const uint *list [[buffer(9)]],
+                             device const uint *slots [[buffer(10)]],
+                             constant uint &m [[buffer(11)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint simd [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint BITS = 5;
+    threadgroup float red[SPLIT * 64];
+    uint u = tg.y;
+    if (u >= list[0]) {
+        return;
+    }
+    uint2 f = frag(lane);
+    uint row = list[1 + u] * shape.rows + tg.x * 8 + f.x;
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    uint wk = 16 * (f.y / 2);
+    device const float *x0 = x + f.y * shape.cols + 16 * (f.x / 2) + f.x % 2;
+    device const float *x1 = x0 + shape.cols;
+    simdgroup_float8x8 g = simdgroup_float8x8(0), up = simdgroup_float8x8(0);
+    for (uint k = simd; k < groups; k += SPLIT) {
+        mma3_group<BITS>(gate_w + row * row_words, gate_s, gate_b, row * groups + k, k, wk, x0,
+                         x1, float2(1), g);
+        mma3_group<BITS>(up_w + row * row_words, up_s, up_b, row * groups + k, k, wk, x0, x1,
+                         float2(1), up);
+    }
+    float gs = mma3_sum<SPLIT>(g, red, simd, tid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float us = mma3_sum<SPLIT>(up, red, simd, tid);
+    uint out_row = tg.x * 8 + tid / 8, j = tid % 8;
+    if (tid < 64 && j < m) {
+        uint slot = slots[u * m + j];
+        if (slot != NO_SLOT) {
+            h[(j * shape.count + slot) * shape.rows + out_row] = gs / (1.0f + exp(-gs)) * us;
+        }
+    }
+}
+
+// moe_down_mma with qmv_mma3's layout: threadgroup tg owns 8 output rows
+// and loops over the distinct experts; SPLIT simdgroups split the groups.
+template <uint SPLIT>
+kernel void moe_down_mma3(device const uint *words [[buffer(0)]],
+                          device const ushort *scales [[buffer(1)]],
+                          device const ushort *biases [[buffer(2)]],
+                          device const float *h [[buffer(3)]],
+                          device float *y [[buffer(4)]],
+                          constant MoeShape &shape [[buffer(5)]],
+                          device const uint *list [[buffer(6)]],
+                          device const uint *slots [[buffer(7)]],
+                          device const float *weights [[buffer(8)]],
+                          constant uint &m [[buffer(9)]],
+                          uint tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint simd [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint BITS = 5;
+    threadgroup float red[SPLIT * 64];
+    uint2 f = frag(lane);
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    uint wk = 16 * (f.y / 2);
+    uint xk = 16 * (f.x / 2) + f.x % 2;
+    uint count = list[0];
+    simdgroup_float8x8 acc = simdgroup_float8x8(0);
+    for (uint u = 0; u < count; u++) {
+        uint row = list[1 + u] * shape.rows + tg * 8 + f.x;
+        float2 xs;
+        device const float *hj[2];
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < 2; i++) {
+            uint j = f.y + i;
+            uint slot = j < m ? slots[u * m + j] : NO_SLOT;
+            xs[i] = slot != NO_SLOT ? weights[j * shape.count + slot] : 0.0f;
+            hj[i] = h + (slot != NO_SLOT ? j * shape.count + slot : 0) * shape.cols + xk;
+        }
+        for (uint k = simd; k < groups; k += SPLIT) {
+            mma3_group<BITS>(words + row * row_words, scales, biases, row * groups + k, k, wk,
+                             hj[0], hj[1], xs, acc);
+        }
+    }
+    float sum = mma3_sum<SPLIT>(acc, red, simd, tid);
+    uint j = tid % 8;
+    if (tid < 64 && j < m) {
+        y[j * shape.rows + tg * 8 + tid / 8] = sum;
+    }
+}
+
+#define MOE_MMA3(S) \
+    template [[host_name("moe_gate_up_mma3_" #S)]] kernel decltype(moe_gate_up_mma3<S>) \
+        moe_gate_up_mma3<S>; \
+    template [[host_name("moe_down_mma3_" #S)]] kernel decltype(moe_down_mma3<S>) \
+        moe_down_mma3<S>;
+MOE_MMA3(2) MOE_MMA3(4) MOE_MMA3(8)
+
+// qmv_mma3 with T weight tiles per simdgroup: the X^T tiles of a group are
+// built once and reused for 8 T weight rows, so x is read T times less.
+// Threadgroup tg owns rows 8 T tg ..; SPLIT simdgroups split the groups.
+template <uint BITS, uint SPLIT, uint T>
+kernel void qmv_mma4(device const uint *words [[buffer(0)]],
+                     device const ushort *scales [[buffer(1)]],
+                     device const ushort *biases [[buffer(2)]],
+                     device const float *x [[buffer(3)]],
+                     device float *y [[buffer(4)]],
+                     constant QmvRowsShape &shape [[buffer(5)]],
+                     constant uint &y_stride [[buffer(6)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]],
+                     uint simd [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NW = BITS == 5 ? 3 : 4;
+    threadgroup float red[SPLIT * 64 * T];
+    uint2 f = frag(lane);
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    uint row0 = tg * 8 * T;
+    uint wk = 16 * (f.y / 2);
+    device const float *x0 = x + f.y * shape.cols + 16 * (f.x / 2) + f.x % 2;
+    device const float *x1 = x0 + shape.cols;
+    uint rows[T];
+#pragma clang loop unroll(full)
+    for (uint t = 0; t < T; t++) {
+        rows[t] = min(row0 + 8 * t + f.x, shape.rows - 1);
+    }
+
+    simdgroup_float8x8 acc[T];
+#pragma clang loop unroll(full)
+    for (uint t = 0; t < T; t++) {
+        acc[t] = simdgroup_float8x8(0);
+    }
+    for (uint g = simd; g < groups; g += SPLIT) {
+        uint k = g * 64;
+        uint bit0 = (k + wk) * BITS;
+        uint off = bit0 % 32;
+        uint packed[T][NW];
+        float s[T], b[T];
+#pragma clang loop unroll(full)
+        for (uint t = 0; t < T; t++) {
+            device const uint *w = words + rows[t] * row_words + bit0 / 32;
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < NW; i++) {
+                packed[t][i] = w[i];
+            }
+            s[t] = bf16_to_float(scales[rows[t] * groups + g]);
+            b[t] = bf16_to_float(biases[rows[t] * groups + g]);
+        }
+        simdgroup_float8x8 xt[8];
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < 8; i++) {
+            xt[i].thread_elements()[0] = x0[k + 2 * i];
+            xt[i].thread_elements()[1] = x1[k + 2 * i];
+        }
+#pragma clang loop unroll(full)
+        for (uint t = 0; t < T; t++) {
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) {
+                simdgroup_float8x8 wt;
+                wt.thread_elements()[0] =
+                    s[t] * float(unpack_at<BITS>(packed[t], off + (2 * i) * BITS)) + b[t];
+                wt.thread_elements()[1] =
+                    s[t] * float(unpack_at<BITS>(packed[t], off + (2 * i + 1) * BITS)) + b[t];
+                simdgroup_multiply_accumulate(acc[t], wt, xt[i], acc[t]);
+            }
+        }
+    }
+
+#pragma clang loop unroll(full)
+    for (uint t = 0; t < T; t++) {
+        simdgroup_store(acc[t], red + (t * SPLIT + simd) * 64, 8);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < 64 * T; e += SPLIT * 32) {
+        uint t = e / 64, c = e % 64;
+        float sum = 0;
+        for (uint s = 0; s < SPLIT; s++) {
+            sum += red[(t * SPLIT + s) * 64 + c];
+        }
+        uint r = row0 + 8 * t + c / 8, j = c % 8;
+        if (r < shape.rows && j < shape.m) {
+            y[j * y_stride + r] = sum;
+        }
+    }
+}
+
+#define QMV_MMA4(BITS, S, T) \
+    template [[host_name("qmv_mma4_" #BITS "bit_" #S "_" #T)]] kernel \
+        decltype(qmv_mma4<BITS, S, T>) qmv_mma4<BITS, S, T>;
+#define QMV_MMA4_T(BITS, S) QMV_MMA4(BITS, S, 2) QMV_MMA4(BITS, S, 4)
+QMV_MMA4_T(5, 2) QMV_MMA4_T(5, 4) QMV_MMA4_T(5, 8) QMV_MMA4_T(8, 2) QMV_MMA4_T(8, 4)
+QMV_MMA4_T(8, 8)

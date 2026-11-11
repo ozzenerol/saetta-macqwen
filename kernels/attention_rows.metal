@@ -55,21 +55,29 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                 s[r][0] = simdgroup_float8x8(0);
                 s[r][1] = simdgroup_float8x8(0);
             }
-            for (uint d = 0; d < DEC_DIM; d += 8) {
-                simdgroup_float8x8 k0, k1;
-                simdgroup_load(k0, k + d, stride);
-                simdgroup_load(k1, k + 8 * stride + d, stride);
-                #pragma clang loop unroll(full)
-        for (uint r = 0; r < ROWS_PASS; r++) {
-            if (r >= rows) {
-                break;
-            }
+            // 32 dims per step: 128 contiguous bytes of each key row, eight
+            // tile loads in flight.
+            for (uint d = 0; d < DEC_DIM; d += 32) {
+                simdgroup_float8x8 k0[4], k1[4];
+#pragma clang loop unroll(full)
+                for (uint i = 0; i < 4; i++) {
+                    simdgroup_load(k0[i], k + d + 8 * i, stride);
+                    simdgroup_load(k1[i], k + 8 * stride + d + 8 * i, stride);
+                }
+#pragma clang loop unroll(full)
+                for (uint r = 0; r < ROWS_PASS; r++) {
+                    if (r >= rows) {
+                        break;
+                    }
                     device const float *qr =
                         q + ((r0 + r) * p.heads + kv * DEC_GROUP) * DEC_DIM + d;
-                    simdgroup_float8x8 qt;
-                    simdgroup_load(qt, qr, DEC_DIM, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(s[r][0], k0, qt, s[r][0]);
-                    simdgroup_multiply_accumulate(s[r][1], k1, qt, s[r][1]);
+#pragma clang loop unroll(full)
+                    for (uint i = 0; i < 4; i++) {
+                        simdgroup_float8x8 qt;
+                        simdgroup_load(qt, qr + 8 * i, DEC_DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(s[r][0], k0[i], qt, s[r][0]);
+                        simdgroup_multiply_accumulate(s[r][1], k1[i], qt, s[r][1]);
+                    }
                 }
             }
             #pragma clang loop unroll(full)
@@ -127,22 +135,29 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                     o[r][i] = simdgroup_float8x8(0);
                 }
             }
-            for (uint t = 0; t < DEC_CHUNK; t += 8) {
-                simdgroup_float8x8 vt[4];
+            // 16 tokens per step: eight value tile loads in flight.
+            for (uint t = 0; t < DEC_CHUNK; t += 16) {
+                simdgroup_float8x8 vt[2][4];
 #pragma clang loop unroll(full)
-                for (uint i = 0; i < 4; i++) {
-                    simdgroup_load(vt[i], v + t * stride + 8 * i, stride);
-                }
-                #pragma clang loop unroll(full)
-        for (uint r = 0; r < ROWS_PASS; r++) {
-            if (r >= rows) {
-                break;
-            }
-                    simdgroup_float8x8 pt;
-                    simdgroup_load(pt, &sc[r * DEC_GROUP][t], DEC_CHUNK);
+                for (uint h = 0; h < 2; h++) {
 #pragma clang loop unroll(full)
                     for (uint i = 0; i < 4; i++) {
-                        simdgroup_multiply_accumulate(o[r][i], pt, vt[i], o[r][i]);
+                        simdgroup_load(vt[h][i], v + (t + 8 * h) * stride + 8 * i, stride);
+                    }
+                }
+#pragma clang loop unroll(full)
+                for (uint r = 0; r < ROWS_PASS; r++) {
+                    if (r >= rows) {
+                        break;
+                    }
+#pragma clang loop unroll(full)
+                    for (uint h = 0; h < 2; h++) {
+                        simdgroup_float8x8 pt;
+                        simdgroup_load(pt, &sc[r * DEC_GROUP][t + 8 * h], DEC_CHUNK);
+#pragma clang loop unroll(full)
+                        for (uint i = 0; i < 4; i++) {
+                            simdgroup_multiply_accumulate(o[r][i], pt, vt[h][i], o[r][i]);
+                        }
                     }
                 }
             }
