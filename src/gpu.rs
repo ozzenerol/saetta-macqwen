@@ -25,8 +25,9 @@ mod mac {
     use super::KERNELS;
     use memmap2::Mmap;
     use metal::{
-        Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState,
-        Device, Library, MTLResourceOptions, MTLSize,
+        BlitCommandEncoderRef, Buffer, CommandBuffer, CommandQueue, CompileOptions,
+        ComputeCommandEncoderRef, ComputePipelineState, Device, Library, MTLResourceOptions,
+        MTLSize,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -147,6 +148,20 @@ mod mac {
             commands.commit();
             commands.wait_until_completed();
             start.elapsed()
+        }
+    }
+
+    impl Gpu {
+        /// Encodes buffer copies and commits them without waiting. Work
+        /// committed later on the queue runs after the copies, so callers
+        /// only wait (on the returned command buffer) to time them.
+        pub fn blit(&self, encode: impl FnOnce(&BlitCommandEncoderRef)) -> CommandBuffer {
+            let commands = self.queue.new_command_buffer().to_owned();
+            let encoder = commands.new_blit_command_encoder();
+            encode(encoder);
+            encoder.end_encoding();
+            commands.commit();
+            commands
         }
     }
 
