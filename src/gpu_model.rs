@@ -1,0 +1,518 @@
+//! The whole model on the GPU for one token at a time (`kernels/model.metal`
+//! and the kernels of the layers). Every op of a token is recorded once
+//! into a `Plan` and replayed from an indirect command buffer, so a token is
+//! one command buffer. The weights are wrapped from the mmap without a copy.
+//!
+//! Each layer follows `cpu::model::Layer::step`: `h = x + mixer(norm(x))`,
+//! then `h + moe(norm(h))`, where the MoE is the router (softmax, top 8,
+//! renormalized), the routed experts and the gated shared expert.
+
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use crate::config::{Config, LayerType};
+    use crate::gpu::{Gpu, contents};
+    use crate::gpu_layers::{GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm};
+    use crate::moe::{Experts, Router};
+    use crate::plan::{Built, Plan, TokenParams};
+    use crate::qmv::{GpuQuant, View};
+    use crate::weights::Weights;
+    use metal::{Buffer, MTLSize};
+
+    const PREFIX: &str = "language_model.model";
+    /// Threads per threadgroup of the element-wise kernels.
+    const GROUP: usize = 256;
+
+    fn view(gpu: &Gpu, floats: usize) -> View {
+        View::new(gpu.buffer(floats * 4))
+    }
+
+    fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
+        Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
+    }
+
+    fn matrix<'a>(
+        gpu: &Gpu,
+        weights: &'a Weights,
+        cfg: &Config,
+        module: &str,
+    ) -> Result<GpuQuant<'a>, String> {
+        Ok(GpuQuant::new(
+            gpu,
+            &weights.quantized(module, &cfg.quantization)?,
+        ))
+    }
+
+    /// An element-wise op over `n` values; `n` goes in as the last buffer.
+    fn elementwise(plan: &mut Plan, kernel: &str, buffers: &[&View], n: usize, parallel: bool) {
+        let len = plan.constant(&[n as u32]);
+        let mut all = buffers.to_vec();
+        all.push(&len);
+        let grid = MTLSize::new(n.div_ceil(GROUP) as u64, 1, 1);
+        let group = MTLSize::new(GROUP as u64, 1, 1);
+        if parallel {
+            plan.op_parallel(kernel, &all, grid, group);
+        } else {
+            plan.op(kernel, &all, grid, group);
+        }
+    }
+
+    /// Records the router: `ids` and `weights` get the `top_k` best of the
+    /// softmax over `logits`, renormalized. One threadgroup.
+    pub fn record_route(
+        plan: &mut Plan,
+        logits: &View,
+        experts: usize,
+        top_k: usize,
+        ids: &View,
+        weights: &View,
+    ) {
+        assert!(experts <= 1024 && top_k <= 16);
+        let shape = plan.constant(&[experts as u32, top_k as u32]);
+        plan.op(
+            "route_top_k",
+            &[logits, ids, weights, &shape],
+            MTLSize::new(1, 1, 1),
+            MTLSize::new(experts.next_multiple_of(32) as u64, 1, 1),
+        );
+    }
+
+    /// The scratch buffers of the MoE block, shared by all layers.
+    struct MoeScratch {
+        normed: View,
+        /// The router's output: `num_experts` logits, then the shared
+        /// expert gate logit, which `shared_logit` points at.
+        router: View,
+        ids: View,
+        weights: View,
+        shared_logit: View,
+        shared_gate: View,
+        shared_up: View,
+        shared_h: View,
+        shared: View,
+        experts_h: View,
+        routed: View,
+    }
+
+    struct GpuMoe<'a> {
+        post_norm: View,
+        /// Router logits then the shared expert gate, 257 values.
+        router: Router<'a>,
+        shared_gate: GpuQuant<'a>,
+        shared_up: GpuQuant<'a>,
+        shared_down: GpuQuant<'a>,
+        experts: Experts<'a>,
+    }
+
+    impl<'a> GpuMoe<'a> {
+        fn load(
+            gpu: &Gpu,
+            cfg: &Config,
+            weights: &'a Weights,
+            prefix: &str,
+        ) -> Result<GpuMoe<'a>, String> {
+            let m = |n: &str| matrix(gpu, weights, cfg, &format!("{prefix}.mlp.{n}"));
+            Ok(GpuMoe {
+                post_norm: vector(
+                    gpu,
+                    weights,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                )?,
+                router: Router::new(gpu, weights, &cfg.quantization, prefix)?,
+                shared_gate: m("shared_expert.gate_proj")?,
+                shared_up: m("shared_expert.up_proj")?,
+                shared_down: m("shared_expert.down_proj")?,
+                experts: Experts::new(gpu, weights, &cfg.quantization, prefix)?,
+            })
+        }
+
+        /// `x += moe(post_norm(x))`.
+        fn record(&self, plan: &mut Plan, cfg: &Config, x: &View, s: &MoeScratch) {
+            let hidden = cfg.hidden_size;
+            Norm::rows(1, hidden, cfg.rms_norm_eps, &self.post_norm)
+                .record(plan, x, &s.normed, false);
+            self.router.record(plan, &s.normed, &s.router, false);
+            self.shared_gate
+                .record(plan, &s.normed, &s.shared_gate, true);
+            self.shared_up.record(plan, &s.normed, &s.shared_up, true);
+            record_route(
+                plan,
+                &s.router,
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                &s.ids,
+                &s.weights,
+            );
+            elementwise(
+                plan,
+                "silu_mul",
+                &[&s.shared_gate, &s.shared_up, &s.shared_h],
+                self.shared_gate.rows,
+                true,
+            );
+            self.shared_down.record(plan, &s.shared_h, &s.shared, false);
+            self.experts.record(
+                plan,
+                &s.normed,
+                &s.ids,
+                &s.weights,
+                cfg.num_experts_per_tok,
+                &s.experts_h,
+                &s.routed,
+            );
+            elementwise(
+                plan,
+                "moe_mix",
+                &[x, &s.shared_logit, &s.shared, &s.routed],
+                hidden,
+                false,
+            );
+        }
+    }
+
+    enum Mixer<'a> {
+        Linear(GpuDeltaNet<'a>, GpuDeltaNetState),
+        Full(GpuAttention<'a>, GpuKvCache),
+    }
+
+    struct GpuLayer<'a> {
+        input_norm: View,
+        mixer: Mixer<'a>,
+        moe: GpuMoe<'a>,
+    }
+
+    /// What a token reads back: the logits, and the hidden state before the
+    /// final norm (for tests that run only some layers).
+    pub struct GpuModel<'a> {
+        gpu: &'a Gpu,
+        cfg: &'a Config,
+        layers: Vec<GpuLayer<'a>>,
+        plan: Plan<'a>,
+        built: Built,
+        hidden: View,
+        logits: View,
+        capacity: usize,
+        position: usize,
+    }
+
+    impl<'a> GpuModel<'a> {
+        /// Loads the first `layers` layers (all of them for the real model)
+        /// with room for `capacity` tokens in the attention caches.
+        pub fn load(
+            gpu: &'a Gpu,
+            cfg: &'a Config,
+            weights: &'a Weights,
+            layers: usize,
+            capacity: usize,
+        ) -> Result<GpuModel<'a>, String> {
+            assert!(layers <= cfg.num_layers());
+            let embed = matrix(gpu, weights, cfg, &format!("{PREFIX}.embed_tokens"))?;
+            if embed.bits != 5 {
+                return Err(format!(
+                    "embedding is {}-bit, the kernel is 5-bit",
+                    embed.bits
+                ));
+            }
+            let mut loaded = Vec::with_capacity(layers);
+            for l in 0..layers {
+                let prefix = format!("{PREFIX}.layers.{l}");
+                let mixer = match cfg.layer_types[l] {
+                    LayerType::LinearAttention => {
+                        let m = GpuDeltaNet::load(gpu, cfg, weights, &prefix)?;
+                        let state = GpuDeltaNetState::new(gpu, &m.cfg);
+                        Mixer::Linear(m, state)
+                    }
+                    LayerType::FullAttention => {
+                        let m = GpuAttention::load(gpu, cfg, weights, &prefix)?;
+                        let cache = GpuKvCache::new(gpu, &m.cfg, capacity);
+                        Mixer::Full(m, cache)
+                    }
+                };
+                loaded.push(GpuLayer {
+                    input_norm: vector(gpu, weights, &format!("{prefix}.input_layernorm.weight"))?,
+                    mixer,
+                    moe: GpuMoe::load(gpu, cfg, weights, &prefix)?,
+                });
+            }
+            let final_norm = vector(gpu, weights, &format!("{PREFIX}.norm.weight"))?;
+            let lm_head = matrix(gpu, weights, cfg, "language_model.lm_head")?;
+
+            let hidden = cfg.hidden_size;
+            let experts = &loaded.first().map(|l| &l.moe.experts);
+            let expert_size = experts.map_or(cfg.moe_intermediate_size, |e| e.size());
+            let shared_size = cfg.shared_expert_intermediate_size;
+            let router = view(gpu, cfg.num_experts + 1);
+            let s = MoeScratch {
+                normed: view(gpu, hidden),
+                router: router.clone(),
+                ids: view(gpu, cfg.num_experts_per_tok),
+                weights: view(gpu, cfg.num_experts_per_tok),
+                shared_logit: View {
+                    buffer: router.buffer,
+                    offset: (cfg.num_experts * 4) as u64,
+                },
+                shared_gate: view(gpu, shared_size),
+                shared_up: view(gpu, shared_size),
+                shared_h: view(gpu, shared_size),
+                shared: view(gpu, hidden),
+                experts_h: view(gpu, cfg.num_experts_per_tok * expert_size),
+                routed: view(gpu, hidden),
+            };
+            let x = view(gpu, hidden);
+            let normed = view(gpu, hidden);
+            let mixed = view(gpu, hidden);
+            let logits = view(gpu, lm_head.rows);
+
+            let mut plan = Plan::new(gpu);
+            let embed_shape = plan.constant(&[hidden as u32]);
+            let params = plan.params.clone();
+            plan.op(
+                "embed_5bit",
+                &[
+                    &embed.words,
+                    &embed.scales,
+                    &embed.biases,
+                    &params,
+                    &x,
+                    &embed_shape,
+                ],
+                MTLSize::new(hidden.div_ceil(GROUP) as u64, 1, 1),
+                MTLSize::new(GROUP as u64, 1, 1),
+            );
+            for layer in &loaded {
+                Norm::rows(1, hidden, cfg.rms_norm_eps, &layer.input_norm)
+                    .record(&mut plan, &x, &normed, false);
+                match &layer.mixer {
+                    Mixer::Linear(m, state) => m.record(&mut plan, &normed, &mixed, state),
+                    Mixer::Full(m, cache) => m.record(&mut plan, &normed, &mixed, cache),
+                }
+                elementwise(&mut plan, "add_into", &[&x, &mixed], hidden, false);
+                layer.moe.record(&mut plan, cfg, &x, &s);
+            }
+            Norm::rows(1, hidden, cfg.rms_norm_eps, &final_norm)
+                .record(&mut plan, &x, &normed, false);
+            lm_head.record(&mut plan, &normed, &logits, false);
+            let built = plan.build();
+
+            Ok(GpuModel {
+                gpu,
+                cfg,
+                layers: loaded,
+                plan,
+                built,
+                hidden: x,
+                logits,
+                capacity,
+                position: 0,
+            })
+        }
+
+        pub fn gpu(&self) -> &'a Gpu {
+            self.gpu
+        }
+
+        /// Tokens in the state.
+        pub fn position(&self) -> usize {
+            self.position
+        }
+
+        /// Sets the number of tokens in the state, after the states were
+        /// restored to that length. The next token runs at this position.
+        pub fn set_position(&mut self, position: usize) {
+            assert!(position <= self.capacity);
+            self.position = position;
+        }
+
+        /// The DeltaNet state of every linear layer, in layer order.
+        pub fn deltanet_states(&self) -> Vec<&GpuDeltaNetState> {
+            self.states()
+                .filter_map(|s| match s {
+                    State::Linear(s) => Some(s),
+                    State::Full(_) => None,
+                })
+                .collect()
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        /// Runs one token and returns the logits after it.
+        pub fn forward(&mut self, token: u32) -> Vec<f32> {
+            self.run(token);
+            contents::<f32>(&self.logits.buffer, self.cfg.vocab_size).to_vec()
+        }
+
+        /// Runs one token and leaves the results on the GPU.
+        pub fn run(&mut self, token: u32) {
+            assert!(
+                self.position < self.capacity,
+                "context is full ({} tokens)",
+                self.capacity
+            );
+            self.plan
+                .set_params(TokenParams::new(token, self.position as u32));
+            self.built.run(self.gpu);
+            self.position += 1;
+        }
+
+        /// The hidden state after the last layer, before the final norm.
+        pub fn hidden(&self) -> Vec<f32> {
+            contents::<f32>(&self.hidden.buffer, self.cfg.hidden_size).to_vec()
+        }
+
+        /// Clears the DeltaNet states and the position. The attention caches
+        /// are only read up to the position, so they need no clearing.
+        pub fn reset(&mut self) {
+            for layer in &self.layers {
+                if let Mixer::Linear(_, state) = &layer.mixer {
+                    zero(&state.conv);
+                    zero(&state.recurrent);
+                }
+            }
+            self.position = 0;
+        }
+
+        /// The DeltaNet state of each linear layer and the cache of each
+        /// attention layer, in layer order.
+        pub fn states(&self) -> impl Iterator<Item = State<'_>> {
+            self.layers.iter().map(|l| match &l.mixer {
+                Mixer::Linear(_, s) => State::Linear(s),
+                Mixer::Full(_, c) => State::Full(c),
+            })
+        }
+    }
+
+    pub enum State<'m> {
+        Linear(&'m GpuDeltaNetState),
+        Full(&'m GpuKvCache),
+    }
+
+    fn zero(buffer: &Buffer) {
+        unsafe { std::ptr::write_bytes(buffer.contents() as *mut u8, 0, buffer.length() as usize) };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::cpu::matrix::Matrix;
+        use crate::cpu::model::{Model, argmax};
+        use crate::cpu::moe::route;
+        use std::path::PathBuf;
+
+        const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
+        const TOKENS: [u32; 6] = [9707, 11, 1879, 0, 198, 3838];
+
+        fn rel_rms(got: &[f32], want: &[f32]) -> f32 {
+            assert_eq!(got.len(), want.len());
+            let err: f32 = got.iter().zip(want).map(|(g, w)| (g - w) * (g - w)).sum();
+            let norm: f32 = want.iter().map(|w| w * w).sum();
+            (err / norm).sqrt()
+        }
+
+        /// The router kernel against `cpu::moe::route` on made-up logits,
+        /// including ties. Runs on any Mac, no model needed.
+        #[test]
+        fn route_matches_cpu() {
+            let gpu = Gpu::new().unwrap();
+            let (experts, top_k) = (256, 8);
+            for case in 0..4 {
+                let mut logits: Vec<f32> = (0..experts)
+                    .map(|i| ((i * 37 + case * 11) as f32 * 0.71).sin() * 4.0)
+                    .collect();
+                if case == 3 {
+                    logits[5] = 9.0;
+                    logits[200] = 9.0;
+                    logits[17] = 9.0;
+                }
+                let identity: Vec<f32> = (0..experts * experts)
+                    .map(|i| (i % (experts + 1) == 0) as u8 as f32)
+                    .collect();
+                let want = route(&Matrix::Dense(&identity), &logits, top_k);
+
+                let mut plan = Plan::new(&gpu);
+                let input = View::new(gpu.buffer_from(&logits));
+                let (ids, weights) = (view(&gpu, top_k), view(&gpu, top_k));
+                record_route(&mut plan, &input, experts, top_k, &ids, &weights);
+                plan.build().run(&gpu);
+                let got_ids = contents::<u32>(&ids.buffer, top_k);
+                let got_w = contents::<f32>(&weights.buffer, top_k);
+                for (k, &(e, w)) in want.iter().enumerate() {
+                    assert_eq!(got_ids[k] as usize, e, "case {case} slot {k}");
+                    assert!((got_w[k] - w).abs() < 1e-6, "case {case} slot {k}");
+                }
+            }
+        }
+
+        fn open() -> (Config, Weights) {
+            let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+            (Config::load(&dir).unwrap(), Weights::open(&dir).unwrap())
+        }
+
+        /// The first SAETTA_LAYERS layers (default 4) against the CPU model,
+        /// token by token. Only the first layers fit next to mlx_lm.server.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn first_layers_match_cpu() {
+            let layers: usize = std::env::var("SAETTA_LAYERS")
+                .map(|v| v.parse().unwrap())
+                .unwrap_or(4);
+            let (cfg, weights) = open();
+            let cpu = Model::new(&cfg, &weights).unwrap();
+            let gpu = Gpu::new().unwrap();
+            let mut model = GpuModel::load(&gpu, &cfg, &weights, layers, 64).unwrap();
+            let mut states: Vec<_> = (0..layers).map(|l| cpu.new_state(l)).collect();
+            for (t, &token) in TOKENS.iter().enumerate() {
+                let mut x = cpu.embed(token);
+                for (l, state) in states.iter_mut().enumerate() {
+                    x = cpu.layer(l).step(&x, state).unwrap().hidden;
+                }
+                let start = std::time::Instant::now();
+                model.run(token);
+                let took = start.elapsed();
+                let err = rel_rms(&model.hidden(), &x);
+                println!("token {t}: rel rms {err:.2e}, {took:.2?}");
+                assert!(err < 1e-4, "token {t}: rel rms {err}");
+            }
+
+            model.reset();
+            let mut x = cpu.embed(TOKENS[0]);
+            let mut fresh: Vec<_> = (0..layers).map(|l| cpu.new_state(l)).collect();
+            for (l, state) in fresh.iter_mut().enumerate() {
+                x = cpu.layer(l).step(&x, state).unwrap().hidden;
+            }
+            model.run(TOKENS[0]);
+            assert!(rel_rms(&model.hidden(), &x) < 1e-4, "after reset");
+        }
+
+        /// All 40 layers: logits against the CPU model and the same greedy
+        /// tokens. Needs about 25 GB, so mlx_lm.server must not be running.
+        #[test]
+        #[ignore = "needs the whole model on the GPU"]
+        fn whole_model_matches_cpu() {
+            let (cfg, weights) = open();
+            let cpu = Model::new(&cfg, &weights).unwrap();
+            let gpu = Gpu::new().unwrap();
+            let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
+            let mut states = cpu.new_states();
+            let mut cpu_logits = Vec::new();
+            let mut gpu_logits = Vec::new();
+            for &t in &TOKENS {
+                cpu_logits = cpu.forward(t, &mut states).unwrap();
+                gpu_logits = model.forward(t);
+                println!("rel rms {:.2e}", rel_rms(&gpu_logits, &cpu_logits));
+            }
+            for i in 0..16 {
+                let (c, g) = (argmax(&cpu_logits), argmax(&gpu_logits));
+                let err = rel_rms(&gpu_logits, &cpu_logits);
+                println!("token {i}: cpu {c}, gpu {g}, rel rms {err:.2e}");
+                assert!(err < 1e-4);
+                assert_eq!(c, g, "token {i}");
+                cpu_logits = cpu.forward(c, &mut states).unwrap();
+                gpu_logits = model.forward(c);
+            }
+        }
+    }
+}

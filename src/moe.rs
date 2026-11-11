@@ -7,9 +7,10 @@ pub use mac::*;
 mod mac {
     use crate::config::Quantization;
     use crate::gpu::Gpu;
-    use crate::qmv::{GpuQuant, View, set_views};
+    use crate::plan::Plan;
+    use crate::qmv::{GpuQuant, View};
     use crate::weights::Weights;
-    use metal::{ComputeCommandEncoderRef, MTLSize};
+    use metal::MTLSize;
 
     /// Must match MOE_ROWS and MOE_SIMDS in the kernel.
     const ROWS_PER_SIMD: usize = 1;
@@ -30,9 +31,18 @@ mod mac {
             quant: &Quantization,
             layer: &str,
         ) -> Result<Experts<'a>, String> {
+            Experts::load(weights, quant, layer, |q| GpuQuant::new(gpu, q))
+        }
+
+        fn load(
+            weights: &'a Weights,
+            quant: &Quantization,
+            layer: &str,
+            make: impl Fn(&crate::weights::QuantTensor<'a>) -> GpuQuant<'a>,
+        ) -> Result<Experts<'a>, String> {
             let load = |name: &str| -> Result<GpuQuant<'a>, String> {
                 let q = weights.quantized(&format!("{layer}.mlp.switch_mlp.{name}"), quant)?;
-                Ok(GpuQuant::new(gpu, &q))
+                Ok(make(&q))
             };
             let e = Experts {
                 gate: load("gate_proj")?,
@@ -46,7 +56,31 @@ mod mac {
             assert_eq!((e.down.rows, e.down.cols), (e.gate.cols, e.gate.rows));
             Ok(e)
         }
+    }
 
+    impl Experts<'static> {
+        /// Copies of experts `ids` only, numbered 0.. in that order. See
+        /// `GpuQuant::subset`.
+        pub fn subset(
+            gpu: &Gpu,
+            weights: &Weights,
+            quant: &Quantization,
+            layer: &str,
+            ids: &[usize],
+        ) -> Result<Experts<'static>, String> {
+            let load = |name: &str| -> Result<GpuQuant<'static>, String> {
+                let q = weights.quantized(&format!("{layer}.mlp.switch_mlp.{name}"), quant)?;
+                Ok(GpuQuant::subset(gpu, &q, ids))
+            };
+            Ok(Experts {
+                gate: load("gate_proj")?,
+                up: load("up_proj")?,
+                down: load("down_proj")?,
+            })
+        }
+    }
+
+    impl Experts<'_> {
         /// The hidden size of one expert (rows of gate and up).
         pub fn size(&self) -> usize {
             self.gate.rows
@@ -57,14 +91,13 @@ mod mac {
             count * (self.gate.bytes() + self.up.bytes() + self.down.bytes())
         }
 
-        /// Encodes y = sum of weights[i] * expert(ids[i], x) for i < count, in
-        /// two dispatches. `ids` holds u32, `weights` f32, and `h` is scratch
-        /// for count * size() f32 values. `x` and `y` have the model width.
+        /// Records y = sum of weights[i] * expert(ids[i], x) for i < count,
+        /// as two ops. `ids` holds u32, `weights` f32, and `h` is scratch for
+        /// count * size() f32 values. `x` and `y` have the model width.
         #[allow(clippy::too_many_arguments)]
-        pub fn encode(
+        pub fn record(
             &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
+            plan: &mut Plan,
             x: &View,
             ids: &View,
             weights: &View,
@@ -72,53 +105,48 @@ mod mac {
             h: &View,
             y: &View,
         ) {
-            self.encode_gate_up(gpu, enc, x, ids, count, h);
-            self.encode_down(gpu, enc, h, ids, weights, count, y);
+            self.record_gate_up(plan, x, ids, count, h);
+            self.record_down(plan, h, ids, weights, count, y);
         }
 
         /// h[i] = silu(gate[ids[i]] x) * up[ids[i]] x for i < count.
-        pub fn encode_gate_up(
+        pub fn record_gate_up(
             &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
+            plan: &mut Plan,
             x: &View,
             ids: &View,
             count: usize,
             h: &View,
         ) {
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_gate_up_5bit"));
-            self.gate.set_buffers(enc, 0);
-            self.up.set_buffers(enc, 3);
-            set_views(enc, 6, &[x, h]);
-            let shape = [self.gate.rows as u32, self.gate.cols as u32, count as u32];
-            enc.set_bytes(8, 12, shape.as_ptr().cast());
-            set_views(enc, 9, &[ids]);
-            enc.dispatch_thread_groups(
-                MTLSize::new(row_groups(self.gate.rows), count as u64, 1),
+            let (g, u) = (&self.gate, &self.up);
+            let shape = plan.constant(&[g.rows as u32, g.cols as u32, count as u32]);
+            plan.op(
+                "moe_gate_up_5bit",
+                &[
+                    &g.words, &g.scales, &g.biases, &u.words, &u.scales, &u.biases, x, h, &shape,
+                    ids,
+                ],
+                MTLSize::new(row_groups(g.rows), count as u64, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),
             );
         }
 
         /// y = sum of weights[i] * down[ids[i]] h[i] for i < count.
-        #[allow(clippy::too_many_arguments)]
-        pub fn encode_down(
+        pub fn record_down(
             &self,
-            gpu: &Gpu,
-            enc: &ComputeCommandEncoderRef,
+            plan: &mut Plan,
             h: &View,
             ids: &View,
             weights: &View,
             count: usize,
             y: &View,
         ) {
-            enc.set_compute_pipeline_state(&gpu.pipeline("moe_down_5bit"));
-            self.down.set_buffers(enc, 0);
-            set_views(enc, 3, &[h, y]);
-            let shape = [self.down.rows as u32, self.down.cols as u32, count as u32];
-            enc.set_bytes(5, 12, shape.as_ptr().cast());
-            set_views(enc, 6, &[ids, weights]);
-            enc.dispatch_thread_groups(
-                MTLSize::new(row_groups(self.down.rows), 1, 1),
+            let d = &self.down;
+            let shape = plan.constant(&[d.rows as u32, d.cols as u32, count as u32]);
+            plan.op(
+                "moe_down_5bit",
+                &[&d.words, &d.scales, &d.biases, h, y, &shape, ids, weights],
+                MTLSize::new(row_groups(d.rows), 1, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),
             );
         }
@@ -127,6 +155,65 @@ mod mac {
     fn row_groups(rows: usize) -> u64 {
         rows.div_ceil(ROWS_PER_SIMD * SIMDS) as u64
     }
+
+    /// The router and shared-expert gate of one layer, both 8-bit.
+    pub struct Router<'a> {
+        pub gate: GpuQuant<'a>,
+        pub shared_gate: GpuQuant<'a>,
+    }
+
+    impl<'a> Router<'a> {
+        /// `layer` is a module prefix such as `language_model.model.layers.0`.
+        pub fn new(
+            gpu: &Gpu,
+            weights: &'a Weights,
+            quant: &Quantization,
+            layer: &str,
+        ) -> Result<Router<'a>, String> {
+            let load = |name: &str| -> Result<GpuQuant<'a>, String> {
+                let q = weights.quantized(&format!("{layer}.mlp.{name}"), quant)?;
+                Ok(GpuQuant::new(gpu, &q))
+            };
+            let r = Router {
+                gate: load("gate")?,
+                shared_gate: load("shared_expert_gate")?,
+            };
+            assert_eq!(
+                (r.gate.bits, r.shared_gate.bits),
+                (8, 8),
+                "router kernel is 8-bit"
+            );
+            assert_eq!(r.shared_gate.rows, 1);
+            assert_eq!(r.gate.cols, r.shared_gate.cols);
+            Ok(r)
+        }
+
+        /// Number of floats `record` writes: one logit per expert, then the
+        /// shared expert's gate logit.
+        pub fn outputs(&self) -> usize {
+            self.gate.rows + 1
+        }
+
+        /// Records out[..experts] = gate x and out[experts] = shared_gate x,
+        /// as one op.
+        pub fn record(&self, plan: &mut Plan, x: &View, out: &View, parallel: bool) {
+            let (g, s) = (&self.gate, &self.shared_gate);
+            let shape = plan.constant(&[g.rows as u32, g.cols as u32]);
+            let buffers = [
+                &g.words, &g.scales, &g.biases, &s.words, &s.scales, &s.biases, x, out, &shape,
+            ];
+            let grid = MTLSize::new(self.outputs().div_ceil(ROUTER_SIMDS) as u64, 1, 1);
+            let threads = MTLSize::new(32 * ROUTER_SIMDS as u64, 1, 1);
+            if parallel {
+                plan.op_parallel("router_8bit", &buffers, grid, threads);
+            } else {
+                plan.op("router_8bit", &buffers, grid, threads);
+            }
+        }
+    }
+
+    /// Must match ROUTER_SIMDS in kernels/router.metal.
+    const ROUTER_SIMDS: usize = 8;
 
     /// Expert ids for layer `l` of the benchmark: 8 distinct, spread out.
     pub fn bench_ids(l: usize) -> [u32; 8] {
@@ -140,21 +227,24 @@ mod mac {
         let config = crate::config::Config::load(dir)?;
         let weights = Weights::open(dir)?;
         let gpu = Gpu::new()?;
+        // Only the 8 used experts of each layer, copied: about 690 MB in all,
+        // the same bytes one token reads.
         let layers: Vec<Experts> = (0..config.num_layers())
             .map(|l| {
-                Experts::new(
+                let used = bench_ids(l).map(|e| e as usize);
+                Experts::subset(
                     &gpu,
                     &weights,
                     &config.quantization,
                     &format!("language_model.model.layers.{l}"),
+                    &used,
                 )
             })
             .collect::<Result<_, _>>()?;
         let hidden = layers[0].gate.cols;
         let x = View::new(gpu.buffer_from(&vec![0.01f32; hidden]));
-        let ids: Vec<View> = (0..layers.len())
-            .map(|l| View::new(gpu.buffer_from(&bench_ids(l))))
-            .collect();
+        let slots = View::new(gpu.buffer_from(&[0u32, 1, 2, 3, 4, 5, 6, 7]));
+        let ids: Vec<&View> = vec![&slots; layers.len()];
         let w = View::new(gpu.buffer_from(&[0.125f32; 8]));
         let h = View::new(gpu.buffer(8 * layers[0].size() * 4));
         let y = View::new(gpu.buffer(hidden * 4));
@@ -175,20 +265,18 @@ mod mac {
             per_layer / 1e6
         );
         for (part, (label, bytes)) in parts.iter().enumerate() {
+            let mut plan = Plan::new(&gpu);
+            for (layer, ids) in layers.iter().zip(&ids) {
+                if part != 2 {
+                    layer.record_gate_up(&mut plan, &x, ids, 8, &h);
+                }
+                if part != 1 {
+                    layer.record_down(&mut plan, &h, ids, &w, 8, &y);
+                }
+            }
+            let built = plan.build();
             let mut times: Vec<f64> = (0..=runs)
-                .map(|_| {
-                    gpu.run(|enc| {
-                        for (layer, ids) in layers.iter().zip(&ids) {
-                            if part != 2 {
-                                layer.encode_gate_up(&gpu, enc, &x, ids, 8, &h);
-                            }
-                            if part != 1 {
-                                layer.encode_down(&gpu, enc, &h, ids, &w, 8, &y);
-                            }
-                        }
-                    })
-                    .as_secs_f64()
-                })
+                .map(|_| built.run(&gpu).as_secs_f64())
                 .skip(1)
                 .collect();
             times.sort_by(f64::total_cmp);
@@ -198,6 +286,42 @@ mod mac {
                 bytes * n / times[0] / 1e9,
                 times[runs / 2] / n * 1e6,
                 bytes * n / times[runs / 2] / 1e9,
+            );
+        }
+
+        // The router: one router_8bit op per layer against two qmv ops.
+        let routers: Vec<Router> = (0..config.num_layers())
+            .map(|l| {
+                Router::new(
+                    &gpu,
+                    &weights,
+                    &config.quantization,
+                    &format!("language_model.model.layers.{l}"),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let logits = View::new(gpu.buffer(routers[0].outputs() * 4));
+        let shared = View::new(gpu.buffer(4));
+        for (label, fused) in [("router_8bit", true), ("2 x qmv_8bit", false)] {
+            let mut plan = Plan::new(&gpu);
+            for r in &routers {
+                if fused {
+                    r.record(&mut plan, &x, &logits, false);
+                } else {
+                    r.gate.record(&mut plan, &x, &logits, false);
+                    r.shared_gate.record(&mut plan, &x, &shared, true);
+                }
+            }
+            let built = plan.build();
+            let mut times: Vec<f64> = (0..=runs)
+                .map(|_| built.run(&gpu).as_secs_f64())
+                .skip(1)
+                .collect();
+            times.sort_by(f64::total_cmp);
+            println!(
+                "  router, {label}: best {:.1} us per layer, median {:.1} us",
+                times[0] / n * 1e6,
+                times[runs / 2] / n * 1e6,
             );
         }
         Ok(())

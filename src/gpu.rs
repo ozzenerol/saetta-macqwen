@@ -4,11 +4,14 @@
 //! so the Mac needs no Xcode, only the system Metal framework.
 
 pub const KERNELS: &str = concat!(
+    include_str!("../kernels/params.metal"),
     include_str!("../kernels/basic.metal"),
     include_str!("../kernels/quant.metal"),
     include_str!("../kernels/qmv.metal"),
     include_str!("../kernels/moe.metal"),
+    include_str!("../kernels/router.metal"),
     include_str!("../kernels/layers.metal"),
+    include_str!("../kernels/model.metal"),
 );
 
 #[cfg(target_os = "macos")]
@@ -26,7 +29,7 @@ mod mac {
     use memmap2::Mmap;
     use metal::{
         Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState,
-        Device, Library, MTLResourceOptions, MTLSize,
+        Device, Library, MTLDispatchType, MTLResourceOptions, MTLSize,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -34,6 +37,12 @@ mod mac {
     use std::path::Path;
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
+
+    /// All buffers skip Metal's hazard tracking. A serial encoder runs its
+    /// dispatches in order anyway, and a Plan replayed from an indirect
+    /// command buffer has explicit barriers. Tracking only adds cost.
+    const OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModeShared
+        .union(MTLResourceOptions::HazardTrackingModeUntracked);
 
     /// Apple Silicon page size. No-copy buffers must start and end on it.
     pub const PAGE: usize = 16384;
@@ -82,9 +91,12 @@ mod mac {
                 .library
                 .get_function(name, None)
                 .unwrap_or_else(|e| panic!("kernel {name}: {e}"));
+            let desc = metal::ComputePipelineDescriptor::new();
+            desc.set_compute_function(Some(&function));
+            desc.set_support_indirect_command_buffers(true);
             let pipeline = self
                 .device
-                .new_compute_pipeline_state_with_function(&function)
+                .new_compute_pipeline_state(&desc)
                 .unwrap_or_else(|e| panic!("pipeline {name}: {e}"));
             self.pipelines
                 .borrow_mut()
@@ -94,8 +106,7 @@ mod mac {
 
         /// A zeroed buffer of `len` bytes in shared memory.
         pub fn buffer(&self, len: usize) -> Buffer {
-            self.device
-                .new_buffer(len as u64, MTLResourceOptions::StorageModeShared)
+            self.device.new_buffer(len as u64, OPTIONS)
         }
 
         /// A buffer holding a copy of `data`.
@@ -103,7 +114,7 @@ mod mac {
             self.device.new_buffer_with_data(
                 data.as_ptr().cast(),
                 std::mem::size_of_val(data) as u64,
-                MTLResourceOptions::StorageModeShared,
+                OPTIONS,
             )
         }
 
@@ -121,7 +132,7 @@ mod mac {
             let buffer = self.device.new_buffer_with_bytes_no_copy(
                 page_start as *const std::ffi::c_void,
                 (page_end - page_start) as u64,
-                MTLResourceOptions::StorageModeShared,
+                OPTIONS,
                 None,
             );
             (buffer, (start - page_start) as u64)
@@ -136,17 +147,52 @@ mod mac {
             Ok(MappedFile { map, buffer })
         }
 
-        /// Encodes work with `encode` into one command buffer, runs it and
-        /// waits. Returns the wall time from commit to completion.
+        /// Encodes work with `encode` into one serial command buffer, runs
+        /// it and waits. Returns the wall time from commit to completion.
         pub fn run(&self, encode: impl FnOnce(&ComputeCommandEncoderRef)) -> Duration {
+            self.run_with(MTLDispatchType::Serial, encode)
+        }
+
+        /// `run` with a chosen dispatch type for the encoder.
+        pub fn run_with(
+            &self,
+            dispatch: MTLDispatchType,
+            encode: impl FnOnce(&ComputeCommandEncoderRef),
+        ) -> Duration {
             let commands = self.queue.new_command_buffer();
-            let encoder = commands.new_compute_command_encoder();
+            let encoder = commands.compute_command_encoder_with_dispatch_type(dispatch);
             encode(encoder);
             encoder.end_encoding();
             let start = Instant::now();
             commands.commit();
             commands.wait_until_completed();
-            start.elapsed()
+            let elapsed = start.elapsed();
+            if commands.status() == metal::MTLCommandBufferStatus::Error {
+                panic!(
+                    "GPU command buffer failed: {}",
+                    command_buffer_error(commands)
+                );
+            }
+            elapsed
+        }
+    }
+
+    /// The error description of a failed command buffer.
+    // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+    #[allow(unexpected_cfgs)]
+    fn command_buffer_error(commands: &metal::CommandBufferRef) -> String {
+        use metal::objc::runtime::Object;
+        use metal::objc::{msg_send, sel, sel_impl};
+        unsafe {
+            let error: *mut Object = msg_send![commands, error];
+            if error.is_null() {
+                return "no error object".into();
+            }
+            let text: *mut Object = msg_send![error, localizedDescription];
+            let utf8: *const std::ffi::c_char = msg_send![text, UTF8String];
+            std::ffi::CStr::from_ptr(utf8)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 
