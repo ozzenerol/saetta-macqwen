@@ -50,6 +50,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
         {
             device const float *k = keys + (start + 16 * simd) * stride + kv * DEC_DIM;
             simdgroup_float8x8 s[ROWS_PASS][2];
+#pragma clang loop unroll(full)
             for (uint r = 0; r < ROWS_PASS; r++) {
                 s[r][0] = simdgroup_float8x8(0);
                 s[r][1] = simdgroup_float8x8(0);
@@ -58,7 +59,11 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                 simdgroup_float8x8 k0, k1;
                 simdgroup_load(k0, k + d, stride);
                 simdgroup_load(k1, k + 8 * stride + d, stride);
-                for (uint r = 0; r < rows; r++) {
+                #pragma clang loop unroll(full)
+        for (uint r = 0; r < ROWS_PASS; r++) {
+            if (r >= rows) {
+                break;
+            }
                     device const float *qr =
                         q + ((r0 + r) * p.heads + kv * DEC_GROUP) * DEC_DIM + d;
                     simdgroup_float8x8 qt;
@@ -67,7 +72,11 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                     simdgroup_multiply_accumulate(s[r][1], k1, qt, s[r][1]);
                 }
             }
-            for (uint r = 0; r < rows; r++) {
+            #pragma clang loop unroll(full)
+        for (uint r = 0; r < ROWS_PASS; r++) {
+            if (r >= rows) {
+                break;
+            }
                 // s[r][i] is S^T: (token, head); store as (head, token).
                 simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
                 simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
@@ -76,7 +85,11 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Softmax pieces: simdgroup g takes query head g of each row.
-        for (uint r = 0; r < rows; r++) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < ROWS_PASS; r++) {
+            if (r >= rows) {
+                break;
+            }
             uint g = simd;
             uint row = r0 + r;
             uint len = min(pos + row + 1, p.capacity);
@@ -107,31 +120,44 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
         {
             device const float *v = values + start * stride + kv * DEC_DIM + 32 * simd;
             simdgroup_float8x8 o[ROWS_PASS][4];
+#pragma clang loop unroll(full)
             for (uint r = 0; r < ROWS_PASS; r++) {
+#pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; i++) {
                     o[r][i] = simdgroup_float8x8(0);
                 }
             }
             for (uint t = 0; t < DEC_CHUNK; t += 8) {
                 simdgroup_float8x8 vt[4];
+#pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; i++) {
                     simdgroup_load(vt[i], v + t * stride + 8 * i, stride);
                 }
-                for (uint r = 0; r < rows; r++) {
+                #pragma clang loop unroll(full)
+        for (uint r = 0; r < ROWS_PASS; r++) {
+            if (r >= rows) {
+                break;
+            }
                     simdgroup_float8x8 pt;
                     simdgroup_load(pt, &sc[r * DEC_GROUP][t], DEC_CHUNK);
+#pragma clang loop unroll(full)
                     for (uint i = 0; i < 4; i++) {
                         simdgroup_multiply_accumulate(o[r][i], pt, vt[i], o[r][i]);
                     }
                 }
             }
-            for (uint r = 0; r < rows; r++) {
+            #pragma clang loop unroll(full)
+        for (uint r = 0; r < ROWS_PASS; r++) {
+            if (r >= rows) {
+                break;
+            }
                 uint row = r0 + r;
                 if (start >= min(pos + row + 1, p.capacity)) {
                     continue;
                 }
                 device float *out =
                     part_o + ((row * chunks + tg.x) * p.heads + kv * DEC_GROUP) * DEC_DIM + 32 * simd;
+#pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; i++) {
                     simdgroup_store(o[r][i], out + 8 * i, DEC_DIM);
                 }
