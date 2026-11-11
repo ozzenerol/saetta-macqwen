@@ -381,6 +381,11 @@ mod mac {
             })
         }
 
+        /// The recorded token, for profiling.
+        pub fn plan(&self) -> &Plan<'a> {
+            &self.plan
+        }
+
         pub fn gpu(&self) -> &'a Gpu {
             self.gpu
         }
