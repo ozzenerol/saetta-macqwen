@@ -461,6 +461,14 @@ mod gpu {
             logits
         }
 
+        /// `step` without the MTP entry, for prompt tokens before the MTP
+        /// window: the drafts only look back that far.
+        pub fn step_plain(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
+            let logits = model.forward(token);
+            copy(model.final_hidden(), &self.last, self.hidden);
+            logits
+        }
+
         pub fn last_hidden(&self) -> Vec<f32> {
             read(&self.last, self.hidden)
         }
