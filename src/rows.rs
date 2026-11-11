@@ -314,16 +314,6 @@ mod mac {
         chunks: u32,
     }
 
-    /// Must match DecodeParams in kernels/attention.metal.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct DecodeParams {
-        heads: u32,
-        kv_heads: u32,
-        capacity: u32,
-        scale: f32,
-    }
-
     /// Must match DEC_CHUNK and DEC_DIM in kernels/attention.metal.
     const CHUNK: usize = 128;
     const DIM: usize = 256;
@@ -386,66 +376,20 @@ mod mac {
                 rows: m as u32,
                 chunks: chunks as u32,
             }]);
-            let kernel = match ATTENTION_ROWS_DIAG.load(std::sync::atomic::Ordering::Relaxed) {
-                1 => "attention_partial_rows_nos",
-                2 => "attention_partial_rows_nov",
-                _ => "attention_partial_rows",
-            };
             plan.op(
-                kernel,
+                "attention_partial_rows",
                 &[q, keys, values, &self.part_o, &self.part_ml, &p, &params[0]],
                 MTLSize::new(chunks as u64, self.kv_heads as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
-            if REDUCE_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
-                plan.op(
-                    "attention_reduce_rows",
-                    &[&self.part_o, &self.part_ml, q_and_gate, out, &p, &params[0]],
-                    MTLSize::new(self.heads as u64, m as u64, 1),
-                    MTLSize::new(1024, 1, 1),
-                );
-                return;
-            }
-            let p = plan.constant(&[DecodeParams {
-                heads: self.heads as u32,
-                kv_heads: self.kv_heads as u32,
-                capacity: self.capacity as u32,
-                scale,
-            }]);
-            let at = |v: &View, floats: usize| View {
-                buffer: v.buffer.clone(),
-                offset: v.offset + (floats * 4) as u64,
-            };
-            let part = chunks * self.heads;
-            let qs = self.heads * DIM;
-            for (r, row_params) in params.iter().enumerate().take(m) {
-                let buffers = [
-                    &at(&self.part_o, r * part * DIM),
-                    &at(&self.part_ml, r * part * 2),
-                    &at(q_and_gate, r * 2 * qs),
-                    &at(out, r * qs),
-                    &p,
-                    row_params,
-                ];
-                let (grid, group) = (
-                    MTLSize::new(self.heads as u64, 1, 1),
-                    MTLSize::new(DIM as u64, 1, 1),
-                );
-                if r == 0 {
-                    plan.op("attention_reduce", &buffers, grid, group);
-                } else {
-                    plan.op_parallel("attention_reduce", &buffers, grid, group);
-                }
-            }
+            plan.op(
+                "attention_reduce_rows",
+                &[&self.part_o, &self.part_ml, q_and_gate, out, &p, &params[0]],
+                MTLSize::new(self.heads as u64, m as u64, 1),
+                MTLSize::new(1024, 1, 1),
+            );
         }
     }
-
-    /// Timing only: 1 drops the score loop, 2 the value loop.
-    pub static ATTENTION_ROWS_DIAG: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-    /// Use attention_reduce_rows, one launch for all rows.
-    pub static REDUCE_ROWS: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
 
     /// Simdgroups per threadgroup of moe_gate_up_mma3 and moe_down_mma3.
     pub static MOE_SPLIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8);
@@ -647,11 +591,8 @@ mod mac {
                     .collect();
                 let rows = AttentionRows::new(&gpu, heads, kv_heads, capacity, MAX_ROWS);
                 let decode = DecodeAttention::new(&gpu, heads, kv_heads, dim, capacity);
-                for (diag, reduce) in [(0, false), (0, true), (1, true), (2, true)] {
-                    ATTENTION_ROWS_DIAG.store(diag, std::sync::atomic::Ordering::Relaxed);
-                    REDUCE_ROWS.store(reduce, std::sync::atomic::Ordering::Relaxed);
-                    let what = ["all", "no scores", "no values"][diag];
-                    let mut line = format!("ctx {ctx:>5} {what:>9}, one reduce {reduce:>5}:");
+                {
+                    let mut line = format!("ctx {ctx:>5}:");
                     for m in [1, 2, 4, 8] {
                         // The reference: one decode attention per row.
                         let mut want_ms = 0.0;
@@ -688,7 +629,7 @@ mod mac {
                             .zip(exp)
                             .map(|(a, b)| (a - b).abs())
                             .fold(0.0, f32::max);
-                        assert!(diag > 0 || err < 1e-4, "ctx {ctx} m {m}: max error {err}");
+                        assert!(err < 1e-4, "ctx {ctx} m {m}: max error {err}");
                         line += &format!("  m{m} {:.3} ms (decode x{m} {:.3})", t[5], want_ms);
                     }
                     println!("{line}");
