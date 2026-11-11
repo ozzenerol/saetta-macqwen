@@ -17,6 +17,7 @@ mod mac {
     use crate::gpu_layers::{
         GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm, add_norm, mix_norm,
     };
+    use crate::kv_quant::KvBits;
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
@@ -267,6 +268,19 @@ mod mac {
             kind: LayerType,
             capacity: usize,
         ) -> Result<GpuLayer<'a>, String> {
+            GpuLayer::load_with_bits(gpu, cfg, weights, prefix, kind, capacity, KvBits::Half)
+        }
+
+        /// As `load`, with an attention layer's cache stored as `bits`.
+        pub(crate) fn load_with_bits(
+            gpu: &Gpu,
+            cfg: &Config,
+            weights: &'a Weights,
+            prefix: &str,
+            kind: LayerType,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Result<GpuLayer<'a>, String> {
             let mixer = match kind {
                 LayerType::LinearAttention => {
                     let m = GpuDeltaNet::load(gpu, cfg, weights, prefix)?;
@@ -275,7 +289,7 @@ mod mac {
                 }
                 LayerType::FullAttention => {
                     let m = GpuAttention::load(gpu, cfg, weights, prefix)?;
-                    let cache = GpuKvCache::new(gpu, &m.cfg, capacity);
+                    let cache = GpuKvCache::with_bits(gpu, &m.cfg, capacity, bits);
                     Mixer::Full(m, cache)
                 }
             };
@@ -460,10 +474,30 @@ mod mac {
             layers: usize,
             capacity: usize,
         ) -> Result<GpuModel<'a>, String> {
-            Self::load_from(gpu, cfg, weights, layers, capacity, kv_start(capacity))
+            GpuModel::load_with_bits(gpu, cfg, weights, layers, capacity, KvBits::Half)
         }
 
-        /// `load` with caches that start at `start` tokens.
+        /// As `load`, with the KV caches stored as `bits`.
+        pub fn load_with_bits(
+            gpu: &'a Gpu,
+            cfg: &'a Config,
+            weights: &'a Weights,
+            layers: usize,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Result<GpuModel<'a>, String> {
+            Self::load_from(
+                gpu,
+                cfg,
+                weights,
+                layers,
+                capacity,
+                kv_start(capacity),
+                bits,
+            )
+        }
+
+        /// `load_with_bits` with caches that start at `start` tokens.
         pub fn load_from(
             gpu: &'a Gpu,
             cfg: &'a Config,
@@ -471,6 +505,7 @@ mod mac {
             layers: usize,
             capacity: usize,
             start: usize,
+            bits: KvBits,
         ) -> Result<GpuModel<'a>, String> {
             assert!(layers <= cfg.num_layers());
             let embed = load_embed(gpu, cfg, weights)?;
@@ -478,7 +513,15 @@ mod mac {
             let loaded = (0..layers)
                 .map(|l| {
                     let prefix = format!("{PREFIX}.layers.{l}");
-                    GpuLayer::load(gpu, cfg, weights, &prefix, cfg.layer_types[l], allocated)
+                    GpuLayer::load_with_bits(
+                        gpu,
+                        cfg,
+                        weights,
+                        &prefix,
+                        cfg.layer_types[l],
+                        allocated,
+                        bits,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let final_norm = vector(gpu, weights, &format!("{PREFIX}.norm.weight"))?;
@@ -825,18 +868,23 @@ mod mac {
         fn growing_cache_matches_whole() {
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
-            let mut grows = GpuModel::load_from(&gpu, &cfg, &weights, 4, 1024, 128).unwrap();
-            let mut whole = GpuModel::load(&gpu, &cfg, &weights, 4, 1024).unwrap();
-            assert_eq!((grows.allocated(), whole.allocated()), (128, 1024));
-            for t in 0..600u32 {
-                let token = (t * 7919) % 50000;
-                grows.run(token);
-                whole.run(token);
-                // The same kernels, and chunks past the length return at once,
-                // so the capacity must not change a bit.
-                assert_eq!(grows.hidden(), whole.hidden(), "token {t}");
+            // A quantized cache grows its codes, scales and biases.
+            for bits in [KvBits::Half, KvBits::Eight] {
+                let load = |start| {
+                    GpuModel::load_from(&gpu, &cfg, &weights, 4, 1024, start, bits).unwrap()
+                };
+                let (mut grows, mut whole) = (load(128), load(1024));
+                assert_eq!((grows.allocated(), whole.allocated()), (128, 1024));
+                for t in 0..600u32 {
+                    let token = (t * 7919) % 50000;
+                    grows.run(token);
+                    whole.run(token);
+                    // The same kernels, and chunks past the length return at
+                    // once, so the capacity must not change a bit.
+                    assert_eq!(grows.hidden(), whole.hidden(), "{bits:?} token {t}");
+                }
+                assert_eq!(grows.allocated(), 1024);
             }
-            assert_eq!(grows.allocated(), 1024);
         }
 
         /// All 40 layers: logits against the CPU model and the same greedy
@@ -844,16 +892,33 @@ mod mac {
         #[test]
         #[ignore = "needs the whole model on the GPU"]
         fn whole_model_matches_cpu() {
+            check_whole_model(KvBits::Half);
+        }
+
+        /// As above over an 8-bit and a 4-bit cache. The codes are the CPU's
+        /// (tests/kv_quant.rs) and decode reads them as f32, as the CPU does.
+        #[test]
+        #[ignore = "needs the whole model on the GPU"]
+        fn whole_model_quantized_matches_cpu() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_whole_model(bits);
+            }
+        }
+
+        fn check_whole_model(bits: KvBits) {
             let (cfg, weights) = open();
             let cpu = Model::new(&cfg, &weights).unwrap();
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
+            let mut model =
+                GpuModel::load_with_bits(&gpu, &cfg, &weights, cfg.num_layers(), 256, bits)
+                    .unwrap();
             let mut states = cpu.new_states();
-            // The GPU cache is half; the CPU rounds its keys and values the
-            // same way, so what is left is the f32 arithmetic.
+            // The CPU rounds its keys and values as the GPU cache stores
+            // them, so what is left is the f32 arithmetic.
             for s in &mut states {
                 if let crate::cpu::model::LayerState::Full(c) = s {
-                    c.round_to_half();
+                    c.round_to(bits);
                 }
             }
             let mut cpu_logits = Vec::new();
@@ -867,8 +932,27 @@ mod mac {
                 let (c, g) = (argmax(&cpu_logits), argmax(&gpu_logits));
                 let err = rel_rms(&gpu_logits, &cpu_logits);
                 println!("token {i}: cpu {c}, gpu {g}, rel rms {err:.2e}");
-                assert!(err < 1e-4);
-                assert_eq!(c, g, "token {i}");
+                // The mma attention sums in another order: 1.2e-4 at token 13.
+                // A key or value that rounds to the next code moves by a
+                // step: 1e-3 of the logits at 8 bits, and 2.6e-2 when that
+                // tips a near tie of the router (token 5). At 4 bits the
+                // values carry 9e-2 of rounding error and many keys sit near
+                // a code boundary: up to 1.2e-1 by token 10.
+                let bound = match bits {
+                    KvBits::Half => 3e-4,
+                    KvBits::Eight => 5e-2,
+                    KvBits::Four => 2e-1,
+                };
+                assert!(err < bound);
+                if bits == KvBits::Half {
+                    assert_eq!(c, g, "token {i}");
+                } else {
+                    // A lossy cache may pick the other side of a near tie
+                    // (8 bits, token 7): the CPU must rate the GPU's pick
+                    // almost as high as its own.
+                    let gap = cpu_logits[c as usize] - cpu_logits[g as usize];
+                    assert!(gap < 0.5, "token {i}: gap {gap}");
+                }
                 cpu_logits = cpu.forward(c, &mut states).unwrap();
                 gpu_logits = model.forward(c);
             }

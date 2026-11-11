@@ -1,4 +1,6 @@
 pub mod attention;
+pub mod attention_gemm;
+pub mod attention_prefill;
 pub mod cache;
 pub mod chat;
 pub mod config;
@@ -11,6 +13,7 @@ pub mod gpu_layers;
 pub mod gpu_model;
 pub mod gpu_mtp;
 pub mod gpu_verify;
+pub mod kv_quant;
 pub mod moe;
 pub mod mtp;
 pub mod plan;

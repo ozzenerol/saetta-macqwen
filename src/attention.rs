@@ -6,6 +6,7 @@ pub use mac::*;
 #[cfg(target_os = "macos")]
 mod mac {
     use crate::gpu::Gpu;
+    use crate::kv_quant::{KvBits, QuantRows};
     use crate::plan::Plan;
     use crate::qmv::View;
     use metal::{Buffer, MTLSize};
@@ -32,6 +33,9 @@ mod mac {
         capacity: usize,
         part_o: Buffer,
         part_ml: Buffer,
+        /// attention_partial or attention_partial_mma; over a quantized
+        /// cache, the _q8 or _q4 variant of it.
+        pub kernel: &'static str,
     }
 
     impl DecodeAttention {
@@ -58,6 +62,7 @@ mod mac {
                 capacity,
                 part_o: gpu.buffer(chunks * heads * DIM * 4),
                 part_ml: gpu.buffer(chunks * heads * 2 * 4),
+                kernel: "attention_partial_mma",
             }
         }
 
@@ -74,32 +79,93 @@ mod mac {
             q_and_gate: &View,
             out: &View,
         ) {
-            let p = plan.constant(&[DecodeParams {
+            let p = self.params(plan);
+            let params = plan.params.clone();
+            let (o, ml) = self.parts();
+            plan.op(
+                self.kernel,
+                &[q, keys, values, &o, &ml, &p, &params],
+                self.grid(),
+                MTLSize::new(256, 1, 1),
+            );
+            self.record_reduce(plan, &p, q_and_gate, out);
+        }
+
+        /// As `record`, over a quantized cache (src/kv_quant.rs).
+        pub fn record_quant(
+            &self,
+            plan: &mut Plan,
+            q: &View,
+            keys: &QuantRows,
+            values: &QuantRows,
+            q_and_gate: &View,
+            out: &View,
+        ) {
+            let mma = self.kernel == "attention_partial_mma";
+            let kernel = match (keys.bits, mma) {
+                (KvBits::Eight, true) => "attention_partial_mma_q8",
+                (KvBits::Four, true) => "attention_partial_mma_q4",
+                (KvBits::Eight, false) => "attention_partial_q8",
+                (KvBits::Four, false) => "attention_partial_q4",
+                (KvBits::Half, _) => unreachable!("a half cache goes through record"),
+            };
+            let p = self.params(plan);
+            let params = plan.params.clone();
+            let (o, ml) = self.parts();
+            let w = |b: &Buffer| View::new(b.clone());
+            plan.op(
+                kernel,
+                &[
+                    q,
+                    &w(&keys.data),
+                    &w(&values.data),
+                    &w(&keys.scales),
+                    &w(&keys.biases),
+                    &w(&values.scales),
+                    &w(&values.biases),
+                    &o,
+                    &ml,
+                    &p,
+                    &params,
+                ],
+                self.grid(),
+                MTLSize::new(256, 1, 1),
+            );
+            self.record_reduce(plan, &p, q_and_gate, out);
+        }
+
+        fn params(&self, plan: &mut Plan) -> View {
+            plan.constant(&[DecodeParams {
                 heads: self.heads as u32,
                 kv_heads: self.kv_heads as u32,
                 capacity: self.capacity as u32,
                 scale: 1.0 / (DIM as f32).sqrt(),
-            }]);
-            let params = plan.params.clone();
-            let (o, ml) = (
+            }])
+        }
+
+        fn parts(&self) -> (View, View) {
+            (
                 View::new(self.part_o.clone()),
                 View::new(self.part_ml.clone()),
-            );
-            plan.op(
-                "attention_partial",
-                &[q, keys, values, &o, &ml, &p, &params],
-                MTLSize::new(
-                    self.capacity.div_ceil(CHUNK) as u64,
-                    self.kv_heads as u64,
-                    1,
-                ),
-                MTLSize::new(256, 1, 1),
-            );
+            )
+        }
+
+        fn grid(&self) -> MTLSize {
+            MTLSize::new(
+                self.capacity.div_ceil(CHUNK) as u64,
+                self.kv_heads as u64,
+                1,
+            )
+        }
+
+        fn record_reduce(&self, plan: &mut Plan, p: &View, q_and_gate: &View, out: &View) {
+            let (o, ml) = self.parts();
+            let params = plan.params.clone();
             plan.op(
                 "attention_reduce",
-                &[&o, &ml, q_and_gate, out, &p, &params],
-                MTLSize::new(self.heads as u64, 1, 1),
-                MTLSize::new(DIM as u64, 1, 1),
+                &[&o, &ml, q_and_gate, out, p, &params],
+                MTLSize::new(self.heads as u64, (DIM / 64) as u64, 1),
+                MTLSize::new(1024, 1, 1),
             );
         }
     }
@@ -126,30 +192,40 @@ mod mac {
         let q = View::new(gpu.buffer_from(&vec![0.01f32; heads * DIM]));
         let qg = View::new(gpu.buffer_from(&vec![0.5f32; heads * 2 * DIM]));
         let out = View::new(gpu.buffer(heads * DIM * 4));
-        let att = DecodeAttention::new(&gpu, heads, kv, DIM, capacity);
-
-        let mut plan = Plan::new(&gpu);
-        for (k, v) in &caches {
-            att.record(&mut plan, &q, k, v, &qg, &out);
-        }
-        let built = plan.build();
+        let mut att = DecodeAttention::new(&gpu, heads, kv, DIM, capacity);
         println!(
             "attention for one token, {layers} layers, 16 q / 2 kv heads of 256, half cache; median of {runs} runs after 1 warm-up:"
         );
-        for &len in lengths {
-            plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
-            let mut t: Vec<f64> = (0..=runs)
-                .map(|_| built.run(&gpu).as_secs_f64())
-                .skip(1)
-                .collect();
-            t.sort_by(f64::total_cmp);
-            let time = t[runs / 2];
-            let bytes = (layers * len * token * 2 * 2) as f64;
-            println!(
-                "  {len:>6} tokens: {:.3} ms ({:.0} GB/s)",
-                time * 1e3,
-                bytes / time / 1e9
-            );
+        for kernel in ["attention_partial", "attention_partial_mma"] {
+            att.kernel = kernel;
+            let mut plan = Plan::new(&gpu);
+            for (k, v) in &caches {
+                att.record(&mut plan, &q, k, v, &qg, &out);
+            }
+            let built = plan.build();
+            let reduce = plan.build_where(|k| k == "attention_reduce", true);
+            println!("  {kernel}:");
+            for &len in lengths {
+                plan.set_params(crate::plan::TokenParams::new(0, len as u32 - 1));
+                let mut t: Vec<f64> = (0..=runs)
+                    .map(|_| built.run(&gpu).as_secs_f64())
+                    .skip(1)
+                    .collect();
+                t.sort_by(f64::total_cmp);
+                let time = t[runs / 2];
+                let mut r: Vec<f64> = (0..=runs)
+                    .map(|_| reduce.run(&gpu).as_secs_f64())
+                    .skip(1)
+                    .collect();
+                r.sort_by(f64::total_cmp);
+                let bytes = (layers * len * token * 2 * 2) as f64;
+                println!(
+                    "    {len:>6} tokens: {:.3} ms ({:.0} GB/s), reduce alone {:.3} ms",
+                    time * 1e3,
+                    bytes / time / 1e9,
+                    r[runs / 2] * 1e3
+                );
+            }
         }
         Ok(())
     }
@@ -161,15 +237,22 @@ mod mac {
         dir: &std::path::Path,
         lengths: &[usize],
         capacity: usize,
+        bits: KvBits,
         runs: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = crate::config::Config::load(dir)?;
         let weights = crate::weights::Weights::open(dir)?;
         let gpu = Gpu::new()?;
-        let mut model =
-            crate::gpu_model::GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity)?;
+        let mut model = crate::gpu_model::GpuModel::load_with_bits(
+            &gpu,
+            &cfg,
+            &weights,
+            cfg.num_layers(),
+            capacity,
+            bits,
+        )?;
         println!(
-            "decode, whole model, room for {capacity} tokens, logits read back; median of {runs} tokens after 1 warm-up:"
+            "decode, whole model, room for {capacity} tokens, {bits:?} KV cache, logits read back; median of {runs} tokens after 1 warm-up:"
         );
         for &len in lengths {
             let mut t: Vec<f64> = (0..=runs)

@@ -1418,3 +1418,171 @@ kernel void argmax_rows(device const float *x [[buffer(0)]],
         out[row] = mi;
     }
 }
+
+// The experts' gate and up in one pass, for the tiles of more than
+// PREFILL_FEW rows, as qmm2 32 x 128 in qmm.metal: a threadgroup computes
+// 32 rows by 64 columns of both, with W rows 0-63 of the tile from gate and
+// 64-127 from up so x is loaded once, then writes silu(gate) * up to g in
+// f32 (for qmm_few in down) and to g_half (for qmm2 in down). x is half.
+constant uint PREFILL_GU_BM = 32;
+constant uint PREFILL_GU_BN = 64;   // columns of each of gate and up
+constant uint PREFILL_GU_BK = 32;
+constant uint PREFILL_GU_LD = PREFILL_GU_BK + 8;
+
+template <uint BITS>
+kernel void prefill_gate_up(device const uint *gate_words [[buffer(0)]],
+                            device const ushort *gate_scales [[buffer(1)]],
+                            device const ushort *gate_biases [[buffer(2)]],
+                            device const uint *up_words [[buffer(3)]],
+                            device const ushort *up_scales [[buffer(4)]],
+                            device const ushort *up_biases [[buffer(5)]],
+                            device const half *x [[buffer(6)]],
+                            device float *g [[buffer(7)]],
+                            device half *g_half [[buffer(8)]],
+                            constant MmShape &s [[buffer(9)]],
+                            device const uint4 *tiles [[buffer(10)]],
+                            device const uint *rows [[buffer(11)]],
+                            device const uint *tile_count [[buffer(12)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half xt[PREFILL_GU_BM * PREFILL_GU_LD];
+    threadgroup half wt[2 * PREFILL_GU_BN * PREFILL_GU_LD];
+    threadgroup float c[PREFILL_GU_BM * 2 * PREFILL_GU_BN];
+
+    if (tg.y >= tile_count[0]) {
+        return;
+    }
+    uint4 tile = tiles[tg.y];
+    if (tile.z <= PREFILL_FEW) {
+        return;  // qmm_few takes it
+    }
+    uint expert = tile.x, first = tile.y, count = tile.z;
+    uint n0 = tg.x * PREFILL_GU_BN;
+
+    // Thread t loads 8 x values of row t / 4 and dequantizes the 32
+    // weights of W row t of the tile.
+    uint xr = tid / 4, xc = (tid % 4) * 8;
+    bool x_ok = xr < count;
+    device const half *xrow = x;
+    if (x_ok) {
+        xrow = x + ulong(rows[first + xr]) * s.k;
+    }
+    bool is_up = tid >= PREFILL_GU_BN;
+    uint wn = n0 + tid % PREFILL_GU_BN;
+    bool w_ok = wn < s.n;
+    ulong wrow = ulong(expert) * s.n + (w_ok ? wn : 0);
+    device const uint *wp = (is_up ? up_words : gate_words) + wrow * (s.k * BITS / 32);
+    device const ushort *sp = (is_up ? up_scales : gate_scales) + wrow * (s.k / 64);
+    device const ushort *bp = (is_up ? up_biases : gate_biases) + wrow * (s.k / 64);
+
+    // Simdgroups 0 and 1 compute gate columns, 2 and 3 up columns, 32 each.
+    uint sn = simd * 32;
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+
+    threadgroup half4 *xd = (threadgroup half4 *)(xt + xr * PREFILL_GU_LD + xc);
+    threadgroup half4 *wd = (threadgroup half4 *)(wt + tid * PREFILL_GU_LD);
+    for (uint k0 = 0; k0 < s.k; k0 += PREFILL_GU_BK) {
+        if (x_ok) {
+            device const half4 *p = (device const half4 *)(xrow + k0 + xc);
+            xd[0] = p[0];
+            xd[1] = p[1];
+        } else {
+            xd[0] = half4(0);
+            xd[1] = half4(0);
+        }
+        if (w_ok) {
+            uint packed[BITS];
+            device const uint *wk = wp + k0 / 32 * BITS;
+            for (uint j = 0; j < BITS; j++) {
+                packed[j] = wk[j];
+            }
+            float scale = bf16_to_float(sp[k0 / 64]);
+            float bias = bf16_to_float(bp[k0 / 64]);
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; i++) {
+                float4 q = float4(unpack<BITS>(packed, 4 * i), unpack<BITS>(packed, 4 * i + 1),
+                                  unpack<BITS>(packed, 4 * i + 2), unpack<BITS>(packed, 4 * i + 3));
+                wd[i] = half4(q * scale + bias);
+            }
+        } else {
+            for (uint i = 0; i < 8; i++) {
+                wd[i] = half4(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma clang loop unroll(full)
+        for (uint kk = 0; kk < PREFILL_GU_BK; kk += 8) {
+            simdgroup_half8x8 a[4];
+            simdgroup_half8x8 b[4];
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(a[i], xt + (8 * i) * PREFILL_GU_LD + kk, PREFILL_GU_LD);
+            }
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_load(b[j], wt + (sn + 8 * j) * PREFILL_GU_LD + kk, PREFILL_GU_LD, ulong2(0, 0), true);
+            }
+            for (uint i = 0; i < 4; i++) {
+                for (uint j = 0; j < 4; j++) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    constexpr uint CW = 2 * PREFILL_GU_BN;
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_store(acc[i][j], c + (8 * i) * CW + sn + 8 * j, CW);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread t writes 16 columns of row t / 4.
+    uint r = tid / 4, c0 = (tid % 4) * 16;
+    if (r < count) {
+        ulong out = ulong(first + r) * s.n + n0;
+        for (uint j = c0; j < c0 + 16; j++) {
+            if (n0 + j < s.n) {
+                float v = silu(c[r * CW + j]) * c[r * CW + PREFILL_GU_BN + j];
+                g[out + j] = v;
+                g_half[out + j] = half(v);
+            }
+        }
+    }
+}
+
+template [[host_name("prefill_gate_up_5bit")]] kernel decltype(prefill_gate_up<5>) prefill_gate_up<5>;
+template [[host_name("prefill_gate_up_8bit")]] kernel decltype(prefill_gate_up<8>) prefill_gate_up<8>;
+
+// g = silu(g) * u and g_half = g for the rows of the tiles of PREFILL_FEW
+// rows or fewer, which prefill_gate_up skips. One threadgroup per tile.
+kernel void prefill_silu_few(device float *g [[buffer(0)]],
+                             device const float *u [[buffer(1)]],
+                             device half *g_half [[buffer(2)]],
+                             constant uint &n [[buffer(3)]],
+                             device const uint4 *tiles [[buffer(4)]],
+                             device const uint *tile_count [[buffer(5)]],
+                             uint tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint threads [[threads_per_threadgroup]]) {
+    if (tg >= tile_count[0]) {
+        return;
+    }
+    uint4 tile = tiles[tg];
+    if (tile.z > PREFILL_FEW) {
+        return;
+    }
+    for (uint i = tid; i < tile.z * n; i += threads) {
+        ulong at = ulong(tile.y) * n + i;
+        float v = silu(g[at]) * u[at];
+        g[at] = v;
+        g_half[at] = half(v);
+    }
+}

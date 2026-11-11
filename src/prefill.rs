@@ -16,6 +16,7 @@ mod mac {
     use crate::gpu::{Gpu, contents, dispatch_1d};
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache, Norm};
     use crate::gpu_model::State;
+    use crate::kv_quant::KvBits;
     use crate::moe::Experts;
     use crate::plan::TokenParams;
     use crate::qmv::{GpuQuant, View};
@@ -31,14 +32,19 @@ mod mac {
     /// Key block of attention_rows2 (attention_rows takes 32); the KV
     /// cache needs this much slack.
     const KEY_BLOCK: usize = 64;
+    const _: () = assert!(KEY_BLOCK.is_multiple_of(crate::attention_prefill::KEY_BLOCK));
 
-    /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one and
-    /// SAETTA_ATT=8 the one with 8 heads per threadgroup, to compare.
+    /// The fast-mode attention: gemm (src/attention_gemm.rs, 9 TF/s at long
+    /// context, as MLX) unless SAETTA_ATT=rows2, fa8 or fa4 (B's flash
+    /// kernels), 1 or 8 (older ones).
     fn attention_half_kernel() -> &'static str {
         match std::env::var("SAETTA_ATT").as_deref() {
             Ok("1") => "attention_rows_half",
             Ok("8") => "attention_rows2_half8",
-            _ => "attention_rows2_half",
+            Ok("rows2") => "attention_rows2_half",
+            Ok("fa8") => "attention_fa8",
+            Ok("fa4") => "attention_fa4",
+            _ => "gemm",
         }
     }
 
@@ -247,8 +253,93 @@ mod mac {
         groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
     }
 
+    /// Fast-mode experts run gate, up and silu in prefill_gate_up unless
+    /// SAETTA_GATE_UP=0 or SAETTA_EXPERT_VARIANT picks other tile rows.
+    fn fused_gate_up() -> bool {
+        std::env::var("SAETTA_GATE_UP").map_or(true, |v| v != "0") && expert_variant().rows == 32
+    }
+
+    /// Experts' silu(gate) * up into `g` (f32) and `g_half`: prefill_gate_up
+    /// for the tiles of more than FEW rows, qmm_few for gate and up of the
+    /// others and prefill_silu_few on those rows. `x` is the input, `x_half`
+    /// its half, `u` scratch for up of the small tiles.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_up_grouped(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x: &View,
+        x_half: &View,
+        g_out: &View,
+        u: &View,
+        g_half: &View,
+        g: &Grouped,
+    ) {
+        let name = match gate.bits {
+            5 => "prefill_gate_up_5bit",
+            8 => "prefill_gate_up_8bit",
+            b => panic!("no prefill_gate_up kernel for {b} bits"),
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(name));
+        set_quant(enc, 0, gate);
+        set_quant(enc, 3, up);
+        set_views(enc, 6, &[x_half, g_out, g_half]);
+        let shape = MmShape {
+            m: 0,
+            n: gate.rows as u32,
+            k: gate.cols as u32,
+            gather: 1,
+        };
+        params(enc, 9, &shape);
+        set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
+        groups(enc, (gate.rows.div_ceil(64), g.max_tiles), 128);
+
+        few_grouped(gpu, enc, gate, x, g_out, g, true);
+        few_grouped(gpu, enc, up, x, u, g, true);
+        enc.set_compute_pipeline_state(&gpu.pipeline("prefill_silu_few"));
+        set_views(enc, 0, &[g_out, u, g_half]);
+        params(enc, 3, &(gate.rows as u32));
+        set_views(enc, 4, &[g.tiles, g.tile_count]);
+        groups(enc, (g.max_tiles, 1), 256);
+    }
+
+    /// qmm_few on the tiles of FEW rows or fewer of a grouped product.
+    fn few_grouped(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        y: &View,
+        g: &Grouped,
+        gather_x: bool,
+    ) {
+        enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
+        set_quant(enc, 0, w);
+        set_views(enc, 3, &[x, y]);
+        let shape = MmShape {
+            m: 0,
+            n: w.rows as u32,
+            k: w.cols as u32,
+            gather: if gather_x { 1 } else { 2 },
+        };
+        params(enc, 5, &shape);
+        set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
+        groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
+    }
+
     /// qmm_grouped on qmm2 (src/qmm.rs), which takes `x_half`, the half of
     /// `x`; the tiles of FEW rows or fewer still go to qmm_few on `x`.
+    /// The qmm2 variant for the experts: SAETTA_EXPERT_VARIANT=<index into
+    /// qmm::VARIANTS> (0 to 3) to compare, else DEFAULT.
+    fn expert_variant() -> crate::qmm::Variant {
+        std::env::var("SAETTA_EXPERT_VARIANT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&i| i < 4)
+            .map_or(crate::qmm::DEFAULT, |i| crate::qmm::VARIANTS[i])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn qmm2_grouped(
         gpu: &Gpu,
@@ -264,7 +355,7 @@ mod mac {
         crate::qmm::encode_gather(
             enc,
             gpu,
-            crate::qmm::DEFAULT,
+            expert_variant(),
             w,
             x_half,
             y,
@@ -274,18 +365,7 @@ mod mac {
             g.max_tiles,
             gather_x,
         );
-        enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
-        set_quant(enc, 0, w);
-        set_views(enc, 3, &[x, y]);
-        let shape = MmShape {
-            m: 0,
-            n: w.rows as u32,
-            k: w.cols as u32,
-            gather: if gather_x { 1 } else { 2 },
-        };
-        params(enc, 5, &shape);
-        set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
-        groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
+        few_grouped(gpu, enc, w, x, y, g, gather_x);
     }
 
     /// Fast-mode dense matrices run on qmm_dq (w rounded to half), 6% faster
@@ -537,6 +617,8 @@ mod mac {
         /// Set while `verify` encodes: its rows run on the exact kernels
         /// whatever `exact` says, so they match decode.
         force_exact: Cell<bool>,
+        /// The buffers of the matrix-product attention, with SAETTA_ATT=gemm.
+        gemm: Option<crate::attention_gemm::AttGemm>,
         /// Set by `profile`: only the stages up to this index in STAGES run.
         only: Cell<Option<usize>>,
     }
@@ -677,7 +759,10 @@ mod mac {
                 });
             }
             let chunk = chunk.next_multiple_of(TILE);
+            let gemm = (attention_half_kernel() == "gemm")
+                .then(|| crate::attention_gemm::AttGemm::new(gpu, chunk, attention.kv_heads));
             Ok(Prefill {
+                gemm,
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
                 only: Cell::new(None),
@@ -850,7 +935,7 @@ mod mac {
             })
         }
 
-        /// Runs `tokens` from position 0 as `run` does, and returns the GPU
+        /// Runs `tokens` from position `pos` as `run` does, and returns the GPU
         /// time of each of `STAGES`, summed over the layers, then the time
         /// of whole layers and of the logits. Each layer runs once for real,
         /// then once for every stage k with only stages 0 ..= k, from the
@@ -860,6 +945,7 @@ mod mac {
             &self,
             gpu: &Gpu,
             tokens: &[u32],
+            pos: usize,
             states: &[State],
         ) -> Vec<(&'static str, f64)> {
             let n = tokens.len();
@@ -874,7 +960,7 @@ mod mac {
                 unsafe { std::ptr::copy_nonoverlapping(ptr, input.as_mut_ptr(), bytes) };
                 let run = || {
                     gpu.run_timed(serial, |enc| {
-                        self.encode_layer(gpu, enc, l, &x, n, 0, state)
+                        self.encode_layer(gpu, enc, l, &x, n, pos, state)
                     })
                     .1
                 };
@@ -1306,7 +1392,7 @@ mod mac {
             self.encode_attention_rows(gpu, enc, w, cache, out, t, pos);
         }
 
-        /// The new keys and values into the half cache, attention over the
+        /// The new keys and values into the cache (half, or quantized), attention over the
         /// cache for the `t` new queries, and o_proj.
         #[allow(clippy::too_many_arguments)]
         fn encode_attention_rows(
@@ -1325,8 +1411,16 @@ mod mac {
             let kv_size = c.kv_heads * d;
             let (q_and_gate, q, y) = (whole(&s.wide), whole(&s.z), whole(&s.y));
             let (keys, values) = (whole(&s.mixed), at(&s.mixed, t * kv_size));
-            for (new, cached) in [(&keys, &cache.keys), (&values, &cache.values)] {
-                to_half(gpu, enc, new, &at_half(cached, pos * kv_size), t * kv_size);
+            match &cache.quant {
+                None => {
+                    for (new, cached) in [(&keys, &cache.keys), (&values, &cache.values)] {
+                        to_half(gpu, enc, new, &at_half(cached, pos * kv_size), t * kv_size);
+                    }
+                }
+                Some((kq, vq)) => {
+                    kq.encode(gpu, enc, &keys, pos, t);
+                    vq.encode(gpu, enc, &values, pos, t);
+                }
             }
             if !self.on("attention") {
                 if self.on("attention o_proj") {
@@ -1334,22 +1428,78 @@ mod mac {
                 }
                 return;
             }
-            let cached = [whole(&cache.keys), whole(&cache.values)];
-            let kernel = if self.exact_now() {
-                "attention_rows"
-            } else {
-                attention_half_kernel()
+            let exact = self.exact_now();
+            let kernel = match (&cache.quant, exact) {
+                (None, true) => "attention_rows",
+                (None, false) => attention_half_kernel(),
+                (Some((kq, _)), true) => match kq.bits {
+                    KvBits::Eight => "attention_rows_q8",
+                    _ => "attention_rows_q4",
+                },
+                (Some(_), false) if attention_half_kernel() == "gemm" => "gemm",
+                (Some((kq, _)), false) => match kq.bits {
+                    KvBits::Eight => "attention_rows2_half_q8",
+                    _ => "attention_rows2_half_q4",
+                },
             };
-            if self.exact_now() {
-                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
-                set_views(enc, 0, &[&q, &cached[0], &cached[1]]);
+            let q_in = if exact {
+                q.clone()
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
-                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
-                set_views(enc, 0, &[&q_half, &cached[0], &cached[1]]);
+                q_half
+            };
+            // The kernel match picks flash only over a half cache; gemm reads
+            // a quantized one in place.
+            if kernel.starts_with("attention_fa") || kernel == "gemm" {
+                let p = crate::attention_prefill::FlashParams {
+                    heads: c.heads as u32,
+                    kv_heads: c.kv_heads as u32,
+                    pos: pos as u32,
+                    tokens: t as u32,
+                    scale: 1.0 / (d as f32).sqrt(),
+                };
+                let (k, v) = (whole(&cache.keys), whole(&cache.values));
+                match &self.gemm {
+                    Some(gemm) if kernel == "gemm" => {
+                        gemm.encode(enc, gpu, &q_in, &k, &v, cache.quant.as_ref(), &q_and_gate, &y, p)
+                    }
+                    _ => crate::attention_prefill::encode(
+                        enc, gpu, kernel, &q_in, &k, &v, &q_and_gate, &y, p,
+                    ),
+                }
+                self.record(gpu, enc, 2, &y, t * c.heads * d);
+                if self.on("attention o_proj") {
+                    self.mm(gpu, enc, &w.o, &y, out, t);
+                }
+                return;
             }
-            set_views(enc, 3, &[&q_and_gate, &y]);
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
+            // A quantized cache is read in place (kernels/attention_rows_q.metal).
+            let next = match &cache.quant {
+                None => {
+                    set_views(enc, 0, &[&q_in, &whole(&cache.keys), &whole(&cache.values)]);
+                    3
+                }
+                Some((kq, vq)) => {
+                    let w = |b: &Buffer| whole(b);
+                    set_views(
+                        enc,
+                        0,
+                        &[
+                            &q_in,
+                            &w(&kq.data),
+                            &w(&vq.data),
+                            &w(&kq.scales),
+                            &w(&kq.biases),
+                            &w(&vq.scales),
+                            &w(&vq.biases),
+                        ],
+                    );
+                    7
+                }
+            };
+            set_views(enc, next, &[&q_and_gate, &y]);
             let p = AttentionParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -1357,9 +1507,13 @@ mod mac {
                 tokens: t as u32,
                 scale: 1.0 / (d as f32).sqrt(),
             };
-            params(enc, 5, &p);
+            params(enc, next + 2, &p);
             // Heads of one kv head per threadgroup.
-            let heads = if kernel.ends_with('8') { 8 } else { 4 };
+            let heads = if kernel == "attention_rows2_half8" {
+                8
+            } else {
+                4
+            };
             assert!((c.heads / c.kv_heads).is_multiple_of(heads));
             groups(enc, (t.div_ceil(8), c.heads / heads), 32 * heads);
             self.record(gpu, enc, 2, &y, t * c.heads * d);
@@ -1418,7 +1572,7 @@ mod mac {
             let tile_rows = if self.exact_now() {
                 TILE
             } else {
-                crate::qmm::tile_rows()
+                expert_variant().rows
             };
             let [ids, weights, order, rows, tiles, tile_count] = [
                 &s.ids,
@@ -1461,10 +1615,16 @@ mod mac {
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
             let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
+            let fused = !self.exact_now() && fused_gate_up();
             if self.on("experts gate, up") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
                     qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
+                } else if fused {
+                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    gate_up_grouped(
+                        gpu, enc, &e.gate, &e.up, normed, &normed_half, &eg, &eu, &expert_half, &g,
+                    );
                 } else {
                     to_half(gpu, enc, normed, &normed_half, t * h);
                     qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
@@ -1472,19 +1632,23 @@ mod mac {
                 }
             }
             if self.on("experts silu") {
-                dispatch_1d(
-                    enc,
-                    &silu_mul,
-                    &[(&s.expert_g, 0), (&s.expert_u, 0)],
-                    t * top_k * e.size(),
-                );
+                if !fused {
+                    dispatch_1d(
+                        enc,
+                        &silu_mul,
+                        &[(&s.expert_g, 0), (&s.expert_u, 0)],
+                        t * top_k * e.size(),
+                    );
+                }
                 self.record(gpu, enc, 4, &eg, t * top_k * e.size());
             }
             if self.on("experts down") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, true);
                 } else {
-                    to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    if !fused {
+                        to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    }
                     qmm2_grouped(gpu, enc, &e.down, &eg, &expert_half, &eo, &g, false);
                 }
             }
@@ -1521,6 +1685,16 @@ mod mac {
 
     impl OwnedState {
         pub fn new_all(gpu: &Gpu, cfg: &Config, capacity: usize) -> Vec<OwnedState> {
+            OwnedState::with_bits(gpu, cfg, capacity, KvBits::Half)
+        }
+
+        /// As `new_all`, with the KV caches stored as `bits`.
+        pub fn with_bits(
+            gpu: &Gpu,
+            cfg: &Config,
+            capacity: usize,
+            bits: KvBits,
+        ) -> Vec<OwnedState> {
             let capacity = capacity.next_multiple_of(KEY_BLOCK);
             cfg.layer_types
                 .iter()
@@ -1528,9 +1702,12 @@ mod mac {
                     LayerType::LinearAttention => {
                         OwnedState::Linear(GpuDeltaNetState::new(gpu, &deltanet_config(cfg)))
                     }
-                    LayerType::FullAttention => {
-                        OwnedState::Full(GpuKvCache::new(gpu, &attention_config(cfg), capacity))
-                    }
+                    LayerType::FullAttention => OwnedState::Full(GpuKvCache::with_bits(
+                        gpu,
+                        &attention_config(cfg),
+                        capacity,
+                        bits,
+                    )),
                 })
                 .collect()
         }
@@ -1551,6 +1728,7 @@ mod mac {
         chunk: usize,
         runs: usize,
         exact: bool,
+        bits: KvBits,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Config::load(dir)?;
         let weights = Weights::open(dir)?;
@@ -1559,7 +1737,7 @@ mod mac {
         let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
         prefill.exact = exact;
         let prompt = test_tokens(tokens);
-        let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+        let owned = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
         let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
         let mut times: Vec<f64> = (0..=runs)
             .map(|_| {
@@ -1577,7 +1755,7 @@ mod mac {
             .collect();
         times.sort_by(f64::total_cmp);
         println!(
-            "prefill {tokens} tokens, chunk {}, exact {exact}, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
+            "prefill {tokens} tokens, chunk {}, exact {exact}, {bits:?} KV, {runs} runs: best {:.3} s ({:.0} tokens/s), median {:.3} s ({:.0} tokens/s)",
             prefill.chunk,
             times[0],
             tokens as f64 / times[0],
@@ -1589,11 +1767,15 @@ mod mac {
 
     /// Prints the GPU time per stage of a `tokens`-token prefill (see
     /// `Prefill::profile`), after one warm-up run.
+    /// Profiles the prefill of `tokens` tokens, or with `last`, only of the
+    /// last `last` of them after a plain prefill of the others, to see what
+    /// a chunk costs deep in a long prompt.
     pub fn bench_profile(
         dir: &std::path::Path,
         tokens: usize,
         chunk: usize,
         exact: bool,
+        last: Option<usize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = Config::load(dir)?;
         let weights = Weights::open(dir)?;
@@ -1604,20 +1786,32 @@ mod mac {
         let prompt = test_tokens(tokens);
         let owned = OwnedState::new_all(&gpu, &cfg, capacity);
         let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
-        prefill.run(&gpu, &prompt, 0, &states);
-        for s in &owned {
-            if let OwnedState::Linear(d) = s {
-                zero(&d.conv);
-                zero(&d.recurrent);
+        let first = tokens - last.unwrap_or(tokens).min(tokens);
+        if first == 0 {
+            // A warm-up, then the DeltaNet state of an empty prompt again.
+            prefill.run(&gpu, &prompt, 0, &states);
+            for s in &owned {
+                if let OwnedState::Linear(d) = s {
+                    zero(&d.conv);
+                    zero(&d.recurrent);
+                }
             }
+        } else {
+            // The keys and values of the first tokens for real; the DeltaNet
+            // state the profiled runs then start from does not change the time.
+            let start = std::time::Instant::now();
+            prefill.run(&gpu, &prompt[..first], 0, &states);
+            let secs = start.elapsed().as_secs_f64();
+            println!("prefill of the first {first} tokens: {secs:.1} s");
         }
-        let times = prefill.profile(&gpu, &prompt, &states);
+        let times = prefill.profile(&gpu, &prompt[first..], first, &states);
         let total: f64 = times.iter().rev().take(2).map(|t| t.1).sum();
+        let n = tokens - first;
         println!(
-            "prefill {tokens} tokens, chunk {}, exact {exact}: GPU {:.3} s ({:.0} tokens/s)",
+            "prefill {n} tokens at position {first}, chunk {}, exact {exact}: GPU {:.3} s ({:.0} tokens/s)",
             prefill.chunk,
             total,
-            tokens as f64 / total
+            n as f64 / total
         );
         for (stage, t) in &times {
             println!("{stage:>22} {:8.1} ms {:5.1}%", t * 1e3, 100.0 * t / total);
@@ -1754,7 +1948,22 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 5e-3, 1e-2);
+            check_prefill(true, 5e-3, 1e-2, KvBits::Half);
+        }
+
+        /// Prefill over an 8-bit and a 4-bit KV cache against the CPU storing
+        /// its cache the same way and reading it through half. The codes match
+        /// the CPU's for the same input (tests/kv_quant.rs); here the inputs
+        /// differ by f32 rounding, so a value now and then lands on the next
+        /// code, and the bounds are the half cache's times
+        /// kv_quant::test_slack (8 bits: logits 1.3e-2, median token 2e-3).
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn quantized_prefill_matches_token_by_token() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_prefill(true, 5e-3, 1e-2, bits);
+            }
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1772,7 +1981,19 @@ mod mac {
             // the median token peaks at 6.1e-2 (layer 26), state 7.4e-2,
             // logits 4.2e-2. MLX in bf16 is off by 1.6e-2 at layer 3.
             // Bounds are about twice what was measured.
-            check_prefill(false, 0.12, 0.1);
+            check_prefill(false, 0.12, 0.1, KvBits::Half);
+        }
+
+        /// Fast prefill (gemm attention reading the codes in place) over an
+        /// 8-bit and a 4-bit KV cache, with the fast bounds times
+        /// kv_quant::test_slack.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn fast_quantized_prefill_matches_token_by_token() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_prefill(false, 0.12, 0.1, bits);
+            }
         }
 
         /// 166 tokens in two calls (150 then 16) with chunks of 128 rounded
@@ -1780,7 +2001,9 @@ mod mac {
         /// kernels and a 22-row one on qmm_few: the hidden state after each layer and every layer state
         /// must be within `bound` of the CPU fed one token at a time, the
         /// logits within `logits_bound`, with the same argmax.
-        fn check_prefill(exact: bool, bound: f32, logits_bound: f32) {
+        fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) {
+            let slack = crate::kv_quant::test_slack(bits);
+            let (bound, logits_bound) = (bound * slack, logits_bound * slack);
             let (cfg, weights) = open();
             let gpu = Gpu::new().unwrap();
             let model = Model::new(&cfg, &weights).unwrap();
@@ -1792,14 +2015,14 @@ mod mac {
             let h = cfg.hidden_size;
 
             let mut cpu_states = model.new_states();
-            // The GPU cache is half; the CPU rounds its keys and values the
-            // same way.
+            // The CPU stores its keys and values as the GPU cache does, and
+            // reads a quantized one through half as prefill does.
             for s in &mut cpu_states {
                 if let LayerState::Full(c) = s {
-                    c.round_to_half();
+                    c.round_to_as_half(bits);
                 }
             }
-            let gpu_states = OwnedState::new_all(&gpu, &cfg, capacity);
+            let gpu_states = OwnedState::with_bits(&gpu, &cfg, capacity, bits);
             let mut cpu_x: Vec<Vec<Vec<f32>>> = parts
                 .iter()
                 .map(|p| p.iter().map(|&t| model.embed(t)).collect())
@@ -1854,8 +2077,21 @@ mod mac {
                                 .map(|v| v.to_f32())
                                 .collect()
                         };
-                        let k = rel_rms(&f32s(&g.keys), c.keys());
-                        let v = rel_rms(&f32s(&g.values), c.values());
+                        let dequantized = |q: &crate::kv_quant::QuantRows| {
+                            let groups = n / crate::kv_quant::GROUP;
+                            crate::kv_quant::dequantize(
+                                contents::<u32>(&q.data, groups * q.bits.words_per_group()),
+                                contents::<half::f16>(&q.scales, groups),
+                                contents::<half::f16>(&q.biases, groups),
+                                q.bits,
+                            )
+                        };
+                        let (keys, values) = match &g.quant {
+                            None => (f32s(&g.keys), f32s(&g.values)),
+                            Some((k, v)) => (dequantized(k), dequantized(v)),
+                        };
+                        let k = rel_rms(&keys, c.keys());
+                        let v = rel_rms(&values, c.values());
                         k.max(v)
                     }
                     _ => panic!("layer {l}: state types differ"),
@@ -1865,8 +2101,27 @@ mod mac {
                 );
                 // The half path may pick another expert at a near tie for a
                 // token, as bf16 MLX does, so only the median token counts.
-                let hidden = if exact { err } else { median };
-                assert!(hidden < bound && state < bound * 1.25, "layer {l}");
+                // So does a quantized cache: a key on the next code moves a
+                // few tokens far more than the rest (8 bits, layer 14: rms
+                // 2.2e-2, median 5.1e-3), and F's KL gate covers the whole.
+                // `bound` has the slack of a quantized cache in it.
+                let hidden = if exact && bits == KvBits::Half {
+                    err
+                } else {
+                    median
+                };
+                // The state of an attention layer over a quantized cache is
+                // its codes: a key that moved with the hidden state lands on
+                // the next code, one step (1.9e-2 of the rms at 8 bits)
+                // away, so it gets twice the room (8 bits, layer 15: 2.5e-2
+                // while the median token is 5.3e-3).
+                let full = matches!(cpu_states[l], LayerState::Full(_));
+                let state_bound = if full && bits != KvBits::Half {
+                    bound * 2.5
+                } else {
+                    bound * 1.25
+                };
+                assert!(hidden < bound && state < state_bound, "layer {l}");
             }
 
             let norm = weights
@@ -1887,6 +2142,29 @@ mod mac {
             assert!(err < logits_bound);
             if exact {
                 assert_eq!(argmax(&got), argmax(&want));
+            }
+        }
+
+        /// The prefill kernels compile (no dispatch, so no GPU work).
+        #[test]
+        fn kernels_compile() {
+            let gpu = Gpu::new().unwrap();
+            for name in [
+                "prefill_gate_up_5bit",
+                "prefill_gate_up_8bit",
+                "prefill_silu_few",
+                "attention_fa8",
+                "attention_fa4",
+                "prefill_ag_scores",
+                "prefill_ag_scores_q8",
+                "prefill_ag_scores_q4",
+                "prefill_ag_softmax",
+                "prefill_ag_pv",
+                "prefill_ag_pv_q8",
+                "prefill_ag_pv_q4",
+                "prefill_ag_final",
+            ] {
+                gpu.pipeline(name);
             }
         }
 

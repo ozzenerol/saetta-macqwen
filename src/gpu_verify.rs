@@ -195,6 +195,13 @@ mod mac {
                 "verify takes 1 to {MAX_ROWS} rows"
             );
             let (gpu, cfg) = (self.gpu, self.cfg);
+            assert!(
+                self.layers.iter().all(|l| match &l.mixer {
+                    Mixer::Full(_, c) => c.quant.is_none(),
+                    Mixer::Linear(..) => true,
+                }),
+                "the multi-row verify reads a half KV cache"
+            );
             let h = cfg.hidden_size;
             let vocab = self.lm_head.rows;
             let s = RowsScratch::new(gpu, cfg, self.allocated, rows);
@@ -475,7 +482,16 @@ mod mac {
             let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
             let (cfg, weights) = (Config::load(&dir).unwrap(), Weights::open(&dir).unwrap());
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load_from(&gpu, &cfg, &weights, layers, 512, start).unwrap();
+            let mut model = GpuModel::load_from(
+                &gpu,
+                &cfg,
+                &weights,
+                layers,
+                512,
+                start,
+                crate::kv_quant::KvBits::Half,
+            )
+            .unwrap();
             model.enable_verify(DRAFT.len());
 
             // 300 tokens, so the rows' keys cross a chunk boundary.
