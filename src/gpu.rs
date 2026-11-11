@@ -12,6 +12,7 @@ pub const KERNELS: &str = concat!(
     include_str!("../kernels/router.metal"),
     include_str!("../kernels/layers.metal"),
     include_str!("../kernels/model.metal"),
+    include_str!("../kernels/prefill.metal"),
 );
 
 #[cfg(target_os = "macos")]

@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -37,6 +37,10 @@ fn main() -> ExitCode {
         ["bench-qmv", dir] => report(saetta::qmv::bench(Path::new(dir), 5, 20)),
         #[cfg(target_os = "macos")]
         ["bench-moe", dir] => report(saetta::moe::bench(Path::new(dir), 5)),
+        #[cfg(target_os = "macos")]
+        ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
+        #[cfg(target_os = "macos")]
+        ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -166,8 +170,12 @@ fn serve_gpu(
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), GPU_CONTEXT)?;
     let layers = model.deltanet_states();
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
+    let mut prefill =
+        saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, GPU_CONTEXT)?;
+    prefill.exact = exact_prefill();
     let served = GpuServed {
         model,
+        prefill,
         pool,
         last_blit: RefCell::new(None),
     };
@@ -185,6 +193,16 @@ struct GpuServed {
     /// The last snapshot copy, which may still run. The CPU must wait for it
     /// before it writes the states, as `reset` does.
     last_blit: RefCell<Option<metal::CommandBuffer>>,
+    prefill: saetta::prefill::Prefill<'static>,
+}
+
+/// Tokens per prefill dispatch.
+#[cfg(target_os = "macos")]
+const PREFILL_CHUNK: usize = 1024;
+
+#[cfg(target_os = "macos")]
+fn exact_prefill() -> bool {
+    !saetta::prefill::fast_from_env()
 }
 
 // The server uses the model from one thread at a time, behind its engine
@@ -203,14 +221,14 @@ impl server::Model for GpuServed {
             tokens.len(),
             m.capacity()
         );
-        let start = Instant::now();
-        let Some((&last, rest)) = tokens.split_last() else {
+        if tokens.is_empty() {
             return Vec::new();
-        };
-        for &t in rest {
-            m.run(t);
         }
-        let logits = m.forward(last);
+        let start = Instant::now();
+        let pos = m.position();
+        let states: Vec<_> = m.states().collect();
+        let logits = self.prefill.run(m.gpu(), tokens, pos, &states);
+        m.set_position(pos + tokens.len());
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
             "prefill {} tokens in {secs:.2} s ({:.1} ms/token)",
@@ -375,4 +393,21 @@ fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
         w.len() - text
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
+    match (tokens.parse(), chunk.parse()) {
+        (Ok(t), Ok(c)) => report(saetta::prefill::bench(
+            Path::new(dir),
+            t,
+            c,
+            3,
+            exact_prefill(),
+        )),
+        _ => {
+            eprintln!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
 }
