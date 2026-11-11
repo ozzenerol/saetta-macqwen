@@ -32,6 +32,10 @@ For each request:
 
 Snapshots live in GPU buffers. A limit of 16 (about 1 GB) is the default; the least recently used goes first, except the one at the end of the last prompt. With qh, each turn adds the model's answer and a tool result to the end of the prompt, so rule 1 or 2 almost always gives a hit, and only the new tokens are read.
 
+## Cost on the GPU
+
+A snapshot is one 65.9 MB buffer from a pool of 17, made when the server starts (`src/gpu_cache.rs`). Saving and restoring are one blit each, committed between tokens without waiting: 0.03 ms on the CPU, and the copy itself takes about 0.55 ms on the GPU (M3 Max, 20 runs, quiet GPU). The CPU waits for the last copy only before it writes the states itself, as `reset` does.
+
 ## Checks
 
 - Restoring a snapshot and running the same tokens gives the same logits as never having left (bit-equal on the GPU, same kernels).
