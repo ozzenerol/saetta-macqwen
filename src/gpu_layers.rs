@@ -188,9 +188,11 @@ mod mac {
     impl GpuKvCache {
         pub fn new(gpu: &Gpu, cfg: &AttentionConfig, capacity: usize) -> GpuKvCache {
             let token = cfg.kv_heads * cfg.head_dim * 4;
+            // attention_partial_rows reads whole chunks of 128 tokens.
+            let room = capacity.next_multiple_of(128);
             GpuKvCache {
-                keys: gpu.buffer(capacity * token),
-                values: gpu.buffer(capacity * token),
+                keys: gpu.buffer(room * token),
+                values: gpu.buffer(room * token),
                 decode: DecodeAttention::new(gpu, cfg.heads, cfg.kv_heads, cfg.head_dim, capacity),
                 capacity,
             }
@@ -296,6 +298,7 @@ mod mac {
     /// The attention buffers of `MAX_ROWS` tokens, shared by all attention
     /// layers.
     pub struct AttentionRowsScratch {
+        attention: rows::AttentionRows,
         q_and_gate: Buffer,
         q: Buffer,
         k: Buffer,
@@ -304,11 +307,13 @@ mod mac {
     }
 
     impl AttentionRowsScratch {
-        pub fn new(gpu: &Gpu, cfg: &Config) -> AttentionRowsScratch {
+        /// For caches of `capacity` tokens and verifies of up to `rows`.
+        pub fn new(gpu: &Gpu, cfg: &Config, capacity: usize, rows: usize) -> AttentionRowsScratch {
             let a = attention_config(cfg);
             let size = a.heads * a.head_dim * 4 * rows::MAX_ROWS;
             let kv = a.kv_heads * a.head_dim * 4 * rows::MAX_ROWS;
             AttentionRowsScratch {
+                attention: rows::AttentionRows::new(gpu, a.heads, a.kv_heads, capacity, rows),
                 q_and_gate: gpu.buffer(2 * size),
                 q: gpu.buffer(size),
                 k: gpu.buffer(kv),
@@ -321,8 +326,8 @@ mod mac {
     impl GpuAttention<'_> {
         /// Records `m` tokens at once: `x` and `out` are `[m, hidden]`, and
         /// row r takes its position from `params[r]` (TokenParams views),
-        /// so it sees the keys of rows before it. The projections read each
-        /// weight once for all rows; the attention itself runs per row.
+        /// so it sees the keys of rows before it. Each weight and each chunk
+        /// of the cache is read once for all rows.
         #[allow(clippy::too_many_arguments)]
         pub fn record_rows(
             &self,
@@ -379,19 +384,8 @@ mod mac {
                     plan.op_parallel("attention_prep", &buffers, grid, group);
                 }
             }
-            let saved = plan.params.clone();
-            for (r, row_params) in params.iter().enumerate().take(m) {
-                plan.params = row_params.clone();
-                cache.decode.record(
-                    plan,
-                    &row(&q, r, qs),
-                    &keys,
-                    &values,
-                    &row(&q_and_gate, r, 2 * qs),
-                    &row(&attn, r, qs),
-                );
-            }
-            plan.params = saved;
+            s.attention
+                .record(plan, m, &q, &keys, &values, &q_and_gate, &attn, params);
             rows::record_qmv(plan, &self.o_proj, m, &attn, out, false);
         }
     }

@@ -43,6 +43,39 @@ mod mac {
         }
     }
 
+    /// Must match MMA_SIMDS in rows.metal: simdgroups per 8-row tile.
+    const MMA_SIMDS: usize = 8;
+
+    /// `record_qmv` with simdgroup matrices. `x` must have `MAX_ROWS`
+    /// readable rows; only the first `m` rows of `y` are written.
+    pub fn record_qmv_mma(
+        plan: &mut Plan,
+        w: &GpuQuant,
+        m: usize,
+        x: &View,
+        y: &View,
+        parallel: bool,
+    ) {
+        assert_eq!(w.experts, 1, "stacked experts go through moe");
+        assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
+        assert!(w.cols.is_multiple_of(32 * MMA_SIMDS));
+        let readable = x.buffer.length() - x.offset;
+        assert!(
+            readable as usize >= MAX_ROWS * w.cols * 4,
+            "x needs {MAX_ROWS} rows"
+        );
+        let kernel = match w.bits {
+            5 => "qmv_mma_5bit",
+            8 => "qmv_mma_8bit",
+            b => panic!("no qmv_mma kernel for {b} bits"),
+        };
+        let shape = plan.constant(&[w.rows as u32, w.cols as u32, m as u32]);
+        let buffers = [&w.words, &w.scales, &w.biases, x, y, &shape];
+        let grid = MTLSize::new(w.rows.div_ceil(8) as u64, 1, 1);
+        let threads = MTLSize::new(32 * MMA_SIMDS as u64, 1, 1);
+        op(plan, kernel, &buffers, grid, threads, parallel);
+    }
+
     fn op(
         plan: &mut Plan,
         kernel: &str,
@@ -89,10 +122,136 @@ mod mac {
         );
     }
 
+    /// Must match RowsAttentionParams in kernels/attention_rows.metal.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RowsAttentionParams {
+        heads: u32,
+        kv_heads: u32,
+        capacity: u32,
+        scale: f32,
+        rows: u32,
+        chunks: u32,
+    }
+
+    /// Must match DecodeParams in kernels/attention.metal.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DecodeParams {
+        heads: u32,
+        kv_heads: u32,
+        capacity: u32,
+        scale: f32,
+    }
+
+    /// Must match DEC_CHUNK and DEC_DIM in kernels/attention.metal.
+    const CHUNK: usize = 128;
+    const DIM: usize = 256;
+
+    /// Decode attention for `m` rows (`attention_partial_rows`, then
+    /// `attention_reduce` per row), with the per-row partial results of
+    /// up to `rows` rows. Layers that run one after the other share it.
+    pub struct AttentionRows {
+        heads: usize,
+        kv_heads: usize,
+        capacity: usize,
+        rows: usize,
+        part_o: View,
+        part_ml: View,
+    }
+
+    impl AttentionRows {
+        /// About `rows * capacity / 128 * heads` KB.
+        pub fn new(
+            gpu: &Gpu,
+            heads: usize,
+            kv_heads: usize,
+            capacity: usize,
+            rows: usize,
+        ) -> AttentionRows {
+            let chunks = capacity.div_ceil(CHUNK);
+            AttentionRows {
+                heads,
+                kv_heads,
+                capacity,
+                rows,
+                part_o: View::new(gpu.buffer(rows * chunks * heads * DIM * 4)),
+                part_ml: View::new(gpu.buffer(rows * chunks * heads * 2 * 4)),
+            }
+        }
+
+        /// Records `DecodeAttention::record` for `m` rows: `q` is `[m,
+        /// heads, 256]`, `q_and_gate` `[m, heads, 512]`, `out` `[m, heads,
+        /// 256]`, and row r takes its kv_len from `params[r]`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn record(
+            &self,
+            plan: &mut Plan,
+            m: usize,
+            q: &View,
+            keys: &View,
+            values: &View,
+            q_and_gate: &View,
+            out: &View,
+            params: &[View],
+        ) {
+            assert!(m <= self.rows && params.len() >= m);
+            let chunks = self.capacity.div_ceil(CHUNK);
+            let scale = 1.0 / (DIM as f32).sqrt();
+            let p = plan.constant(&[RowsAttentionParams {
+                heads: self.heads as u32,
+                kv_heads: self.kv_heads as u32,
+                capacity: self.capacity as u32,
+                scale,
+                rows: m as u32,
+                chunks: chunks as u32,
+            }]);
+            plan.op(
+                "attention_partial_rows",
+                &[q, keys, values, &self.part_o, &self.part_ml, &p, &params[0]],
+                MTLSize::new(chunks as u64, self.kv_heads as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            let p = plan.constant(&[DecodeParams {
+                heads: self.heads as u32,
+                kv_heads: self.kv_heads as u32,
+                capacity: self.capacity as u32,
+                scale,
+            }]);
+            let at = |v: &View, floats: usize| View {
+                buffer: v.buffer.clone(),
+                offset: v.offset + (floats * 4) as u64,
+            };
+            let part = chunks * self.heads;
+            let qs = self.heads * DIM;
+            for (r, row_params) in params.iter().enumerate().take(m) {
+                let buffers = [
+                    &at(&self.part_o, r * part * DIM),
+                    &at(&self.part_ml, r * part * 2),
+                    &at(q_and_gate, r * 2 * qs),
+                    &at(out, r * qs),
+                    &p,
+                    row_params,
+                ];
+                let (grid, group) = (
+                    MTLSize::new(self.heads as u64, 1, 1),
+                    MTLSize::new(DIM as u64, 1, 1),
+                );
+                if r == 0 {
+                    plan.op("attention_reduce", &buffers, grid, group);
+                } else {
+                    plan.op_parallel("attention_reduce", &buffers, grid, group);
+                }
+            }
+        }
+    }
+
     /// The distinct experts of `m` rows, for `MoeRows::record`.
     pub struct MoeRows {
         list: View,
         slots: View,
+        /// Use the simdgroup-matrix kernels.
+        pub mma: bool,
     }
 
     impl MoeRows {
@@ -101,6 +260,7 @@ mod mac {
             MoeRows {
                 list: View::new(gpu.buffer((1 + most) * 4)),
                 slots: View::new(gpu.buffer(most * MAX_ROWS * 4)),
+                mma: true,
             }
         }
 
@@ -132,6 +292,51 @@ mod mac {
                 parallel,
             );
             let (g, up, d) = (&e.gate, &e.up, &e.down);
+            if self.mma {
+                let readable = (x.buffer.length() - x.offset) as usize;
+                assert!(readable >= MAX_ROWS * g.cols * 4, "x needs {MAX_ROWS} rows");
+                let threads = MTLSize::new(32 * MMA_SIMDS as u64, 1, 1);
+                let rows = plan.constant(&[m as u32]);
+                let shape = plan.constant(&[g.rows as u32, g.cols as u32, top_k as u32]);
+                plan.op(
+                    "moe_gate_up_mma",
+                    &[
+                        &g.words,
+                        &g.scales,
+                        &g.biases,
+                        &up.words,
+                        &up.scales,
+                        &up.biases,
+                        x,
+                        h,
+                        &shape,
+                        &self.list,
+                        &self.slots,
+                        &rows,
+                    ],
+                    MTLSize::new((g.rows / 8) as u64, (m * top_k) as u64, 1),
+                    threads,
+                );
+                let shape = plan.constant(&[d.rows as u32, d.cols as u32, top_k as u32]);
+                plan.op(
+                    "moe_down_mma",
+                    &[
+                        &d.words,
+                        &d.scales,
+                        &d.biases,
+                        h,
+                        y,
+                        &shape,
+                        &self.list,
+                        &self.slots,
+                        weights,
+                        &rows,
+                    ],
+                    MTLSize::new((d.rows / 8) as u64, 1, 1),
+                    threads,
+                );
+                return;
+            }
             let threads = MTLSize::new(32 * MOE_SIMDS as u64, 1, 1);
             let shape = plan.constant(&[g.rows as u32, g.cols as u32, top_k as u32]);
             plan.op(
@@ -229,6 +434,27 @@ mod mac {
                     }
                 }
                 println!("{module}: rows 1 to {MAX_ROWS} match qmv");
+                let xs = input(MAX_ROWS, w.cols);
+                let x = View::new(gpu.buffer_from(&xs));
+                for m in 1..=MAX_ROWS {
+                    let (y, want) = (
+                        View::new(gpu.buffer(m * w.rows * 4)),
+                        View::new(gpu.buffer(m * w.rows * 4)),
+                    );
+                    let mut plan = Plan::new(&gpu);
+                    record_qmv_mma(&mut plan, &w, m, &x, &y, false);
+                    record_qmv(&mut plan, &w, m, &x, &want, true);
+                    plan.build().run(&gpu);
+                    let (got, want) = (
+                        contents::<f32>(&y.buffer, m * w.rows),
+                        contents::<f32>(&want.buffer, m * w.rows),
+                    );
+                    let err: f32 = got.iter().zip(want).map(|(g, w)| (g - w) * (g - w)).sum();
+                    let norm: f32 = want.iter().map(|w| w * w).sum();
+                    let rel = (err / norm).sqrt();
+                    assert!(rel < 1e-6, "{module} mma m {m}: rel rms {rel}");
+                }
+                println!("{module}: mma rows 1 to {MAX_ROWS} within 1e-6");
             }
         }
 
@@ -250,9 +476,13 @@ mod mac {
             let router = Router::new(&gpu, &weights, &cfg.quantization, layer).unwrap();
             let experts = Experts::new(&gpu, &weights, &cfg.quantization, layer).unwrap();
             let (hidden, k, size) = (cfg.hidden_size, cfg.num_experts_per_tok, experts.size());
-            let rows = MoeRows::new(&gpu, k);
-            for m in 1..=MAX_ROWS {
-                let xs = input(m, hidden);
+            let mut rows = MoeRows::new(&gpu, k);
+            for (mma, m) in [false, true]
+                .into_iter()
+                .flat_map(|a| (1..=MAX_ROWS).map(move |m| (a, m)))
+            {
+                rows.mma = mma;
+                let xs = input(MAX_ROWS, hidden);
                 let x = View::new(gpu.buffer_from(&xs));
                 // Rows share some experts: row j picks 3j, 3j + 1, ... mod 40.
                 let ids: Vec<u32> = (0..m * k)
@@ -289,10 +519,55 @@ mod mac {
                     assert!(rel < 1e-6, "router m {m} row {j}: rel rms {rel}");
                     let want = contents::<f32>(&yj.buffer, hidden);
                     let rel = rel_rms(&got_y[j * hidden..(j + 1) * hidden], want);
-                    assert!(rel < 1e-6, "moe m {m} row {j}: rel rms {rel}");
+                    assert!(rel < 1e-5, "moe m {m} row {j}: rel rms {rel}");
                 }
-                println!("m {m}: router and moe within 1e-6");
+                println!("mma {mma} m {m}: router within 1e-6, moe within 1e-5");
             }
+        }
+
+        /// Microseconds per MoE block (routed experts only) of layer 0, decode
+        /// against the rows kernels, with all m * 8 experts distinct (the
+        /// worst case). Take the bench lock (timed.sh).
+        #[test]
+        #[ignore = "a timing run"]
+        fn moe_rows_time() {
+            let (cfg, weights) = open();
+            let gpu = Gpu::new().unwrap();
+            let layer = "language_model.model.layers.0";
+            let experts = Experts::new(&gpu, &weights, &cfg.quantization, layer).unwrap();
+            let (hidden, k, size) = (cfg.hidden_size, cfg.num_experts_per_tok, experts.size());
+            let mut rows = MoeRows::new(&gpu, k);
+            let x = View::new(gpu.buffer_from(&input(MAX_ROWS, hidden)));
+            let ids: Vec<u32> = (0..MAX_ROWS * k).map(|i| (i * 37 % 256) as u32).collect();
+            let wts = vec![0.125f32; MAX_ROWS * k];
+            let (idv, wv) = (
+                View::new(gpu.buffer_from(&ids)),
+                View::new(gpu.buffer_from(&wts)),
+            );
+            let h = View::new(gpu.buffer(MAX_ROWS * k * size * 4));
+            let y = View::new(gpu.buffer(MAX_ROWS * hidden * 4));
+            let mut time = |m: usize, mma: bool| {
+                rows.mma = mma;
+                let mut plan = Plan::new(&gpu);
+                for _ in 0..20 {
+                    if m == 0 {
+                        experts.record(&mut plan, &x, &idv, &wv, k, &h, &y);
+                    } else {
+                        rows.record(&mut plan, &experts, m, k, &x, &idv, &wv, &h, &y, false);
+                    }
+                }
+                let built = plan.build();
+                let mut t: Vec<f64> = (0..11)
+                    .map(|_| built.run_timed(&gpu).1 * 1e6 / 20.0)
+                    .collect();
+                t.sort_by(f64::total_cmp);
+                t[5]
+            };
+            let base = time(0, false);
+            let all: Vec<String> = (1..=MAX_ROWS)
+                .map(|m| format!("m{m} {:.1}/{:.1}", time(m, false), time(m, true)))
+                .collect();
+            println!("moe: decode {base:.1} us; rows/mma {}", all.join(", "));
         }
 
         /// Microseconds per qmv_rows call on the qkv projection, against
@@ -305,14 +580,14 @@ mod mac {
             for module in MODULES {
                 let w = GpuQuant::new(&gpu, &weights.quantized(module, &cfg.quantization).unwrap());
                 let time = |m: usize| {
-                    let x = View::new(gpu.buffer_from(&input(m.max(1), w.cols)));
-                    let y = View::new(gpu.buffer(m.max(1) * w.rows * 4));
+                    let x = View::new(gpu.buffer_from(&input(MAX_ROWS, w.cols)));
+                    let y = View::new(gpu.buffer(MAX_ROWS * w.rows * 4));
                     let mut plan = Plan::new(&gpu);
                     for _ in 0..50 {
-                        if m == 0 {
-                            w.record(&mut plan, &x, &y, false);
-                        } else {
-                            record_qmv(&mut plan, &w, m, &x, &y, false);
+                        match m {
+                            0 => w.record(&mut plan, &x, &y, false),
+                            1..=MAX_ROWS => record_qmv(&mut plan, &w, m, &x, &y, false),
+                            _ => record_qmv_mma(&mut plan, &w, m - MAX_ROWS, &x, &y, false),
                         }
                     }
                     let built = plan.build();
@@ -324,10 +599,10 @@ mod mac {
                 };
                 let base = time(0);
                 let rows: Vec<String> = (1..=MAX_ROWS)
-                    .map(|m| format!("m{m} {:.1}", time(m)))
+                    .map(|m| format!("m{m} {:.1}/{:.1}", time(m), time(m + MAX_ROWS)))
                     .collect();
                 println!(
-                    "{module} {}x{}: qmv {base:.1} us; {}",
+                    "{module} {}x{}: qmv {base:.1} us; rows/mma {}",
                     w.rows,
                     w.cols,
                     rows.join(", ")

@@ -1,0 +1,145 @@
+// Split-K decode attention for m rows at once (the speculative verify),
+// with the layout of attention.metal: one threadgroup per (128-token chunk,
+// kv head), and part_o / part_ml per row as attention_partial writes them,
+// so attention_reduce merges each row. Row r is at position pos + r and sees
+// kv_len = pos + r + 1 tokens. The chunk's keys and values are read once
+// for up to ROWS_PASS rows: scores S^T = K Q^T and O = P V in 8x8
+// simdgroup matrices. More rows take more passes.
+//
+// The cache is f32 like attention.metal's, with room for whole chunks
+// (GpuKvCache rounds it up), so a chunk never reaches past it.
+
+constant uint ROWS_PASS = 4;
+
+struct RowsAttentionParams {
+    uint heads;
+    uint kv_heads;
+    uint capacity;
+    float scale;
+    uint rows;    // m
+    uint chunks;  // per row in part_o and part_ml
+};
+
+kernel void attention_partial_rows(device const float *q [[buffer(0)]],
+                                   device const float *keys [[buffer(1)]],
+                                   device const float *values [[buffer(2)]],
+                                   device float *part_o [[buffer(3)]],
+                                   device float *part_ml [[buffer(4)]],
+                                   constant RowsAttentionParams &p [[buffer(5)]],
+                                   constant TokenParams &tp [[buffer(6)]],
+                                   uint2 tg [[threadgroup_position_in_grid]],
+                                   uint simd [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    // Scores of the pass's rows: sc[r * 8 + g][t].
+    threadgroup float sc[ROWS_PASS * DEC_GROUP][DEC_CHUNK];
+    uint pos = tp.position;
+    uint start = tg.x * DEC_CHUNK;
+    uint last_len = min(pos + p.rows, p.capacity);
+    if (start >= last_len) {
+        return;
+    }
+    uint kv = tg.y;
+    uint stride = p.kv_heads * DEC_DIM;
+    uint chunks = p.chunks;
+    uint qid = lane / 4;
+    uint fm = (qid & 4) + (lane / 2) % 4;
+    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+
+    for (uint r0 = 0; r0 < p.rows; r0 += ROWS_PASS) {
+        uint rows = min(ROWS_PASS, p.rows - r0);
+
+        // Scores: simdgroup s takes tokens 16s .. 16s + 15, two tiles of 8,
+        // for all rows of the pass.
+        {
+            device const float *k = keys + (start + 16 * simd) * stride + kv * DEC_DIM;
+            simdgroup_float8x8 s[ROWS_PASS][2];
+            for (uint r = 0; r < ROWS_PASS; r++) {
+                s[r][0] = simdgroup_float8x8(0);
+                s[r][1] = simdgroup_float8x8(0);
+            }
+            for (uint d = 0; d < DEC_DIM; d += 8) {
+                simdgroup_float8x8 k0, k1;
+                simdgroup_load(k0, k + d, stride);
+                simdgroup_load(k1, k + 8 * stride + d, stride);
+                for (uint r = 0; r < rows; r++) {
+                    device const float *qr =
+                        q + ((r0 + r) * p.heads + kv * DEC_GROUP) * DEC_DIM + d;
+                    simdgroup_float8x8 qt;
+                    simdgroup_load(qt, qr, DEC_DIM, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(s[r][0], k0, qt, s[r][0]);
+                    simdgroup_multiply_accumulate(s[r][1], k1, qt, s[r][1]);
+                }
+            }
+            for (uint r = 0; r < rows; r++) {
+                // s[r][i] is S^T: (token, head); store as (head, token).
+                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
+                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Softmax pieces: simdgroup g takes query head g of each row.
+        for (uint r = 0; r < rows; r++) {
+            uint g = simd;
+            uint row = r0 + r;
+            uint len = min(pos + row + 1, p.capacity);
+            uint n = start < len ? min(DEC_CHUNK, len - start) : 0;
+            threadgroup float *sr = sc[r * DEC_GROUP + g];
+            float m = -INFINITY;
+            for (uint t = lane; t < n; t += 32) {
+                m = max(m, sr[t] * p.scale);
+            }
+            m = simd_max(m);
+            float l = 0;
+            for (uint t = lane; t < DEC_CHUNK; t += 32) {
+                float e = t < n ? exp(sr[t] * p.scale - m) : 0;
+                sr[t] = e;
+                l += e;
+            }
+            l = simd_sum(l);
+            if (lane == 0 && n > 0) {
+                uint i = (row * chunks + tg.x) * p.heads + kv * DEC_GROUP + g;
+                part_ml[2 * i] = m;
+                part_ml[2 * i + 1] = l;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Values: simdgroup s takes dims 32s .. 32s + 31, four tiles of 8,
+        // for all rows of the pass.
+        {
+            device const float *v = values + start * stride + kv * DEC_DIM + 32 * simd;
+            simdgroup_float8x8 o[ROWS_PASS][4];
+            for (uint r = 0; r < ROWS_PASS; r++) {
+                for (uint i = 0; i < 4; i++) {
+                    o[r][i] = simdgroup_float8x8(0);
+                }
+            }
+            for (uint t = 0; t < DEC_CHUNK; t += 8) {
+                simdgroup_float8x8 vt[4];
+                for (uint i = 0; i < 4; i++) {
+                    simdgroup_load(vt[i], v + t * stride + 8 * i, stride);
+                }
+                for (uint r = 0; r < rows; r++) {
+                    simdgroup_float8x8 pt;
+                    simdgroup_load(pt, &sc[r * DEC_GROUP][t], DEC_CHUNK);
+                    for (uint i = 0; i < 4; i++) {
+                        simdgroup_multiply_accumulate(o[r][i], pt, vt[i], o[r][i]);
+                    }
+                }
+            }
+            for (uint r = 0; r < rows; r++) {
+                uint row = r0 + r;
+                if (start >= min(pos + row + 1, p.capacity)) {
+                    continue;
+                }
+                device float *out =
+                    part_o + ((row * chunks + tg.x) * p.heads + kv * DEC_GROUP) * DEC_DIM + 32 * simd;
+                for (uint i = 0; i < 4; i++) {
+                    simdgroup_store(o[r][i], out + 8 * i, DEC_DIM);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

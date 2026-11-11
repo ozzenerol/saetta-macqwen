@@ -54,7 +54,7 @@ mod mac {
     }
 
     impl RowsScratch {
-        fn new(gpu: &Gpu, cfg: &Config) -> RowsScratch {
+        fn new(gpu: &Gpu, cfg: &Config, capacity: usize, rows: usize) -> RowsScratch {
             let m = MAX_ROWS;
             let (h, k) = (cfg.hidden_size, cfg.num_experts_per_tok);
             let shared = cfg.shared_expert_intermediate_size;
@@ -73,7 +73,7 @@ mod mac {
                 routed: view(gpu, m * h),
                 moe: MoeRows::new(gpu, k),
                 deltanet: DeltaNetRowsScratch::new(gpu, cfg),
-                attention: AttentionRowsScratch::new(gpu, cfg),
+                attention: AttentionRowsScratch::new(gpu, cfg, capacity, rows),
             }
         }
     }
@@ -197,7 +197,7 @@ mod mac {
             let (gpu, cfg) = (self.gpu, self.cfg);
             let h = cfg.hidden_size;
             let vocab = self.lm_head.rows;
-            let s = RowsScratch::new(gpu, cfg);
+            let s = RowsScratch::new(gpu, cfg, self.capacity, rows);
             let x = view(gpu, MAX_ROWS * h);
             let final_hidden = view(gpu, MAX_ROWS * h);
             let logits = view(gpu, MAX_ROWS * vocab);
@@ -353,7 +353,8 @@ mod mac {
 
         const MODEL_DIR: &str = "llm/saetta-models/Qwen3.6-35B-A3B-5bit";
         const PROMPT: [u32; 5] = [9707, 11, 1879, 0, 198];
-        const DRAFT: [u32; 4] = [3838, 374, 279, 6722];
+        /// Six rows take two passes of attention_partial_rows.
+        const DRAFT: [u32; 6] = [3838, 374, 279, 6722, 315, 1879];
 
         fn rel_rms(got: &[f32], want: &[f32]) -> f32 {
             let err: f32 = got.iter().zip(want).map(|(g, w)| (g - w) * (g - w)).sum();
@@ -384,7 +385,7 @@ mod mac {
             plan.set_params(TokenParams::new(DRAFT[0], 0));
             plan.build().run(&gpu);
 
-            let s = RowsScratch::new(&gpu, &cfg);
+            let s = RowsScratch::new(&gpu, &cfg, 64, 1);
             let x = view(&gpu, MAX_ROWS * h);
             let params = View::new(gpu.buffer_from(&[TokenParams::new(DRAFT[0], 0)]));
             let rout = view(&gpu, MAX_ROWS * h);
@@ -433,7 +434,7 @@ mod mac {
         }
 
         /// SAETTA_LAYERS layers (default 4; 40 needs timed.sh): after a
-        /// prompt, a verify of 4 tokens gives the logits of decoding them
+        /// prompt, a verify of 6 tokens gives the logits of decoding them
         /// one by one, and `accept` of each count leaves the model where
         /// decoding that many would.
         #[test]
@@ -445,12 +446,16 @@ mod mac {
             let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
             let (cfg, weights) = (Config::load(&dir).unwrap(), Weights::open(&dir).unwrap());
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load(&gpu, &cfg, &weights, layers, 64).unwrap();
+            let mut model = GpuModel::load(&gpu, &cfg, &weights, layers, 512).unwrap();
             model.enable_verify(DRAFT.len());
 
+            // 300 tokens, so the rows' keys cross a chunk boundary.
+            let long: Vec<u32> = (0..300)
+                .map(|i| PROMPT[i % PROMPT.len()] + i as u32)
+                .collect();
             let prompt = |model: &mut GpuModel| {
                 model.reset();
-                for &t in &PROMPT {
+                for &t in &long {
                     model.run(t);
                 }
             };
@@ -471,7 +476,7 @@ mod mac {
                     }
                 }
                 model.accept(n);
-                assert_eq!(model.position(), PROMPT.len() + n);
+                assert_eq!(model.position(), long.len() + n);
                 // Decoding on from the accepted rows matches decoding them.
                 for &t in &DRAFT[n..] {
                     model.run(t);
