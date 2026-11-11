@@ -90,8 +90,8 @@ mod mac {
             Norm::rows(1, hidden, eps, &pre_hidden).record(&mut plan, &input, &cat_hidden, true);
             Norm::rows(1, hidden, eps, &pre_embedding).record(&mut plan, &cat, &cat, false);
             fc.record(&mut plan, &cat, &x, false);
-            layer.record(&mut plan, cfg, &x, &scratch);
-            Norm::rows(1, hidden, eps, &norm).record(&mut plan, &x, &output, false);
+            layer.record_input_norm(&mut plan, cfg, &x, &scratch);
+            layer.record(&mut plan, cfg, &x, &scratch, &norm, &output);
             lm_head.record(&mut plan, &output, &logits, false);
             record_argmax(&mut plan, &logits, lm_head.rows, &token);
             let built = plan.build();

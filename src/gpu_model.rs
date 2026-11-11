@@ -14,7 +14,9 @@ pub use mac::*;
 mod mac {
     use crate::config::{Config, LayerType};
     use crate::gpu::{Gpu, contents};
-    use crate::gpu_layers::{GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm};
+    use crate::gpu_layers::{
+        GpuAttention, GpuDeltaNet, GpuDeltaNetState, GpuKvCache, Norm, add_norm, mix_norm,
+    };
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
@@ -170,11 +172,18 @@ mod mac {
             })
         }
 
-        /// `x += moe(post_norm(x))`.
-        fn record(&self, plan: &mut Plan, cfg: &Config, x: &View, s: &MoeScratch) {
+        /// `x += moe(normed)`, where `s.normed` already holds
+        /// `post_norm(x)`; then `next_out = rms_norm(x) * next_norm`.
+        fn record(
+            &self,
+            plan: &mut Plan,
+            cfg: &Config,
+            x: &View,
+            s: &MoeScratch,
+            next_norm: &View,
+            next_out: &View,
+        ) {
             let hidden = cfg.hidden_size;
-            Norm::rows(1, hidden, cfg.rms_norm_eps, &self.post_norm)
-                .record(plan, x, &s.normed, false);
             self.router.record(plan, &s.normed, &s.router, false);
             self.shared_gate
                 .record(plan, &s.normed, &s.shared_gate, true);
@@ -204,12 +213,18 @@ mod mac {
                 &s.experts_h,
                 &s.routed,
             );
-            elementwise(
+            mix_norm(
                 plan,
-                "moe_mix",
-                &[x, &s.shared_logit, &s.shared, &s.routed],
+                [
+                    x,
+                    &s.shared_logit,
+                    &s.shared,
+                    &s.routed,
+                    next_norm,
+                    next_out,
+                ],
                 hidden,
-                false,
+                cfg.rms_norm_eps,
             );
         }
     }
@@ -255,16 +270,47 @@ mod mac {
             })
         }
 
-        /// `x += mixer(norm(x))`, then `x += moe(norm(x))`.
-        pub(crate) fn record(&self, plan: &mut Plan, cfg: &Config, x: &View, s: &Scratch) {
+        /// Records `s.normed = input_norm(x)`, which `record` expects. Only
+        /// the first layer needs it; each layer writes the next one's.
+        pub(crate) fn record_input_norm(
+            &self,
+            plan: &mut Plan,
+            cfg: &Config,
+            x: &View,
+            s: &Scratch,
+        ) {
             Norm::rows(1, cfg.hidden_size, cfg.rms_norm_eps, &self.input_norm)
                 .record(plan, x, &s.normed, false);
+        }
+
+        pub(crate) fn input_norm(&self) -> &View {
+            &self.input_norm
+        }
+
+        /// `x += mixer(s.normed)`, then `x += moe(post_norm(x))`, then
+        /// `next_out = rms_norm(x) * next_norm`: the next layer's input norm
+        /// into `s.normed`, or the final norm. `s.normed` must hold
+        /// `input_norm(x)` (`record_input_norm`, or the layer before).
+        pub(crate) fn record(
+            &self,
+            plan: &mut Plan,
+            cfg: &Config,
+            x: &View,
+            s: &Scratch,
+            next_norm: &View,
+            next_out: &View,
+        ) {
             match &self.mixer {
                 Mixer::Linear(m, state) => m.record(plan, &s.normed, &s.mixed, state),
                 Mixer::Full(m, cache) => m.record(plan, &s.normed, &s.mixed, cache),
             }
-            elementwise(plan, "add_into", &[x, &s.mixed], cfg.hidden_size, false);
-            self.moe.record(plan, cfg, x, &s.moe);
+            add_norm(
+                plan,
+                [x, &s.mixed, &self.moe.post_norm, &s.moe.normed],
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            );
+            self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
         }
 
         /// Clears a DeltaNet state; an attention cache needs no clearing.
@@ -356,15 +402,14 @@ mod mac {
 
             let mut plan = Plan::new(gpu);
             record_embed(&mut plan, &embed, &x);
-            for layer in &loaded {
-                layer.record(&mut plan, cfg, &x, &scratch);
+            loaded[0].record_input_norm(&mut plan, cfg, &x, &scratch);
+            for (l, layer) in loaded.iter().enumerate() {
+                let (next_norm, next_out) = match loaded.get(l + 1) {
+                    Some(next) => (next.input_norm(), &scratch.normed),
+                    None => (&final_norm, &final_hidden),
+                };
+                layer.record(&mut plan, cfg, &x, &scratch, next_norm, next_out);
             }
-            Norm::rows(1, hidden, cfg.rms_norm_eps, &final_norm).record(
-                &mut plan,
-                &x,
-                &final_hidden,
-                false,
-            );
             lm_head.record(&mut plan, &final_hidden, &logits, false);
             let built = plan.build();
 
