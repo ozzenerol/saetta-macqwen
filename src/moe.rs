@@ -168,11 +168,33 @@ mod mac {
             count: usize,
             y: &View,
         ) {
+            self.record_down_mode(plan, h, ids, weights, count, y, None);
+        }
+
+        /// `record_down`, or with `acc = Some(extra)`: y += the experts'
+        /// sum + extra, as a residual add.
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_down_mode(
+            &self,
+            plan: &mut Plan,
+            h: &View,
+            ids: &View,
+            weights: &View,
+            count: usize,
+            y: &View,
+            acc: Option<&View>,
+        ) {
             let d = &self.down;
             let shape = plan.constant(&[d.rows as u32, d.cols as u32, count as u32]);
+            let (kernel, extra) = match acc {
+                Some(extra) => ("moe_down_acc_5bit", extra),
+                None => ("moe_down_5bit", weights),
+            };
             plan.op(
-                "moe_down_5bit",
-                &[&d.words, &d.scales, &d.biases, h, y, &shape, ids, weights],
+                kernel,
+                &[
+                    &d.words, &d.scales, &d.biases, h, y, &shape, ids, weights, extra,
+                ],
                 MTLSize::new(row_groups(d.rows), 1, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),
             );

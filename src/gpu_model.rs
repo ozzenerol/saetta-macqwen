@@ -188,16 +188,17 @@ mod mac {
             })
         }
 
-        /// `x += moe(normed)`, where `s.normed` already holds
-        /// `post_norm(x)`; then `next_out = rms_norm(x) * next_norm`.
+        /// `x += moe(post_norm(x))`. With `next = Some((next_norm,
+        /// next_out))`, mix_norm adds the experts into x and writes
+        /// `next_out = rms_norm(x) * next_norm`. With None, the down ops add
+        /// into x themselves and the next norm is left to its consumers.
         fn record(
             &self,
             plan: &mut Plan,
             cfg: &Config,
             x: &View,
             s: &MoeScratch,
-            next_norm: &View,
-            next_out: &View,
+            next: Option<(&View, &View)>,
         ) {
             let hidden = cfg.hidden_size;
             // The post-attention norm is folded into the four ops that read
@@ -220,19 +221,38 @@ mod mac {
                 &s.ids,
                 &s.weights,
             );
-            elementwise(
-                plan,
-                "silu_mul",
-                &[&s.shared_gate, &s.shared_up, &s.shared_h],
-                self.shared_gate.rows,
-                true,
-            );
+            let shared_rows = self.shared_gate.rows;
+            let (gate, up, h) = (&s.shared_gate, &s.shared_up, &s.shared_h);
+            match next {
+                Some(_) => elementwise(plan, "silu_mul", &[gate, up, h], shared_rows, true),
+                // The shared expert's sigmoid gate goes in here, as the
+                // down projection after it is linear.
+                None => elementwise(
+                    plan,
+                    "silu_mul_gate",
+                    &[gate, up, h, &s.shared_logit],
+                    shared_rows,
+                    true,
+                ),
+            }
             // The barrier before shared_down also covers route_top_k, so the
             // routed experts' first op can run alongside it.
             self.shared_down.record(plan, &s.shared_h, &s.shared, false);
             let k = cfg.num_experts_per_tok;
             self.experts
                 .record_gate_up_norm(plan, x, Some(norm), &s.ids, k, &s.experts_h, true);
+            let Some((next_norm, next_out)) = next else {
+                self.experts.record_down_mode(
+                    plan,
+                    &s.experts_h,
+                    &s.ids,
+                    &s.weights,
+                    k,
+                    x,
+                    Some(&s.shared),
+                );
+                return;
+            };
             self.experts
                 .record_down(plan, &s.experts_h, &s.ids, &s.weights, k, &s.routed);
             mix_norm(
@@ -305,10 +325,6 @@ mod mac {
                 .record(plan, x, &s.normed, false);
         }
 
-        pub(crate) fn input_norm(&self) -> &View {
-            &self.input_norm
-        }
-
         /// `x += mixer(s.normed)`, then `x += moe(post_norm(x))`, then
         /// `next_out = rms_norm(x) * next_norm`: the next layer's input norm
         /// into `s.normed`, or the final norm. `s.normed` must hold
@@ -323,11 +339,29 @@ mod mac {
             next_out: &View,
         ) {
             // The output projection adds into the residual x.
+            let (input, output) = (Mode::Plain, Mode::Acc);
             match &self.mixer {
-                Mixer::Linear(m, state) => m.record_mode(plan, &s.normed, x, state, Mode::Acc),
-                Mixer::Full(m, cache) => m.record_mode(plan, &s.normed, x, cache, Mode::Acc),
+                Mixer::Linear(m, state) => m.record_mode(plan, &s.normed, x, state, input, output),
+                Mixer::Full(m, cache) => m.record_mode(plan, &s.normed, x, cache, input, output),
             }
-            self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
+            self.moe
+                .record(plan, cfg, x, &s.moe, Some((next_norm, next_out)));
+        }
+
+        /// `record` with every norm folded into the ops that read it: x is
+        /// the residual before the layer and after it; nothing reads or
+        /// writes `s.normed`.
+        pub(crate) fn record_fold(&self, plan: &mut Plan, cfg: &Config, x: &View, s: &Scratch) {
+            let norm = FoldNorm {
+                weight: &self.input_norm,
+                eps: cfg.rms_norm_eps,
+            };
+            let (input, output) = (Mode::Norm(norm), Mode::Acc);
+            match &self.mixer {
+                Mixer::Linear(m, state) => m.record_mode(plan, x, x, state, input, output),
+                Mixer::Full(m, cache) => m.record_mode(plan, x, x, cache, input, output),
+            }
+            self.moe.record(plan, cfg, x, &s.moe, None);
         }
 
         /// Clears a DeltaNet state; an attention cache needs no clearing.
@@ -437,14 +471,15 @@ mod mac {
 
             let mut plan = Plan::new(gpu);
             record_embed(&mut plan, &embed, &x);
-            loaded[0].record_input_norm(&mut plan, cfg, &x, &scratch);
-            for (l, layer) in loaded.iter().enumerate() {
-                let (next_norm, next_out) = match loaded.get(l + 1) {
-                    Some(next) => (next.input_norm(), &scratch.normed),
-                    None => (&final_norm, &final_hidden),
-                };
-                layer.record(&mut plan, cfg, &x, &scratch, next_norm, next_out);
+            for layer in &loaded {
+                layer.record_fold(&mut plan, cfg, &x, &scratch);
             }
+            Norm::rows(1, hidden, cfg.rms_norm_eps, &final_norm).record(
+                &mut plan,
+                &x,
+                &final_hidden,
+                false,
+            );
             lm_head.record(&mut plan, &final_hidden, &logits, false);
             let sampler = GpuSampler::new(gpu);
             sampler.record(&mut plan, &logits);

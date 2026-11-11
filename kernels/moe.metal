@@ -66,10 +66,12 @@ kernel void moe_gate_up(device const uint *gate_w [[buffer(0)]],
     }
 }
 
+// ACC: y += the sum + extra, where extra (buffer 8) is the gated shared
+// expert's output; each simdgroup owns its rows, so the add is race-free.
 // h has count * cols values. The lanes walk the 32-value chunks of all
 // slots together, so a short row (cols 512 is 16 chunks) still keeps all 32
 // lanes busy, and the simd_sum adds up the slots as well as the chunks.
-template <uint BITS>
+template <uint BITS, bool ACC>
 kernel void moe_down(device const uint *words [[buffer(0)]],
                      device const ushort *scales [[buffer(1)]],
                      device const ushort *biases [[buffer(2)]],
@@ -78,6 +80,7 @@ kernel void moe_down(device const uint *words [[buffer(0)]],
                      constant MoeShape &shape [[buffer(5)]],
                      device const uint *ids [[buffer(6)]],
                      device const float *weights [[buffer(7)]],
+                     device const float *extra [[buffer(8)]],
                      uint tg [[threadgroup_position_in_grid]],
                      uint simd [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]]) {
@@ -105,11 +108,13 @@ kernel void moe_down(device const uint *words [[buffer(0)]],
     for (uint r = 0; r < MOE_ROWS; r++) {
         float sum = simd_sum(acc[r]);
         if (lane == 0) {
-            y[row0 + r] = sum;
+            uint row = row0 + r;
+            y[row] = ACC ? y[row] + sum + extra[row] : sum;
         }
     }
 }
 
 template [[host_name("moe_gate_up_5bit")]] kernel decltype(moe_gate_up<5, false>) moe_gate_up<5, false>;
 template [[host_name("moe_gate_up_norm_5bit")]] kernel decltype(moe_gate_up<5, true>) moe_gate_up<5, true>;
-template [[host_name("moe_down_5bit")]] kernel decltype(moe_down<5>) moe_down<5>;
+template [[host_name("moe_down_5bit")]] kernel decltype(moe_down<5, false>) moe_down<5, false>;
+template [[host_name("moe_down_acc_5bit")]] kernel decltype(moe_down<5, true>) moe_down<5, true>;

@@ -116,6 +116,20 @@ kernel void rope(device float *x [[buffer(0)]],
     h[i + p.half_dims] = a * s + b * c;
 }
 
+// out = silu(gate) * up * sigmoid(logit[0]): the shared expert's SwiGLU
+// with its gate folded in, since down_proj is linear.
+kernel void silu_mul_gate(device const float *gate [[buffer(0)]],
+                          device const float *up [[buffer(1)]],
+                          device float *out [[buffer(2)]],
+                          device const float *logit [[buffer(3)]],
+                          constant uint &n [[buffer(4)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i < n) {
+        float g = gate[i];
+        out[i] = g * sigmoid(g) * up[i] * sigmoid(logit[0]);
+    }
+}
+
 // ---- Fused kernels for decode: each replaces several ops and their
 // barriers. Same arithmetic as the separate kernels above.
 

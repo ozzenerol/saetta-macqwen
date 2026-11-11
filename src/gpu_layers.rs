@@ -255,27 +255,29 @@ mod mac {
         /// layer output, and the token's key and value go into `cache` at
         /// its position.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, cache: &GpuKvCache) {
-            self.record_mode(plan, x, out, cache, Mode::Plain);
+            self.record_mode(plan, x, out, cache, Mode::Plain, Mode::Plain);
         }
 
-        /// `record` with `mode` on the output projection: `Mode::Acc` adds
-        /// the layer output to `out` (the residual).
+        /// `record` with `input` on the input projections (`Mode::Norm`
+        /// folds the layer's input norm, x is then the residual) and `output`
+        /// on the output projection (`Mode::Acc` adds into `out`).
         pub fn record_mode(
             &self,
             plan: &mut Plan,
             x: &View,
             out: &View,
             cache: &GpuKvCache,
-            mode: Mode,
+            input: Mode,
+            output: Mode,
         ) {
             let c = &self.cfg;
             let d = c.head_dim;
             let [q_and_gate, q, k, v, attn] =
                 [&self.q_and_gate, &self.q, &self.k, &self.v, &self.out].map(whole);
 
-            self.q_proj.record(plan, x, &q_and_gate, false);
-            self.k_proj.record(plan, x, &k, true);
-            self.v_proj.record(plan, x, &v, true);
+            self.q_proj.record_mode(plan, x, &q_and_gate, false, input);
+            self.k_proj.record_mode(plan, x, &k, true, input);
+            self.v_proj.record_mode(plan, x, &v, true, input);
 
             let (keys, values) = (whole(&cache.keys), whole(&cache.values));
             let p = plan.constant(&[PrepParams {
@@ -309,7 +311,7 @@ mod mac {
                 .decode
                 .record(plan, &q, &keys, &values, &q_and_gate, &attn);
 
-            self.o_proj.record_mode(plan, &attn, out, false, mode);
+            self.o_proj.record_mode(plan, &attn, out, false, output);
         }
     }
 
@@ -517,10 +519,10 @@ mod mac {
         /// Records one token: `x` is the normed hidden state, `out` gets the
         /// layer output, `state` is updated.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, state: &GpuDeltaNetState) {
-            self.record_mode(plan, x, out, state, Mode::Plain);
+            self.record_mode(plan, x, out, state, Mode::Plain, Mode::Plain);
         }
 
-        /// `record` with `mode` on the output projection, as
+        /// `record` with modes on the input and output projections, as
         /// `GpuAttention::record_mode`.
         pub fn record_mode(
             &self,
@@ -528,7 +530,8 @@ mod mac {
             x: &View,
             out: &View,
             state: &GpuDeltaNetState,
-            mode: Mode,
+            input: Mode,
+            output: Mode,
         ) {
             let c = &self.cfg;
             let key_size = c.k_heads * c.k_dim;
@@ -536,10 +539,10 @@ mod mac {
             let [qkv, mixed, z, a, b, y] =
                 [&self.qkv, &self.mixed, &self.z, &self.a, &self.b, &self.y].map(whole);
 
-            self.in_proj_qkv.record(plan, x, &qkv, false);
-            self.in_proj_z.record(plan, x, &z, true);
-            self.in_proj_b.record(plan, x, &b, true);
-            self.in_proj_a.record(plan, x, &a, true);
+            self.in_proj_qkv.record_mode(plan, x, &qkv, false, input);
+            self.in_proj_z.record_mode(plan, x, &z, true, input);
+            self.in_proj_b.record_mode(plan, x, &b, true, input);
+            self.in_proj_a.record_mode(plan, x, &a, true, input);
 
             let p = plan.constant(&[ConvParams {
                 channels: channels as u32,
@@ -583,7 +586,7 @@ mod mac {
                 size(1024, 1),
             );
 
-            self.out_proj.record_mode(plan, &y, out, false, mode);
+            self.out_proj.record_mode(plan, &y, out, false, output);
         }
 
         /// Records `m` tokens one after the other, as `m` calls of `record`
