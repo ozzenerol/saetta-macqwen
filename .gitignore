@@ -2,3 +2,4 @@
 /golden
 *.bin
 __pycache__/
+.commit
