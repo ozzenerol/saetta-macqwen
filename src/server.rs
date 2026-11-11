@@ -36,6 +36,10 @@ pub trait Model: Send {
         let logits = self.step(pending);
         (Vec::new(), decide.pick(&logits))
     }
+    /// Tokens the state can hold: the prompt and the answer together.
+    fn capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 pub struct Settings {
@@ -55,6 +59,8 @@ pub struct Server<M: Model> {
     settings: Settings,
     special: Special,
     requests: AtomicU64,
+    /// `Model::capacity`, read once.
+    capacity: usize,
 }
 
 struct Engine<M> {
@@ -87,7 +93,9 @@ impl<M: Model + 'static> Server<M> {
             tool_start: id("<tool_call>")?,
             tool_end: id("</tool_call>")?,
         };
+        let capacity = model.capacity();
         Ok(Server {
+            capacity,
             engine: Mutex::new(Engine {
                 model,
                 tokens: Vec::new(),
@@ -143,6 +151,14 @@ impl<M: Model + 'static> Server<M> {
             Ok(r) => r,
             Err(e) => return send_error(out, 400, &e),
         };
+        if request.prompt.len() >= self.capacity {
+            let e = format!(
+                "the prompt is {} tokens, and the model's context holds {}",
+                request.prompt.len(),
+                self.capacity
+            );
+            return send_error(out, 400, &e);
+        }
         let id = request.id.clone();
         let model = self.settings.model_name.as_str();
         let created = now();
@@ -279,6 +295,16 @@ impl<M: Model + 'static> Server<M> {
             "render"
         };
         let prompt = spliced.unwrap_or_else(|| r.prompt.clone());
+        if prompt.len() >= self.capacity {
+            // Only a spliced prompt can get here; `chat` checks the rendered one.
+            return Done {
+                prompt_tokens: prompt.len(),
+                cached_tokens: 0,
+                completion_tokens: 0,
+                hit_limit: true,
+                tool_calls: 0,
+            };
+        }
         let (logits, cached) = engine.start(&prompt);
         eprintln!(
             "{}",
@@ -307,7 +333,9 @@ impl<M: Model + 'static> Server<M> {
 
         // Emits one decided token; false when generation ends here.
         let mut take = |token: u32, done: &mut Done| -> Take {
-            if done.completion_tokens == r.max_tokens {
+            // The token taken now is run next, so it must fit in the state.
+            let full = prompt.len() + done.completion_tokens >= self.capacity;
+            if done.completion_tokens == r.max_tokens || full {
                 done.hit_limit = true;
                 return Take::Stop;
             }
