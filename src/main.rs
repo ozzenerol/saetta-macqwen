@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk]";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -41,6 +41,10 @@ fn main() -> ExitCode {
         ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
+        #[cfg(target_os = "macos")]
+        ["bench-attention"] => {
+            report(saetta::attention::bench(&[1024, 8192, 16384, 32768], 10, 5).map_err(Into::into))
+        }
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
