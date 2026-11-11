@@ -20,14 +20,6 @@ mod mac {
     use crate::weights::Weights;
     use metal::{Buffer, MTLSize};
 
-    /// A view `floats` values into `buffer`.
-    fn at(buffer: &Buffer, floats: usize) -> View {
-        View {
-            buffer: buffer.clone(),
-            offset: (floats * 4) as u64,
-        }
-    }
-
     fn whole(buffer: &Buffer) -> View {
         View::new(buffer.clone())
     }
@@ -292,17 +284,11 @@ mod mac {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct ConvParams {
-        channels: u32,
-        kernel_size: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
     struct StepParams {
         k_heads: u32,
         v_heads: u32,
         v_dim: u32,
+        kernel_size: u32,
         eps: f32,
     }
 
@@ -320,7 +306,6 @@ mod mac {
         dt_bias: View,
         norm: View,
         qkv: Buffer,
-        mixed: Buffer,
         z: Buffer,
         a: Buffer,
         b: Buffer,
@@ -335,8 +320,11 @@ mod mac {
             prefix: &str,
         ) -> Result<GpuDeltaNet<'a>, String> {
             let c = deltanet_config(cfg);
-            if c.k_dim != 128 || c.v_dim > 256 {
-                return Err("deltanet_step is written for k_dim 128 and v_dim up to 256".into());
+            if c.k_dim != 128 || c.v_dim != 128 || c.v_heads != 2 * c.k_heads {
+                return Err(
+                    "deltanet_step is written for k_dim and v_dim 128, two value heads per key head"
+                        .into(),
+                );
             }
             let p = format!("{prefix}.linear_attn");
             let channels = 2 * c.k_heads * c.k_dim + c.v_heads * c.v_dim;
@@ -354,7 +342,6 @@ mod mac {
                 dt_bias: v("dt_bias")?,
                 norm: v("norm.weight")?,
                 qkv: gpu.buffer(channels * 4),
-                mixed: gpu.buffer(channels * 4),
                 z: gpu.buffer(values * 4),
                 a: gpu.buffer(c.v_heads * 4),
                 b: gpu.buffer(c.v_heads * 4),
@@ -367,44 +354,26 @@ mod mac {
         /// layer output, `state` is updated.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, state: &GpuDeltaNetState) {
             let c = &self.cfg;
-            let key_size = c.k_heads * c.k_dim;
-            let channels = 2 * key_size + c.v_heads * c.v_dim;
-            let [qkv, mixed, z, a, b, y] =
-                [&self.qkv, &self.mixed, &self.z, &self.a, &self.b, &self.y].map(whole);
+            let [qkv, z, a, b, y] = [&self.qkv, &self.z, &self.a, &self.b, &self.y].map(whole);
 
             self.in_proj_qkv.record(plan, x, &qkv, false);
             self.in_proj_z.record(plan, x, &z, true);
             self.in_proj_b.record(plan, x, &b, true);
             self.in_proj_a.record(plan, x, &a, true);
 
-            let p = plan.constant(&[ConvParams {
-                channels: channels as u32,
-                kernel_size: c.kernel as u32,
-            }]);
-            plan.op(
-                "deltanet_conv",
-                &[&qkv, &self.conv1d, &whole(&state.conv), &mixed, &p],
-                size(channels.div_ceil(256), 1),
-                size(256, 1),
-            );
-
-            let (q, k, v) = (
-                at(&self.mixed, 0),
-                at(&self.mixed, key_size),
-                at(&self.mixed, 2 * key_size),
-            );
             let p = plan.constant(&[StepParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
                 v_dim: c.v_dim as u32,
+                kernel_size: c.kernel as u32,
                 eps: c.eps,
             }]);
             plan.op(
                 "deltanet_step",
                 &[
-                    &q,
-                    &k,
-                    &v,
+                    &qkv,
+                    &self.conv1d,
+                    &whole(&state.conv),
                     &a,
                     &b,
                     &self.a_log,
@@ -415,7 +384,7 @@ mod mac {
                     &y,
                     &p,
                 ],
-                size(c.v_heads, 1),
+                size(c.k_heads, 1),
                 size(1024, 1),
             );
 
