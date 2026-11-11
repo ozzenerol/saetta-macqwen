@@ -42,6 +42,11 @@ pub trait Decider {
     fn greedy(&self) -> bool {
         false
     }
+    /// The params and random stream `pick` samples with, so a GPU sampler
+    /// can draw the same token in its place.
+    fn sampling(&mut self) -> Option<(Params, &mut Sampler)> {
+        None
+    }
 }
 
 /// Greedy decoding: a draft is accepted when it is the main model's argmax,
@@ -125,6 +130,10 @@ impl Decider for Sampled {
 
     fn greedy(&self) -> bool {
         self.params.temperature <= 0.0
+    }
+
+    fn sampling(&mut self) -> Option<(Params, &mut Sampler)> {
+        Some((self.params, &mut self.sampler))
     }
 }
 
@@ -350,6 +359,8 @@ mod gpu {
     use crate::gpu_mtp::GpuMtp;
     use crate::prefill::Prefill;
     use crate::qmv::View;
+    use crate::sample::Sampler;
+    use crate::sample_gpu::{NO_DRAFT, slot, supports};
 
     /// The drafter and what a round needs to go back. The main model is
     /// passed in, so the same model also serves without drafts.
@@ -520,36 +531,66 @@ mod gpu {
             let tokens: Vec<u32> = std::iter::once(pending)
                 .chain(drafts.iter().copied())
                 .collect();
+            // At temperature > 0 the GPU sampler applies the rejection rule
+            // to each row, in the verify's command buffer.
+            let on_gpu = match decide.sampling() {
+                Some((p, sampler)) if p.temperature > 0.0 && supports(&p) => {
+                    let s = model.sampler();
+                    s.set(vocab, &p, false);
+                    s.seed(sampler.state());
+                    for (i, &d) in drafts.iter().enumerate() {
+                        s.set_draft(base + i + 1, d);
+                    }
+                    s.set_draft(base + k + 1, NO_DRAFT);
+                    true
+                }
+                _ => false,
+            };
             let states: Vec<_> = model.states().collect();
-            let v = prefill.verify(self.gpu, &tokens, base, &states);
+            let sampler = on_gpu.then(|| model.sampler());
+            let v = prefill.verify(self.gpu, &tokens, base, &states, sampler);
             let row = |i: usize| {
                 let at = v.logits.offset as usize / 4 + i * vocab;
                 &contents::<f32>(&v.logits.buffer, at + vocab)[at..]
             };
 
-            let mut accepted = 0;
-            let mut next = None;
-            for (i, &d) in drafts.iter().enumerate() {
-                let verdict = if decide.greedy() {
-                    (v.argmax[i] != d).then_some(v.argmax[i])
-                } else {
-                    decide.check(row(i), d)
-                };
-                match verdict {
-                    None => accepted += 1,
-                    Some(t) => {
-                        next = Some(t);
-                        break;
+            let (accepted, next) = if on_gpu {
+                let s = model.sampler();
+                let ring = s.read();
+                s.clear_drafts();
+                if let Some((_, sampler)) = decide.sampling() {
+                    *sampler = Sampler::new(s.rng());
+                }
+                let accepted = (0..k)
+                    .take_while(|&i| ring.accepted[slot(base + i + 1)] == 1)
+                    .count();
+                (accepted, ring.ids[slot(base + accepted + 1)])
+            } else {
+                let mut accepted = 0;
+                let mut next = None;
+                for (i, &d) in drafts.iter().enumerate() {
+                    let verdict = if decide.greedy() {
+                        (v.argmax[i] != d).then_some(v.argmax[i])
+                    } else {
+                        decide.check(row(i), d)
+                    };
+                    match verdict {
+                        None => accepted += 1,
+                        Some(t) => {
+                            next = Some(t);
+                            break;
+                        }
                     }
                 }
-            }
-            let next = next.unwrap_or_else(|| {
-                if decide.greedy() {
-                    v.argmax[k]
-                } else {
-                    decide.pick(row(k))
-                }
-            });
+                let next = next.unwrap_or_else(|| {
+                    if decide.greedy() {
+                        v.argmax[k]
+                    } else {
+                        decide.pick(row(k))
+                    }
+                });
+                (accepted, next)
+            };
 
             if accepted < k {
                 prefill.restore(self.gpu, accepted, &states);

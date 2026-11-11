@@ -17,7 +17,9 @@ mod mac {
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache, Norm};
     use crate::gpu_model::State;
     use crate::moe::Experts;
+    use crate::plan::TokenParams;
     use crate::qmv::{GpuQuant, View};
+    use crate::sample_gpu::GpuSampler;
     use crate::weights::Weights;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
     use std::cell::Cell;
@@ -761,7 +763,17 @@ mod mac {
         /// every row the final-norm hidden state, the logits, the argmax and
         /// the DeltaNet state after it, for speculative decoding. Use the
         /// exact kernels so rows match decode. Needs `enable_verify`.
-        pub fn verify(&self, gpu: &Gpu, tokens: &[u32], pos: usize, states: &[State]) -> Verify {
+        /// With `sampler`, also samples every row into its ring slot
+        /// (row i at position pos + i fills slot pos + i + 1), against the
+        /// drafts set in the ring.
+        pub fn verify(
+            &self,
+            gpu: &Gpu,
+            tokens: &[u32],
+            pos: usize,
+            states: &[State],
+            sampler: Option<&GpuSampler>,
+        ) -> Verify {
             let v = self.verify_rows.as_ref().expect("enable_verify first");
             let n = tokens.len();
             assert!(n > 0 && n <= v.rows, "verify takes 1 to {} tokens", v.rows);
@@ -788,6 +800,25 @@ mod mac {
                 set_views(enc, 0, &[&logits, &whole(&v.argmax)]);
                 params(enc, 2, &(self.lm_head.rows as u32));
                 groups(enc, (n, 1), 1024);
+                if let Some(s) = sampler {
+                    let vocab = self.lm_head.rows;
+                    let rows: Vec<TokenParams> = (0..n)
+                        .map(|i| TokenParams::new(0, (pos + i) as u32))
+                        .collect();
+                    let tp = gpu.buffer_from(&rows);
+                    for i in 0..n {
+                        let at = |b: &View, size: usize| View {
+                            buffer: b.buffer.clone(),
+                            offset: b.offset + (i * size) as u64,
+                        };
+                        s.encode(
+                            gpu,
+                            enc,
+                            &at(&logits, vocab * 4),
+                            &at(&View::new(tp.clone()), 16),
+                        );
+                    }
+                }
             });
             self.snapshot_run.set(false);
             Verify {
@@ -1573,7 +1604,7 @@ mod mac {
 
             prefill.run(&gpu, prompt, 0, &spec.states().collect::<Vec<_>>());
             spec.set_position(20);
-            let v = prefill.verify(&gpu, draft, 20, &spec.states().collect::<Vec<_>>());
+            let v = prefill.verify(&gpu, draft, 20, &spec.states().collect::<Vec<_>>(), None);
             let logits = contents::<f32>(&v.logits.buffer, draft.len() * cfg.vocab_size);
             for &t in prompt {
                 decode.forward(t);

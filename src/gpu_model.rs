@@ -20,6 +20,8 @@ mod mac {
     use crate::moe::{Experts, Router};
     use crate::plan::{Built, Plan, TokenParams};
     use crate::qmv::{GpuQuant, View};
+    use crate::sample::{Params, Sampler};
+    use crate::sample_gpu::GpuSampler;
     use crate::weights::Weights;
     use metal::{Buffer, MTLSize};
 
@@ -368,6 +370,8 @@ mod mac {
         final_hidden: View,
         logits: View,
         scratch: Scratch,
+        /// Samples the next token from `logits` in the same command buffer.
+        sampler: GpuSampler,
         capacity: usize,
         position: usize,
     }
@@ -420,6 +424,14 @@ mod mac {
                 layer.record(&mut plan, cfg, &x, &scratch, next_norm, next_out);
             }
             lm_head.record(&mut plan, &final_hidden, &logits, false);
+            let sampler = GpuSampler::new(gpu);
+            sampler.record(&mut plan, &logits);
+            let greedy = Params {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 1,
+            };
+            sampler.set(lm_head.rows, &greedy, false);
             let built = plan.build();
 
             Ok(GpuModel {
@@ -432,6 +444,7 @@ mod mac {
                 final_hidden,
                 logits,
                 scratch,
+                sampler,
                 capacity,
                 position: 0,
             })
@@ -476,6 +489,24 @@ mod mac {
         pub fn forward(&mut self, token: u32) -> Vec<f32> {
             self.run(token);
             contents::<f32>(&self.logits.buffer, self.cfg.vocab_size).to_vec()
+        }
+
+        /// The sampler after the lm_head, whose ring speculative decoding
+        /// shares.
+        pub fn sampler(&self) -> &GpuSampler {
+            &self.sampler
+        }
+
+        /// Runs one token and samples the next on the GPU, the token
+        /// `sampler.sample(logits, p)` would draw; `sampler` goes on after
+        /// that draw. `p` needs `sample_gpu::supports`.
+        pub fn run_sampled(&mut self, token: u32, p: &Params, sampler: &mut Sampler) -> u32 {
+            self.sampler.set(self.cfg.vocab_size, p, false);
+            self.sampler.seed(sampler.state());
+            let position = self.position;
+            self.run(token);
+            *sampler = Sampler::new(self.sampler.rng());
+            self.sampler.token(position + 1)
         }
 
         /// Runs one token and leaves the results on the GPU.
