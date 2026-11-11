@@ -524,15 +524,10 @@ impl server::Model for GpuServed {
             let logits = match &mut self.drafting {
                 None => self.prefill.run(m.gpu(), tokens, pos, &states),
                 Some(d) => {
-                    // The same work as `run`, keeping the hidden states of the
-                    // last tokens for the MTP cache.
-                    let gpu = m.gpu();
+                    // `run`, keeping the hidden states of the last tokens for
+                    // the MTP cache.
                     let n = tokens.len();
-                    let x = self.prefill.embed(gpu, tokens);
-                    for (l, state) in states.iter().enumerate() {
-                        self.prefill.layer(gpu, l, &x, n, pos, state);
-                    }
-                    let logits = self.prefill.logits(gpu, &x, n);
+                    let (logits, x) = self.prefill.run_hidden(m.gpu(), tokens, pos, &states);
                     let h = d.norm.len();
                     let first = n.saturating_sub(MTP_WINDOW + 1);
                     let mut rows = saetta::gpu::contents::<f32>(&x, n * h)[first * h..].to_vec();
