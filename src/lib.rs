@@ -6,5 +6,8 @@ pub mod gpu;
 pub mod moe;
 pub mod qmv;
 pub mod quant;
+pub mod sample;
+pub mod server;
 pub mod tokenizer;
+pub mod toolcall;
 pub mod weights;
