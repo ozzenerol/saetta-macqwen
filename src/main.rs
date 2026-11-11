@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -27,7 +27,7 @@ fn main() -> ExitCode {
         ["convert", src, out] => report(convert(Path::new(src), Path::new(out))),
         ["convert-mtp", file, dir] => report(convert_mtp(Path::new(file), Path::new(dir))),
         ["serve", dir, ref rest @ ..] => match serve_flags(rest) {
-            Ok((gpu, port)) => report(serve(Path::new(dir), port, gpu)),
+            Ok(flags) => report(serve(Path::new(dir), flags)),
             Err(e) => {
                 eprintln!("{e}\n{USAGE}");
                 ExitCode::from(2)
@@ -87,26 +87,42 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `[--gpu] [--port N]` after `serve <dir>`.
-fn serve_flags(flags: &[&str]) -> Result<(bool, u16), String> {
-    let (mut gpu, mut port) = (false, 8090);
+struct ServeFlags {
+    gpu: bool,
+    port: u16,
+    exact_history: bool,
+}
+
+/// `[--gpu] [--port N] [--exact-history]` after `serve <dir>`.
+fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
+    let mut f = ServeFlags {
+        gpu: false,
+        port: 8090,
+        exact_history: false,
+    };
     let mut it = flags.iter();
     while let Some(&flag) = it.next() {
         match flag {
-            "--gpu" => gpu = true,
+            "--gpu" => f.gpu = true,
+            "--exact-history" => f.exact_history = true,
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
-                port = value.parse().map_err(|_| format!("bad port {value}"))?;
+                f.port = value.parse().map_err(|_| format!("bad port {value}"))?;
             }
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
-    Ok((gpu, port))
+    Ok(f)
 }
 
 /// Serves the model on 127.0.0.1, on the GPU with `gpu`, else on the CPU
 /// (slow, but it runs the whole path).
-fn serve(dir: &Path, port: u16, gpu: bool) -> Result<(), Box<dyn Error>> {
+fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
+    let ServeFlags {
+        gpu,
+        port,
+        exact_history,
+    } = flags;
     // The model borrows these for as long as the server runs.
     let config: &'static Config = Box::leak(Box::new(Config::load(dir)?));
     let weights: &'static Weights = Box::leak(Box::new(Weights::open(dir)?));
@@ -121,6 +137,7 @@ fn serve(dir: &Path, port: u16, gpu: bool) -> Result<(), Box<dyn Error>> {
         },
         max_tokens: 16384,
         eos_token_ids: config.eos_token_ids.clone(),
+        exact_history,
     };
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
