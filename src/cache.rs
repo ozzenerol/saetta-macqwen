@@ -15,6 +15,12 @@ pub const DEFAULT_LIMIT: usize = 16;
 /// A long prefill takes a snapshot at every multiple of this many tokens.
 pub const DEFAULT_EVERY: usize = 1024;
 
+/// KV rows a backup holds at most: 16384 rows of the 35B model are 335 MB
+/// in f32, taken only as far as rows are copied.
+pub const BACKUP_ROWS: usize = 16384;
+/// Rows a speculative step may write past the tokens it returns.
+const DRAFT_ROWS: usize = 8;
+
 /// A model whose recurrent state can be copied out and put back.
 pub trait Restore {
     type State: Send;
@@ -23,6 +29,18 @@ pub trait Restore {
     /// Puts back a state saved at `len` tokens, and cuts the caches that
     /// only grow (the KV cache) to `len`.
     fn restore(&mut self, state: &Self::State, len: usize);
+    /// True when token `p` always sits in KV row `p` and rows past the
+    /// length survive a restore, so a state of another branch can be used
+    /// while its rows are intact. Then `backup_rows` and `restore_rows` work.
+    fn keeps_rows(&self) -> bool {
+        false
+    }
+    /// Copies KV rows `from..from + n` (n <= BACKUP_ROWS) aside.
+    fn backup_rows(&mut self, _from: usize, _n: usize) {}
+    /// Copies the rows of the last `backup_rows` back and frees them.
+    fn restore_rows(&mut self) {}
+    /// Frees the rows of the last `backup_rows`.
+    fn discard_rows(&mut self) {}
 }
 
 /// Saved states, each with the tokens it holds.
@@ -105,6 +123,21 @@ impl<S> Snapshots<S> {
         }
     }
 
+    /// The tokens of each snapshot.
+    pub fn tokens(&self) -> impl Iterator<Item = &[u32]> {
+        self.items.iter().map(|s| s.tokens.as_slice())
+    }
+
+    /// Length of the longest snapshot whose tokens start `tokens`, or 0.
+    pub fn longest(&self, tokens: &[u32]) -> usize {
+        self.items
+            .iter()
+            .filter(|s| tokens.starts_with(&s.tokens))
+            .map(|s| s.tokens.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The longest snapshot whose tokens start `tokens`.
     pub fn find(&mut self, tokens: &[u32]) -> Option<(usize, &S)> {
         self.clock += 1;
@@ -127,6 +160,20 @@ pub struct Cached<M: Restore> {
     tokens: Vec<u32>,
     snapshots: Snapshots<M::State>,
     every: usize,
+    /// The token in each KV row, as far as rows were written; past
+    /// `tokens` they belong to an earlier branch. u32::MAX is unknown.
+    rows: Vec<u32>,
+    /// KV rows copied aside before a detour wrote over them.
+    backup: Option<Backup>,
+}
+
+struct Backup {
+    from: usize,
+    rows: Vec<u32>,
+}
+
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 impl<M: Model + Restore> Cached<M> {
@@ -136,7 +183,34 @@ impl<M: Model + Restore> Cached<M> {
             tokens: Vec::new(),
             snapshots: Snapshots::new(limit),
             every: every.max(1),
+            rows: Vec::new(),
+            backup: None,
         }
+    }
+
+    /// Records that `tokens` went into the rows from `at`.
+    fn write_rows(&mut self, at: usize, tokens: &[u32]) {
+        let end = at + tokens.len();
+        if self.rows.len() < end {
+            self.rows.resize(end, u32::MAX);
+        }
+        self.rows[at..end].copy_from_slice(tokens);
+    }
+
+    /// How far `prompt` matches the rows with the backup put back.
+    fn common_with_backup(&self, prompt: &[u32]) -> usize {
+        let Some(b) = &self.backup else {
+            return 0;
+        };
+        let row = |i: usize| match i.checked_sub(b.from) {
+            Some(j) if j < b.rows.len() => b.rows.get(j),
+            _ => self.rows.get(i),
+        };
+        prompt
+            .iter()
+            .enumerate()
+            .take_while(|&(i, t)| row(i) == Some(t))
+            .count()
     }
 
     pub fn model(&self) -> &M {
@@ -167,6 +241,7 @@ impl<M: Model + Restore> Model for Cached<M> {
             return self.model.prefill(tokens);
         }
         let start = self.tokens.len();
+        self.write_rows(start, tokens);
         let last = start + tokens.len() - 1;
         let mut done = 0;
         while start + done < last {
@@ -189,15 +264,90 @@ impl<M: Model + Restore> Model for Cached<M> {
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
+        self.write_rows(self.tokens.len(), &[token]);
         self.tokens.push(token);
         self.model.step(token)
     }
 
     fn speculate(&mut self, pending: u32, decide: &mut dyn Decider) -> (Vec<u32>, u32) {
+        let start = self.tokens.len();
         let (accepted, next) = self.model.speculate(pending, decide);
         self.tokens.push(pending);
         self.tokens.extend(&accepted);
+        // The rejected drafts went into the rows after them.
+        let end = (start + DRAFT_ROWS).max(self.tokens.len());
+        if self.rows.len() < end {
+            self.rows.resize(end, u32::MAX);
+        }
+        self.rows[start..end].fill(u32::MAX);
+        let tokens = self.tokens[start..].to_vec();
+        self.write_rows(start, &tokens);
         (accepted, next)
+    }
+
+    /// Goes to the longest state that `prompt` starts with: the current one,
+    /// or a snapshot of any branch whose KV rows are still intact, if need
+    /// be after putting back the rows of the backup. Before the rows past
+    /// that point get written over, they are backed up, so a short detour
+    /// does not lose a long conversation.
+    fn resume(&mut self, _held: &[u32], prompt: &[u32]) -> usize {
+        let keeps = self.model.keeps_rows();
+        let common = common_prefix(&self.tokens, prompt);
+        let direct = if keeps {
+            common_prefix(&self.rows, prompt)
+        } else {
+            common
+        };
+        let patched = if keeps {
+            self.common_with_backup(prompt)
+        } else {
+            0
+        };
+        let best = self.snapshots.longest(&prompt[..direct.max(patched)]);
+        let keep = if common == self.tokens.len() && common >= best {
+            common
+        } else {
+            self.save(false);
+            if best == 0 {
+                self.reset();
+                0
+            } else {
+                if best > direct {
+                    self.model.restore_rows();
+                    let b = self.backup.take().unwrap();
+                    self.write_rows(b.from, &b.rows);
+                }
+                let (n, state) = self.snapshots.find(&prompt[..best]).unwrap();
+                self.model.restore(state, n);
+                self.tokens = prompt[..n].to_vec();
+                if !keeps {
+                    self.rows.truncate(n);
+                }
+                n
+            }
+        };
+        let tail = self.rows.len().saturating_sub(keep);
+        if keeps && tail > DRAFT_ROWS && self.backup.as_ref().is_none_or(|b| keep < b.from) {
+            let n = tail.min(BACKUP_ROWS);
+            self.model.backup_rows(keep, n);
+            self.backup = Some(Backup {
+                from: keep,
+                rows: self.rows[keep..keep + n].to_vec(),
+            });
+        }
+        // Free the backup once no snapshot past its start needs its rows.
+        if let Some(b) = &self.backup {
+            let from = b.from;
+            let needed = self
+                .snapshots
+                .tokens()
+                .any(|t| t.len() > from && self.common_with_backup(t) == t.len());
+            if !needed {
+                self.backup = None;
+                self.model.discard_rows();
+            }
+        }
+        keep
     }
 
     /// Saves the state being left, then goes back to the longest snapshot
@@ -211,6 +361,9 @@ impl<M: Model + Restore> Model for Cached<M> {
             Some((n, state)) => {
                 self.model.restore(state, n);
                 self.tokens.truncate(n);
+                if !self.model.keeps_rows() {
+                    self.rows.truncate(n);
+                }
                 n
             }
             None => {
@@ -223,6 +376,9 @@ impl<M: Model + Restore> Model for Cached<M> {
     fn reset(&mut self) {
         self.model.reset();
         self.tokens.clear();
+        if !self.model.keeps_rows() {
+            self.rows.clear();
+        }
     }
 
     fn capacity(&self) -> usize {
@@ -259,21 +415,41 @@ mod tests {
     use super::*;
 
     /// A model with a state that cannot be cut back, like DeltaNet: a running
-    /// hash of all tokens. The logits depend on the whole history.
+    /// hash of all tokens. The logits depend on the whole history, and on
+    /// the KV rows, which token `p` writes in row `p`, so using rows of
+    /// another branch shows.
     #[derive(Default)]
     struct Toy {
         hash: u64,
         len: usize,
         runs: usize,
         restores: Vec<usize>,
+        /// Rows survive a restore, as on the GPU.
+        keeps: bool,
+        rows: Vec<u32>,
+        backup: (usize, Vec<u32>),
     }
 
     impl Toy {
+        fn keeping() -> Toy {
+            Toy {
+                keeps: true,
+                ..Toy::default()
+            }
+        }
+
         fn run(&mut self, token: u32) -> Vec<f32> {
             self.hash = self.hash.wrapping_mul(0x100000001b3) ^ u64::from(token);
+            if self.rows.len() <= self.len {
+                self.rows.resize(self.len + 1, 0);
+            }
+            self.rows[self.len] = token;
             self.len += 1;
             self.runs += 1;
-            vec![self.hash as f32, self.len as f32]
+            let rows = self.rows[..self.len]
+                .iter()
+                .fold(0u64, |h, &t| h.wrapping_mul(31) ^ u64::from(t));
+            vec![self.hash as f32, self.len as f32, rows as f32]
         }
     }
 
@@ -294,6 +470,9 @@ mod tests {
         fn reset(&mut self) {
             self.hash = 0;
             self.len = 0;
+            if !self.keeps {
+                self.rows.clear();
+            }
         }
     }
 
@@ -305,7 +484,23 @@ mod tests {
         fn restore(&mut self, state: &u64, len: usize) {
             self.hash = *state;
             self.len = len;
+            if !self.keeps {
+                self.rows.truncate(len);
+            }
             self.restores.push(len);
+        }
+        fn keeps_rows(&self) -> bool {
+            self.keeps
+        }
+        fn backup_rows(&mut self, from: usize, n: usize) {
+            self.backup = (from, self.rows[from..from + n].to_vec());
+        }
+        fn restore_rows(&mut self) {
+            let (from, rows) = std::mem::take(&mut self.backup);
+            self.rows[from..from + rows.len()].copy_from_slice(&rows);
+        }
+        fn discard_rows(&mut self) {
+            self.backup = (0, Vec::new());
         }
     }
 
@@ -317,15 +512,10 @@ mod tests {
         (0..n as u32).map(|i| i * 7 + seed).collect()
     }
 
-    /// Does what the server does: keep the common prefix, run the rest.
+    /// Does what the server does: resume, run the rest.
     fn request(c: &mut Cached<Toy>, prompt: &[u32]) -> (Vec<f32>, usize) {
-        let common = c
-            .tokens
-            .iter()
-            .zip(prompt)
-            .take_while(|(a, b)| a == b)
-            .count();
-        let keep = c.truncate(common.min(prompt.len() - 1));
+        let held = c.tokens.clone();
+        let keep = c.resume(&held, &prompt[..prompt.len() - 1]);
         (c.prefill(&prompt[keep..]), keep)
     }
 
@@ -337,6 +527,86 @@ mod tests {
         c.step(5);
         c.prefill(&[1, 2]);
         assert_eq!(c.snapshots().lengths(), vec![4, 8, 9, 11, 12]);
+    }
+
+    /// A long prompt, a short unrelated request, then the long prompt with
+    /// its end changed, as qh does: the long prefix is reused.
+    #[test]
+    fn long_prompt_survives_a_short_detour() {
+        let mut c = Cached::new(Toy::keeping(), 16, 4);
+        let long = tokens(40, 0);
+        request(&mut c, &long);
+        for t in [500, 501, 502] {
+            c.step(t);
+        }
+        let mut short = long[..2].to_vec();
+        short.extend(tokens(5, 9));
+        let (logits, keep) = request(&mut c, &short);
+        assert_eq!(logits, fresh(&short));
+        assert!(keep <= 2);
+        c.step(600);
+
+        let mut edited = long.clone();
+        edited[38] = 999;
+        let (logits, keep) = request(&mut c, &edited);
+        assert_eq!(keep, 36);
+        assert_eq!(logits, fresh(&edited));
+
+        // The rows went back, so there is no backup now.
+        assert!(c.backup.is_none() && c.model().backup.1.is_empty());
+
+        // And back to the short one: its rows are gone, so it runs again.
+        let (logits, _) = request(&mut c, &short);
+        assert_eq!(logits, fresh(&short));
+    }
+
+    #[test]
+    fn backup_is_freed_when_no_snapshot_needs_it() {
+        let mut c = Cached::new(Toy::keeping(), 3, 4);
+        let long = tokens(40, 0);
+        request(&mut c, &long);
+        let mut short = long[..2].to_vec();
+        short.extend(tokens(5, 9));
+        request(&mut c, &short);
+        assert!(c.backup.is_some());
+        // Follow-ups of the short conversation push the long one's
+        // snapshots out; then nothing needs the backup.
+        let mut prompt = short;
+        for seed in 20..24 {
+            prompt.extend(tokens(6, seed));
+            request(&mut c, &prompt);
+        }
+        assert!(c.backup.is_none() && c.model().backup.1.is_empty());
+    }
+
+    /// Without kept rows, another branch is never used.
+    #[test]
+    fn detour_without_kept_rows_starts_over() {
+        let mut c = Cached::new(Toy::default(), 16, 4);
+        let long = tokens(40, 0);
+        request(&mut c, &long);
+        let mut short = long[..2].to_vec();
+        short.extend(tokens(5, 9));
+        request(&mut c, &short);
+        let mut edited = long.clone();
+        edited[38] = 999;
+        let (logits, keep) = request(&mut c, &edited);
+        assert_eq!(keep, 0);
+        assert_eq!(logits, fresh(&edited));
+    }
+
+    /// A detour longer than the backup loses the rows past it.
+    #[test]
+    fn rows_written_past_the_backup_are_not_used() {
+        let mut c = Cached::new(Toy::keeping(), 16, 1024);
+        let long = tokens(BACKUP_ROWS + 100, 0);
+        request(&mut c, &long);
+        let mut other = long[..2].to_vec();
+        other.extend(tokens(BACKUP_ROWS + 50, 9));
+        request(&mut c, &other);
+        let (logits, keep) = request(&mut c, &long);
+        assert!(keep < 2 + BACKUP_ROWS, "keep {keep}");
+        assert_eq!(logits, fresh(&long));
     }
 
     #[test]

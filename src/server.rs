@@ -29,6 +29,20 @@ pub trait Model: Send {
     /// holds now. At 0 the server resets the model.
     fn truncate(&mut self, len: usize) -> usize;
     fn reset(&mut self);
+    /// Goes to the longest state that `prompt` starts with and returns its
+    /// length; `held` is what the state holds now. The default cuts the
+    /// state back to the common prefix; a prompt cache may find more.
+    fn resume(&mut self, held: &[u32], prompt: &[u32]) -> usize {
+        let common = held.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        if common == held.len() {
+            return common;
+        }
+        let keep = self.truncate(common);
+        if keep == 0 {
+            self.reset();
+        }
+        keep
+    }
     /// Runs `pending` and returns the tokens decided after it: tokens the
     /// state already holds, and the next token, which it does not. A model
     /// with a drafter returns several tokens per call.
@@ -437,23 +451,12 @@ enum Take {
 }
 
 impl<M: Model> Engine<M> {
-    /// Reuses the longest common prefix of the cached tokens and the prompt,
-    /// runs the rest, and returns the logits with the number of reused tokens.
+    /// Reuses the longest state the model has for the prompt, runs the rest,
+    /// and returns the logits with the number of reused tokens.
     fn start(&mut self, prompt: &[u32]) -> (Vec<f32>, usize) {
-        let mut keep = self
-            .tokens
-            .iter()
-            .zip(prompt)
-            .take_while(|(a, b)| a == b)
-            .count();
         // At least one token has to run to get logits.
-        keep = keep.min(prompt.len().saturating_sub(1));
-        if keep < self.tokens.len() {
-            keep = self.model.truncate(keep);
-            if keep == 0 {
-                self.model.reset();
-            }
-        }
+        let usable = &prompt[..prompt.len().saturating_sub(1)];
+        let keep = self.model.resume(&self.tokens, usable);
         let logits = self.model.prefill(&prompt[keep..]);
         self.tokens = prompt.to_vec();
         (logits, keep)
