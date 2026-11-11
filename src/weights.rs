@@ -36,6 +36,15 @@ impl Dtype {
         }
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            Dtype::U32 => "U32",
+            Dtype::BF16 => "BF16",
+            Dtype::F16 => "F16",
+            Dtype::F32 => "F32",
+        }
+    }
+
     pub fn size(self) -> usize {
         match self {
             Dtype::BF16 | Dtype::F16 => 2,
@@ -196,6 +205,23 @@ impl Weights {
         self.shards.len()
     }
 
+    pub fn shard_name(&self, shard: usize) -> &str {
+        &self.shard_names[shard]
+    }
+
+    /// Names of the tensors whose data does not start on a multiple of
+    /// `align` bytes in its file.
+    pub fn unaligned(&self, align: usize) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.start % align != 0)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The whole mapped file of one shard, for no-copy GPU buffers.
     pub fn shard_bytes(&self, shard: usize) -> &[u8] {
         &self.shards[shard]
@@ -314,20 +340,20 @@ fn parse_header(file: &[u8], shard: usize) -> Result<Vec<(String, Entry)>, Strin
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
     /// Writes a safetensors file with the given header and data, the way MLX
     /// does: no padding after the header.
-    fn write_shard(dir: &Path, name: &str, header: &str, data: &[u8]) {
+    pub(crate) fn write_shard(dir: &Path, name: &str, header: &str, data: &[u8]) {
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(data);
         fs::write(dir.join(name), bytes).unwrap();
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub(crate) fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("saetta-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir

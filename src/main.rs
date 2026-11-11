@@ -5,25 +5,45 @@ use std::error::Error;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir>";
+const USAGE: &str =
+    "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args[..] {
         ["gpu-check"] => saetta::gpu::check(),
-        ["info", dir] => match info(Path::new(dir)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        ["info", dir] => report(info(Path::new(dir))),
+        ["convert", src, out] => report(convert(Path::new(src), Path::new(out))),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
     }
+}
+
+fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn convert(src: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
+    let s = saetta::convert::convert(src, out)?;
+    println!(
+        "wrote {} tensors, {} bytes, in {} shards to {}",
+        s.tensors,
+        s.bytes,
+        s.shards,
+        out.display()
+    );
+    let checked = saetta::convert::verify(src, out)?;
+    println!("checked {checked} tensors: same bytes as the source, all aligned");
+    Ok(())
 }
 
 fn info(dir: &Path) -> Result<(), Box<dyn Error>> {
