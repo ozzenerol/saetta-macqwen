@@ -1,7 +1,8 @@
 //! Prompt cache snapshots on the GPU (docs/CACHE.md). A snapshot is one
-//! buffer from a preallocated pool that holds the conv and recurrent state
-//! of every DeltaNet layer, written and read back with blit copies. The KV
-//! caches are not copied: going back only sets the model position.
+//! buffer that holds the conv and recurrent state of every DeltaNet layer,
+//! written and read back with blit copies. It is made when the snapshot is
+//! saved and freed when it is dropped. The KV caches are not copied: going
+//! back only sets the model position.
 //!
 //! The copies are committed without waiting. Work committed after them on
 //! the same queue runs after them, so the next token sees the copied state.
@@ -14,51 +15,52 @@ mod mac {
     use crate::gpu::Gpu;
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache};
     use metal::{Buffer, CommandBuffer, Device, MTLResourceOptions};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Snapshot buffers, all the same size. A snapshot gives its buffer back
-    /// when it is dropped, for example when the cache evicts it.
+    /// Makes the snapshot buffers, all the same size. A buffer is made when
+    /// a snapshot is saved and freed when the snapshot is dropped, for
+    /// example when the cache evicts it, so the memory follows the snapshots
+    /// the cache holds instead of staying at the most it ever held.
     pub struct SnapshotPool {
         device: Device,
         size: u64,
-        free: Arc<Mutex<Vec<Buffer>>>,
+        limit: usize,
+        live: Arc<AtomicUsize>,
     }
 
     pub struct GpuSnapshot {
-        buffer: Option<Buffer>,
-        free: Arc<Mutex<Vec<Buffer>>>,
+        buffer: Buffer,
+        live: Arc<AtomicUsize>,
     }
 
     impl Drop for GpuSnapshot {
         fn drop(&mut self) {
-            if let Some(buffer) = self.buffer.take() {
-                self.free.lock().unwrap().push(buffer);
-            }
+            // A blit still in flight retains the buffer until it is done.
+            self.live.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     impl GpuSnapshot {
         fn buffer(&self) -> &Buffer {
-            self.buffer.as_ref().unwrap()
+            &self.buffer
         }
     }
 
     impl SnapshotPool {
-        /// `count` buffers that each fit the states of `layers`. The cache
-        /// adds a snapshot before it evicts one, so use its limit + 1.
+        /// A pool of at most `count` snapshots that each fit the states of
+        /// `layers`. The cache adds a snapshot before it evicts one, so use
+        /// its limit + 1.
         pub fn new(gpu: &Gpu, layers: &[&GpuDeltaNetState], count: usize) -> SnapshotPool {
-            let size = layers
-                .iter()
-                .map(|s| s.conv.length() + s.recurrent.length())
-                .sum();
-            let pool = SnapshotPool {
+            SnapshotPool {
                 device: gpu.device.clone(),
-                size,
-                free: Arc::new(Mutex::new(Vec::new())),
-            };
-            let buffers = (0..count).map(|_| pool.new_buffer()).collect();
-            *pool.free.lock().unwrap() = buffers;
-            pool
+                size: layers
+                    .iter()
+                    .map(|s| s.conv.length() + s.recurrent.length())
+                    .sum(),
+                limit: count,
+                live: Arc::new(AtomicUsize::new(0)),
+            }
         }
 
         /// Bytes per snapshot.
@@ -66,26 +68,28 @@ mod mac {
             self.size
         }
 
+        /// Snapshots that can still be made within the limit.
         pub fn free_count(&self) -> usize {
-            self.free.lock().unwrap().len()
+            self.limit.saturating_sub(self.live.load(Ordering::Relaxed))
         }
 
-        fn new_buffer(&self) -> Buffer {
-            self.device
-                .new_buffer(self.size, MTLResourceOptions::StorageModePrivate)
+        /// Snapshots alive now.
+        pub fn live(&self) -> usize {
+            self.live.load(Ordering::Relaxed)
         }
 
-        /// A buffer from the pool, or a new one when the pool is empty. The
-        /// cache never holds more than the pool, so a new one means a bug;
-        /// it is logged, as it goes past `--cache-mb`.
+        /// A new snapshot buffer. The cache never holds more than the
+        /// limit, so going past it means a bug; it is logged, as it goes
+        /// past `--cache-mb`.
         fn take(&self) -> GpuSnapshot {
-            let buffer = self.free.lock().unwrap().pop();
+            if self.live.fetch_add(1, Ordering::Relaxed) >= self.limit {
+                eprintln!("snapshot pool is full: allocating past the cache limit");
+            }
             GpuSnapshot {
-                buffer: Some(buffer.unwrap_or_else(|| {
-                    eprintln!("snapshot pool is empty: allocating past the cache limit");
-                    self.new_buffer()
-                })),
-                free: Arc::clone(&self.free),
+                buffer: self
+                    .device
+                    .new_buffer(self.size, MTLResourceOptions::StorageModePrivate),
+                live: Arc::clone(&self.live),
             }
         }
     }
@@ -372,13 +376,8 @@ mod mac {
             let pool = SnapshotPool::new(&gpu, &layers, 17);
             println!("snapshot size {:.1} MB", pool.size() as f64 / 1e6);
 
-            // The first use of each pool buffer maps its memory; do that once.
-            let warm: Vec<_> = (0..17).map(|_| save(&gpu, &pool, &layers)).collect();
-            for (_, commands) in &warm {
-                commands.wait_until_completed();
-            }
-            drop(warm);
-
+            // Every save makes a new buffer, so the times include mapping
+            // its memory on first use, as in the server.
             let runs = 20;
             let (mut save_cpu, mut save_all, mut restore_cpu, mut restore_all) =
                 (0.0, 0.0, 0.0, 0.0);
