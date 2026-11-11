@@ -8,6 +8,7 @@
 
 use crate::chat::{self, Message, Options};
 use crate::sample::{Params, Sampler};
+use crate::speculative::{Decider, Sampled};
 use crate::tokenizer::Tokenizer;
 use crate::toolcall;
 use serde_json::{Value, json};
@@ -28,6 +29,17 @@ pub trait Model: Send {
     /// holds now. At 0 the server resets the model.
     fn truncate(&mut self, len: usize) -> usize;
     fn reset(&mut self);
+    /// Runs `pending` and returns the tokens decided after it: tokens the
+    /// state already holds, and the next token, which it does not. A model
+    /// with a drafter returns several tokens per call.
+    fn speculate(&mut self, pending: u32, decide: &mut dyn Decider) -> (Vec<u32>, u32) {
+        let logits = self.step(pending);
+        (Vec::new(), decide.pick(&logits))
+    }
+    /// Tokens the state can hold: the prompt and the answer together.
+    fn capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 pub struct Settings {
@@ -47,6 +59,8 @@ pub struct Server<M: Model> {
     settings: Settings,
     special: Special,
     requests: AtomicU64,
+    /// `Model::capacity`, read once.
+    capacity: usize,
 }
 
 struct Engine<M> {
@@ -79,7 +93,9 @@ impl<M: Model + 'static> Server<M> {
             tool_start: id("<tool_call>")?,
             tool_end: id("</tool_call>")?,
         };
+        let capacity = model.capacity();
         Ok(Server {
+            capacity,
             engine: Mutex::new(Engine {
                 model,
                 tokens: Vec::new(),
@@ -135,6 +151,14 @@ impl<M: Model + 'static> Server<M> {
             Ok(r) => r,
             Err(e) => return send_error(out, 400, &e),
         };
+        if request.prompt.len() >= self.capacity {
+            let e = format!(
+                "the prompt is {} tokens, and the model's context holds {}",
+                request.prompt.len(),
+                self.capacity
+            );
+            return send_error(out, 400, &e);
+        }
         let id = request.id.clone();
         let model = self.settings.model_name.as_str();
         let created = now();
@@ -271,12 +295,25 @@ impl<M: Model + 'static> Server<M> {
             "render"
         };
         let prompt = spliced.unwrap_or_else(|| r.prompt.clone());
-        let (mut logits, cached) = engine.start(&prompt);
+        if prompt.len() >= self.capacity {
+            // Only a spliced prompt can get here; `chat` checks the rendered one.
+            return Done {
+                prompt_tokens: prompt.len(),
+                cached_tokens: 0,
+                completion_tokens: 0,
+                hit_limit: true,
+                tool_calls: 0,
+            };
+        }
+        let (logits, cached) = engine.start(&prompt);
         eprintln!(
             "{}",
             reuse_report(how, &held, &prompt, cached, &self.tokenizer)
         );
-        let mut sampler = Sampler::new(r.seed);
+        let mut decide = Sampled {
+            params: r.sampling,
+            sampler: Sampler::new(r.seed),
+        };
         let mut output = Output::new(r.thinking, &r.tools, &r.id);
         let mut answer = Message {
             role: "assistant".into(),
@@ -294,22 +331,43 @@ impl<M: Model + 'static> Server<M> {
             tool_calls: 0,
         };
 
-        loop {
-            if done.completion_tokens == r.max_tokens {
+        // Emits one decided token; false when generation ends here.
+        let mut take = |token: u32, done: &mut Done| -> Take {
+            // The token taken now is run next, so it must fit in the state.
+            let full = prompt.len() + done.completion_tokens >= self.capacity;
+            if done.completion_tokens == r.max_tokens || full {
                 done.hit_limit = true;
-                break;
+                return Take::Stop;
             }
-            let token = sampler.sample(&logits, &r.sampling);
             done.completion_tokens += 1;
             if self.settings.eos_token_ids.contains(&token) {
-                break;
+                return Take::Stop;
             }
             let events = output.push(token, &self.tokenizer, &self.special);
-            if !self.emit_all(events, &mut emit, &mut done) {
-                return done;
+            if !self.emit_all(events, &mut emit, done) {
+                return Take::Gone;
             }
-            logits = engine.model.step(token);
-            engine.tokens.push(token);
+            Take::Go
+        };
+
+        let mut pending = decide.pick(&logits);
+        'outer: loop {
+            match take(pending, &mut done) {
+                Take::Go => {}
+                Take::Stop => break,
+                Take::Gone => return done,
+            }
+            let (accepted, next) = engine.model.speculate(pending, &mut decide);
+            engine.tokens.push(pending);
+            engine.tokens.extend(&accepted);
+            for t in accepted {
+                match take(t, &mut done) {
+                    Take::Go => {}
+                    Take::Stop => break 'outer,
+                    Take::Gone => return done,
+                }
+            }
+            pending = next;
         }
         let events = output.finish();
         if self.emit_all(events, &mut emit, &mut done) {
@@ -370,6 +428,12 @@ impl<M: Model + 'static> Server<M> {
         }
         true
     }
+}
+
+enum Take {
+    Go,
+    Stop,
+    Gone,
 }
 
 impl<M: Model> Engine<M> {
@@ -531,6 +595,8 @@ struct Output<'a> {
     part: Part,
     pending: Vec<u8>,
     tool_text: String,
+    /// The tool call started inside the reasoning, before `</think>`.
+    tool_in_reasoning: bool,
     content_started: bool,
     tools: &'a [Value],
     id: &'a str,
@@ -547,6 +613,7 @@ impl<'a> Output<'a> {
             },
             pending: Vec::new(),
             tool_text: String::new(),
+            tool_in_reasoning: false,
             content_started: false,
             tools,
             id,
@@ -561,12 +628,19 @@ impl<'a> Output<'a> {
             self.part = Part::Content;
         } else if token == special.tool_start && self.part != Part::ToolCall {
             self.flush(&mut events, true);
+            self.tool_in_reasoning = self.part == Part::Reasoning;
             self.part = Part::ToolCall;
             self.tool_text.clear();
         } else if token == special.tool_end && self.part == Part::ToolCall {
             self.flush(&mut events, true);
-            events.push(self.tool_call(true));
-            self.part = Part::Content;
+            let event = self.tool_call(true);
+            // mlx_lm leaves the reasoning for a tool call too, but a call
+            // that is only written about in the reasoning stays there.
+            self.part = match event {
+                Event::Reasoning(_) => Part::Reasoning,
+                _ => Part::Content,
+            };
+            events.push(event);
         } else if !tokenizer.is_special(token) {
             self.pending.extend_from_slice(tokenizer.token_bytes(token));
             self.flush(&mut events, false);
@@ -585,9 +659,18 @@ impl<'a> Output<'a> {
     }
 
     /// A tool call event, or the raw text as written when it does not parse.
+    /// Inside the reasoning, the call must also name one of the request's
+    /// tools, else its text goes back to the reasoning: the model sometimes
+    /// writes `<tool_call>` there while thinking about the format.
     fn tool_call(&mut self, closed: bool) -> Event {
         let text = std::mem::take(&mut self.tool_text);
-        match toolcall::parse(&text, self.tools) {
+        let known = |name: &str| self.tools.iter().any(|t| t["function"]["name"] == name);
+        let call = toolcall::parse(&text, self.tools)
+            .filter(|c| !self.tool_in_reasoning || known(&c.name));
+        let end = if closed { "</tool_call>" } else { "" };
+        match call {
+            None if self.tool_in_reasoning => Event::Reasoning(format!("<tool_call>{text}{end}")),
+            None => Event::Content(format!("<tool_call>{text}{end}")),
             Some(call) => {
                 self.calls += 1;
                 Event::ToolCall(ToolCallOut {
@@ -600,8 +683,6 @@ impl<'a> Output<'a> {
                     arguments: chat::python_json(&Value::Object(call.arguments)),
                 })
             }
-            None if closed => Event::Content(format!("<tool_call>{text}</tool_call>")),
-            None => Event::Content(format!("<tool_call>{text}")),
         }
     }
 
