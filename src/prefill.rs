@@ -294,6 +294,11 @@ mod mac {
         std::env::var("SAETTA_QMM2").map_or(true, |v| v != "0")
     }
 
+    /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
+    fn fast_router() -> bool {
+        std::env::var("SAETTA_ROUTER_FAST").is_ok_and(|v| v == "1")
+    }
+
     /// SAETTA_DELTA=1 runs the DeltaNet conv and delta rule on conv_rows and
     /// delta_rows instead of conv_rows2 and delta_prep plus delta_rows2, to
     /// compare.
@@ -1429,8 +1434,13 @@ mod mac {
             ]
             .map(whole);
             if self.on("router") {
-                // Routing stays close to f32 so it picks the experts decode would.
-                qmm(gpu, enc, &layer.router, normed, &router, t, true);
+                // Routing stays close to f32 so it picks the experts decode
+                // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
+                if !self.exact && fast_router() {
+                    self.mm(gpu, enc, &layer.router, normed, &router, t);
+                } else {
+                    qmm(gpu, enc, &layer.router, normed, &router, t, true);
+                }
                 self.mm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
             }
             let silu_mul = gpu.pipeline("silu_mul_rows");
