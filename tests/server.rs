@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 const IM_START: u32 = 300;
 const IM_END: u32 = 301;
@@ -74,6 +75,7 @@ struct Log {
     prefills: Vec<usize>,
     resets: usize,
     restores: Vec<usize>,
+    steps: usize,
 }
 
 /// Writes `script` after every prefill, one token per step.
@@ -82,6 +84,8 @@ struct Fake {
     at: usize,
     len: usize,
     log: Arc<Mutex<Log>>,
+    /// Time per step, to give a client time to leave mid-answer.
+    delay: Duration,
 }
 
 impl Fake {
@@ -100,6 +104,8 @@ impl Model for Fake {
         self.logits()
     }
     fn step(&mut self, _token: u32) -> Vec<f32> {
+        thread::sleep(self.delay);
+        self.log.lock().unwrap().steps += 1;
         self.len += 1;
         self.at += 1;
         self.logits()
@@ -135,6 +141,7 @@ fn fake(script: Vec<u32>) -> (Fake, Arc<Mutex<Log>>) {
         at: 0,
         len: 0,
         log: Arc::clone(&log),
+        delay: Duration::ZERO,
     };
     (model, log)
 }
@@ -710,4 +717,39 @@ fn answer_stops_at_capacity() {
                                           "chat_template_kwargs": {"enable_thinking": false}}),
     );
     assert_eq!(status, 200);
+}
+
+#[test]
+fn client_leaving_in_a_tool_call_stops_it() {
+    let (mut model, log) = fake(script(&[Err(TOOL), Ok(&"a".repeat(3000)), Err(TOOL_END)]));
+    model.delay = Duration::from_micros(500);
+    let addr = serve(model);
+    let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true,
+                      "chat_template_kwargs": {"enable_thinking": false}})
+    .to_string();
+    let mut s = TcpStream::connect(&addr).unwrap();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    // Read up to the end of the first event, so nothing unread is left.
+    let mut seen = Vec::new();
+    let mut byte = [0];
+    while !seen.ends_with(b"}\n\n") {
+        s.read_exact(&mut byte).unwrap();
+        seen.push(byte[0]);
+    }
+    drop(s);
+
+    // The next request waits for the first to end, and runs one step.
+    let (status, _) = post(
+        &addr,
+        json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2,
+               "chat_template_kwargs": {"enable_thinking": false}}),
+    );
+    assert_eq!(status, 200);
+    let steps = log.lock().unwrap().steps;
+    assert!(steps < 500, "{steps} steps");
 }
