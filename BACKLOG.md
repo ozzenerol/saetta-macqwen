@@ -28,6 +28,12 @@
 
 - G1 (track G) GPU prefill: chunks of tokens per dispatch, quantized matrix-matrix kernel, chunked Gated DeltaNet.
 
+- A9 MTP layer on the GPU (src/gpu_mtp.rs).
+- B6 Long-context decode: split-K attention, ms/token at 1k to 32k; profile of the short token.
+- C8 Decode token profile and fusion of the small ops (DeltaNet step, norms, residuals).
+
+Goal (user, 2026-11-11): faster than MLX in every case of tools/bench.py: decode and time to first token, short and long prompt.
+
 ## Track D: prompt cache
 
 - D1 state snapshots and the prompt cache, as in docs/CACHE.md (src/cache.rs).
