@@ -3,6 +3,7 @@ pub mod config;
 pub mod convert;
 pub mod cpu;
 pub mod gpu;
+pub mod gpu_layers;
 pub mod moe;
 pub mod plan;
 pub mod qmv;
