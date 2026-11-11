@@ -11,7 +11,7 @@ pub struct Variant {
     pub cols: usize,
 }
 
-pub const VARIANTS: [Variant; 4] = [
+pub const VARIANTS: [Variant; 5] = [
     Variant {
         name: "qmm2",
         rows: 64,
@@ -32,10 +32,18 @@ pub const VARIANTS: [Variant; 4] = [
         rows: 32,
         cols: 128,
     },
+    Variant {
+        name: "qmm2_16",
+        rows: 16,
+        cols: 128,
+    },
 ];
 
 /// The fastest in bench-qmm2: 32 x 128 tiles, single buffered.
 pub const DEFAULT: Variant = VARIANTS[2];
+/// For expert tiles of 16 rows or fewer: 7.5 TFLOP/s there against 5.0 for
+/// DEFAULT, but slower on full 32-row tiles.
+pub const SMALL: Variant = VARIANTS[4];
 
 /// Tiles of this many rows or fewer are skipped (qmm_few takes them); must
 /// match QMM_FEW.
