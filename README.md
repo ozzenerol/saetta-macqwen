@@ -41,7 +41,7 @@ cargo build --release
 ./target/release/saetta gpu-check
 ```
 
-`saetta serve <model dir> [--port N]` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default). For now it runs the CPU model, at about 375 ms per token.
+`saetta serve <model dir> --gpu` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default, `--port N` to change it). Without `--gpu` it runs the CPU model, at about 375 ms per token. `--draft K` drafts K tokens per step with the MTP layer. `--context N` (default 32768) and `--cache-mb N` (default 1024) bound the memory it takes besides the weights; [docs/MEMORY.md](docs/MEMORY.md) has the numbers.
 
 ## License
 
