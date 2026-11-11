@@ -247,6 +247,81 @@ mod mac {
         groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
     }
 
+    /// Fast-mode experts run gate, up and silu in prefill_gate_up unless
+    /// SAETTA_GATE_UP=0 or SAETTA_EXPERT_VARIANT picks other tile rows.
+    fn fused_gate_up() -> bool {
+        std::env::var("SAETTA_GATE_UP").map_or(true, |v| v != "0") && expert_variant().rows == 32
+    }
+
+    /// Experts' silu(gate) * up into `g` (f32) and `g_half`: prefill_gate_up
+    /// for the tiles of more than FEW rows, qmm_few for gate and up of the
+    /// others and prefill_silu_few on those rows. `x` is the input, `x_half`
+    /// its half, `u` scratch for up of the small tiles.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_up_grouped(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x: &View,
+        x_half: &View,
+        g_out: &View,
+        u: &View,
+        g_half: &View,
+        g: &Grouped,
+    ) {
+        let name = match gate.bits {
+            5 => "prefill_gate_up_5bit",
+            8 => "prefill_gate_up_8bit",
+            b => panic!("no prefill_gate_up kernel for {b} bits"),
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(name));
+        set_quant(enc, 0, gate);
+        set_quant(enc, 3, up);
+        set_views(enc, 6, &[x_half, g_out, g_half]);
+        let shape = MmShape {
+            m: 0,
+            n: gate.rows as u32,
+            k: gate.cols as u32,
+            gather: 1,
+        };
+        params(enc, 9, &shape);
+        set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
+        groups(enc, (gate.rows.div_ceil(64), g.max_tiles), 128);
+
+        few_grouped(gpu, enc, gate, x, g_out, g, true);
+        few_grouped(gpu, enc, up, x, u, g, true);
+        enc.set_compute_pipeline_state(&gpu.pipeline("prefill_silu_few"));
+        set_views(enc, 0, &[g_out, u, g_half]);
+        params(enc, 3, &(gate.rows as u32));
+        set_views(enc, 4, &[g.tiles, g.tile_count]);
+        groups(enc, (g.max_tiles, 1), 256);
+    }
+
+    /// qmm_few on the tiles of FEW rows or fewer of a grouped product.
+    fn few_grouped(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x: &View,
+        y: &View,
+        g: &Grouped,
+        gather_x: bool,
+    ) {
+        enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
+        set_quant(enc, 0, w);
+        set_views(enc, 3, &[x, y]);
+        let shape = MmShape {
+            m: 0,
+            n: w.rows as u32,
+            k: w.cols as u32,
+            gather: if gather_x { 1 } else { 2 },
+        };
+        params(enc, 5, &shape);
+        set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
+        groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
+    }
+
     /// qmm_grouped on qmm2 (src/qmm.rs), which takes `x_half`, the half of
     /// `x`; the tiles of FEW rows or fewer still go to qmm_few on `x`.
     /// The qmm2 variant for the experts: SAETTA_EXPERT_VARIANT=<index into
@@ -284,18 +359,7 @@ mod mac {
             g.max_tiles,
             gather_x,
         );
-        enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
-        set_quant(enc, 0, w);
-        set_views(enc, 3, &[x, y]);
-        let shape = MmShape {
-            m: 0,
-            n: w.rows as u32,
-            k: w.cols as u32,
-            gather: if gather_x { 1 } else { 2 },
-        };
-        params(enc, 5, &shape);
-        set_views(enc, 6, &[g.tiles, g.rows, g.tile_count]);
-        groups(enc, (w.rows.div_ceil(FEW_OUT), g.max_tiles), 64);
+        few_grouped(gpu, enc, w, x, y, g, gather_x);
     }
 
     /// Fast-mode dense matrices run on qmm_dq (w rounded to half), 6% faster
@@ -1471,10 +1535,16 @@ mod mac {
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
             let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
+            let fused = !self.exact_now() && fused_gate_up();
             if self.on("experts gate, up") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
                     qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
+                } else if fused {
+                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    gate_up_grouped(
+                        gpu, enc, &e.gate, &e.up, normed, &normed_half, &eg, &eu, &expert_half, &g,
+                    );
                 } else {
                     to_half(gpu, enc, normed, &normed_half, t * h);
                     qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
@@ -1482,19 +1552,23 @@ mod mac {
                 }
             }
             if self.on("experts silu") {
-                dispatch_1d(
-                    enc,
-                    &silu_mul,
-                    &[(&s.expert_g, 0), (&s.expert_u, 0)],
-                    t * top_k * e.size(),
-                );
+                if !fused {
+                    dispatch_1d(
+                        enc,
+                        &silu_mul,
+                        &[(&s.expert_g, 0), (&s.expert_u, 0)],
+                        t * top_k * e.size(),
+                    );
+                }
                 self.record(gpu, enc, 4, &eg, t * top_k * e.size());
             }
             if self.on("experts down") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.down, &eg, &eo, &g, false, true);
                 } else {
-                    to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    if !fused {
+                        to_half(gpu, enc, &eg, &expert_half, t * top_k * e.size());
+                    }
                     qmm2_grouped(gpu, enc, &e.down, &eg, &expert_half, &eo, &g, false);
                 }
             }
@@ -1897,6 +1971,15 @@ mod mac {
             assert!(err < logits_bound);
             if exact {
                 assert_eq!(argmax(&got), argmax(&want));
+            }
+        }
+
+        /// The prefill kernels compile (no dispatch, so no GPU work).
+        #[test]
+        fn kernels_compile() {
+            let gpu = Gpu::new().unwrap();
+            for name in ["prefill_gate_up_5bit", "prefill_gate_up_8bit", "prefill_silu_few"] {
+                gpu.pipeline(name);
             }
         }
 
