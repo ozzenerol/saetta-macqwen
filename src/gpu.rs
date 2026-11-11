@@ -3,7 +3,10 @@
 //! Kernels live in `kernels/*.metal` and are compiled at startup from source,
 //! so the Mac needs no Xcode, only the system Metal framework.
 
-pub const KERNELS: &str = include_str!("../kernels/basic.metal");
+pub const KERNELS: &str = concat!(
+    include_str!("../kernels/basic.metal"),
+    include_str!("../kernels/qmv.metal"),
+);
 
 #[cfg(target_os = "macos")]
 pub use mac::*;
