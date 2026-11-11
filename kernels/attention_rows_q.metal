@@ -30,6 +30,27 @@ inline void kv_stage(device const uint *data, device const half *scales,
     }
 }
 
+// As kv_stage, all 256 dims of each row: dst[row * stride + dim], for
+// kernels that keep a whole block of keys (stride 256 + padding).
+template <uint BITS>
+inline void kv_stage_rows(device const uint *data, device const half *scales,
+                          device const half *biases, uint kv_heads, uint kv, uint row0,
+                          uint rows, uint limit, threadgroup half *dst, uint stride, uint tid,
+                          uint threads) {
+    uint per_token = kv_heads * PREFILL_ATT_DIM / KVQ_DIMS;
+    uint first = kv * (PREFILL_ATT_DIM / KVQ_DIMS);
+    constexpr uint QUADS = PREFILL_ATT_DIM / 4;
+    for (uint i = tid; i < rows * QUADS; i += threads) {
+        uint row = i / QUADS, dim = 4 * (i % QUADS);
+        uint token = row0 + row;
+        float4 x = token < limit ? kv_load4<BITS>(data, scales, biases,
+                                                  token * per_token + first + dim / KVQ_DIMS,
+                                                  dim % KVQ_DIMS)
+                                 : float4(0);
+        *(threadgroup half4 *)(dst + row * stride + dim) = half4(x);
+    }
+}
+
 // attention_rows2 (prefill.metal), keys and values staged as above.
 template <typename T, uint SIMDS, uint BITS>
 kernel void attention_rows2_q(device const T *q [[buffer(0)]],
