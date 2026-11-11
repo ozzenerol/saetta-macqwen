@@ -249,7 +249,6 @@ mod mac {
 
     /// qmm_grouped on qmm2 (src/qmm.rs), which takes `x_half`, the half of
     /// `x`; the tiles of FEW rows or fewer still go to qmm_few on `x`.
-    #[allow(clippy::too_many_arguments)]
     /// The qmm2 variant for the experts: SAETTA_EXPERT_VARIANT=<index into
     /// qmm::VARIANTS> (0 to 3) to compare, else DEFAULT.
     fn expert_variant() -> crate::qmm::Variant {
@@ -260,6 +259,7 @@ mod mac {
             .map_or(crate::qmm::DEFAULT, |i| crate::qmm::VARIANTS[i])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn qmm2_grouped(
         gpu: &Gpu,
         enc: &ComputeCommandEncoderRef,
