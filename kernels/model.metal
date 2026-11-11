@@ -38,19 +38,24 @@ template [[host_name("embed_5bit")]] kernel decltype(embed<5>) embed<5>;
 struct RouteShape {
     uint experts;
     uint top_k;
+    uint logit_stride;  // floats between rows' logits
 };
 
 // Softmax over the router logits, the top_k best (ties go to the lower id,
 // as the CPU's stable sort), and their weights rescaled to sum to 1.
-// One simdgroup: lane l holds experts l, l + 32, ... in registers, so the
-// whole kernel runs without threadgroup memory or barriers.
+// One simdgroup per row: lane l holds experts l, l + 32, ... in registers,
+// so the whole kernel runs without threadgroup memory or barriers.
 #define ROUTE_PER_LANE 8
 
 kernel void route_top_k(device const float *logits [[buffer(0)]],
                         device uint *ids [[buffer(1)]],
                         device float *weights [[buffer(2)]],
                         constant RouteShape &shape [[buffer(3)]],
+                        uint row [[threadgroup_position_in_grid]],
                         uint lane [[thread_index_in_simdgroup]]) {
+    logits += row * shape.logit_stride;
+    ids += row * shape.top_k;
+    weights += row * shape.top_k;
     float p[ROUTE_PER_LANE];
     float m = -INFINITY;
     for (uint j = 0; j < ROUTE_PER_LANE; j++) {
