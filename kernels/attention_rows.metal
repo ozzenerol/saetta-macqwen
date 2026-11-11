@@ -10,6 +10,9 @@
 // (GpuKvCache rounds it up), so a chunk never reaches past it.
 
 constant uint ROWS_PASS = 4;
+// Row stride of the score tile: 128 + 4 floats, so the 8 rows of an 8x8
+// tile load fall in different banks.
+constant uint SC_STRIDE = DEC_CHUNK + 4;
 
 struct RowsAttentionParams {
     uint heads;
@@ -31,7 +34,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                                    uint simd [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
     // Scores of the pass's rows: sc[r * 8 + g][t].
-    threadgroup float sc[ROWS_PASS * DEC_GROUP][DEC_CHUNK];
+    threadgroup float sc[ROWS_PASS * DEC_GROUP][SC_STRIDE];
     uint pos = tp.position;
     uint start = tg.x * DEC_CHUNK;
     uint last_len = min(pos + p.rows, p.capacity);
@@ -86,8 +89,8 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
                 break;
             }
                 // s[r][i] is S^T: (token, head); store as (head, token).
-                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
-                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
+                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], SC_STRIDE, ulong2(0, 0), true);
+                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], SC_STRIDE, ulong2(0, 0), true);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -153,7 +156,7 @@ kernel void attention_partial_rows(device const float *q [[buffer(0)]],
 #pragma clang loop unroll(full)
                     for (uint h = 0; h < 2; h++) {
                         simdgroup_float8x8 pt;
-                        simdgroup_load(pt, &sc[r * DEC_GROUP][t + 8 * h], DEC_CHUNK);
+                        simdgroup_load(pt, &sc[r * DEC_GROUP][t + 8 * h], SC_STRIDE);
 #pragma clang loop unroll(full)
                         for (uint i = 0; i < 4; i++) {
                             simdgroup_multiply_accumulate(o[r][i], pt, vt[h][i], o[r][i]);
@@ -245,7 +248,7 @@ kernel void attention_partial_rows_nos(device const float *q [[buffer(0)]],
                                    uint simd [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
     // Scores of the pass's rows: sc[r * 8 + g][t].
-    threadgroup float sc[ROWS_PASS * DEC_GROUP][DEC_CHUNK];
+    threadgroup float sc[ROWS_PASS * DEC_GROUP][SC_STRIDE];
     uint pos = tp.position;
     uint start = tg.x * DEC_CHUNK;
     uint last_len = min(pos + p.rows, p.capacity);
@@ -277,8 +280,8 @@ kernel void attention_partial_rows_nos(device const float *q [[buffer(0)]],
                 break;
             }
                 // s[r][i] is S^T: (token, head); store as (head, token).
-                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
-                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
+                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], SC_STRIDE, ulong2(0, 0), true);
+                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], SC_STRIDE, ulong2(0, 0), true);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -344,7 +347,7 @@ kernel void attention_partial_rows_nos(device const float *q [[buffer(0)]],
 #pragma clang loop unroll(full)
                     for (uint h = 0; h < 2; h++) {
                         simdgroup_float8x8 pt;
-                        simdgroup_load(pt, &sc[r * DEC_GROUP][t + 8 * h], DEC_CHUNK);
+                        simdgroup_load(pt, &sc[r * DEC_GROUP][t + 8 * h], SC_STRIDE);
 #pragma clang loop unroll(full)
                         for (uint i = 0; i < 4; i++) {
                             simdgroup_multiply_accumulate(o[r][i], pt, vt[h][i], o[r][i]);
@@ -385,7 +388,7 @@ kernel void attention_partial_rows_nov(device const float *q [[buffer(0)]],
                                    uint simd [[simdgroup_index_in_threadgroup]],
                                    uint lane [[thread_index_in_simdgroup]]) {
     // Scores of the pass's rows: sc[r * 8 + g][t].
-    threadgroup float sc[ROWS_PASS * DEC_GROUP][DEC_CHUNK];
+    threadgroup float sc[ROWS_PASS * DEC_GROUP][SC_STRIDE];
     uint pos = tp.position;
     uint start = tg.x * DEC_CHUNK;
     uint last_len = min(pos + p.rows, p.capacity);
@@ -440,8 +443,8 @@ kernel void attention_partial_rows_nov(device const float *q [[buffer(0)]],
                 break;
             }
                 // s[r][i] is S^T: (token, head); store as (head, token).
-                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], DEC_CHUNK, ulong2(0, 0), true);
-                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], DEC_CHUNK, ulong2(0, 0), true);
+                simdgroup_store(s[r][0], &sc[r * DEC_GROUP][16 * simd], SC_STRIDE, ulong2(0, 0), true);
+                simdgroup_store(s[r][1], &sc[r * DEC_GROUP][16 * simd + 8], SC_STRIDE, ulong2(0, 0), true);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
