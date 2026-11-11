@@ -184,7 +184,9 @@ mod mac {
             k: w.cols as u32,
             gather: 0,
         };
-        if m <= FEW_MAX {
+        // The exact (split) kernels keep qmm_few's f32 up to FEW_MAX rows.
+        let few = m <= FEW_MAX && (kernel.ends_with("_split") || m <= fast_few_max());
+        if few {
             enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
         } else {
             enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
@@ -192,7 +194,7 @@ mod mac {
         set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y, x, x, x]);
         params(enc, 5, &shape);
-        if m <= FEW_MAX {
+        if few {
             groups(enc, (w.rows.div_ceil(FEW_OUT), m.div_ceil(FEW)), 64);
         } else {
             groups(enc, (w.rows.div_ceil(TILE), m.div_ceil(TILE)), 128);
@@ -202,6 +204,19 @@ mod mac {
     /// Up to this many rows, qmm uses qmm_few: weights are read once per 8
     /// rows of x instead of computing a 64-row tile.
     const FEW_MAX: usize = 64;
+
+    /// The FEW_MAX of the fast (qmm_dq) dense products: SAETTA_FEW_MAX=<n>
+    /// sends more than n rows to the 64-row tiles, which read the weights
+    /// once where qmm_few reads them once per 8 rows. At most FEW_MAX.
+    fn fast_few_max() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_FEW_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(FEW_MAX, |n: usize| n.min(FEW_MAX))
+        })
+    }
     /// x rows per qmm_few threadgroup; must match PREFILL_FEW.
     const FEW: usize = 8;
     /// y columns per qmm_few threadgroup: 2 simdgroups of 4.
