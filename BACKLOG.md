@@ -7,6 +7,9 @@
 - A2 `tools/golden.py`: run MLX on a fixed short prompt and write reference data to `golden/` on the Mac: token ids, the hidden state after the embedding and after each of layers 0 to 3, router choices for those layers, the Gated DeltaNet state after layer 0. Plain f32 files plus a small JSON index. Use lazy loading so only those layers are computed.
 - A3 `src/tokenizer.rs`: byte-level BPE from `tokenizer.json`, special tokens, encode and decode. Test against the MLX tokenizer on a set of strings (ASCII, code, Romanian, CJK, emoji).
 
+- A4 `src/chat.rs`: the chat template written by hand, byte-equal with MLX `apply_chat_template`, tools and preserved thinking, and the prompt of N+1 messages starts with the prompt of N.
+- A5 `src/server.rs` and `src/sample.rs`: OpenAI-compatible HTTP on std::net with streaming, reasoning_content, tool calls and usage; the model behind a small trait, tested with a fake model; sampling.
+
 ## Track B: Metal kernels
 
 - B1 `src/quant.rs`: CPU dequantize for MLX affine 5-bit and 8-bit, group 64, checked against `mlx.core.dequantize` on real tensors.
@@ -24,6 +27,5 @@
 ## Later
 
 - Metal versions of C1 to C3, all 40 layers, logits and sampling
-- OpenAI-compatible server
 - MTP weights and speculative decoding
 - state snapshots per turn
