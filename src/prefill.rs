@@ -33,19 +33,17 @@ mod mac {
     const KEY_BLOCK: usize = 64;
     const _: () = assert!(KEY_BLOCK.is_multiple_of(crate::attention_prefill::KEY_BLOCK));
 
-    /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one and
-    /// SAETTA_ATT=8 the one with 8 heads per threadgroup, to compare.
-    /// The fast-mode attention kernel: SAETTA_ATT=fa8 or fa4 picks B's flash
-    /// kernels in src/attention_prefill.rs, gemm src/attention_gemm.rs, 1 and
-    /// 8 older ones.
+    /// The fast-mode attention: gemm (src/attention_gemm.rs, 9 TF/s at long
+    /// context, as MLX) unless SAETTA_ATT=rows2, fa8 or fa4 (B's flash
+    /// kernels), 1 or 8 (older ones).
     fn attention_half_kernel() -> &'static str {
         match std::env::var("SAETTA_ATT").as_deref() {
             Ok("1") => "attention_rows_half",
             Ok("8") => "attention_rows2_half8",
+            Ok("rows2") => "attention_rows2_half",
             Ok("fa8") => "attention_fa8",
-            Ok("gemm") => "gemm",
             Ok("fa4") => "attention_fa4",
-            _ => "attention_rows2_half",
+            _ => "gemm",
         }
     }
 
