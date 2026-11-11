@@ -286,7 +286,7 @@ impl<'a> Layer<'a> {
     }
 }
 
-fn deltanet_config(cfg: &Config) -> DeltaNetConfig {
+pub fn deltanet_config(cfg: &Config) -> DeltaNetConfig {
     DeltaNetConfig {
         k_heads: cfg.linear_num_key_heads,
         v_heads: cfg.linear_num_value_heads,
@@ -297,7 +297,7 @@ fn deltanet_config(cfg: &Config) -> DeltaNetConfig {
     }
 }
 
-fn attention_config(cfg: &Config) -> AttentionConfig {
+pub fn attention_config(cfg: &Config) -> AttentionConfig {
     AttentionConfig {
         heads: cfg.num_attention_heads,
         kv_heads: cfg.num_key_value_heads,
