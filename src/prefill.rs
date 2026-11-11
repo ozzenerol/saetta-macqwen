@@ -23,7 +23,7 @@ mod mac {
     use crate::sample_gpu::GpuSampler;
     use crate::weights::Weights;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::time::Instant;
 
     const PREFIX: &str = "language_model.model";
@@ -535,10 +535,6 @@ mod mac {
         verify_rows: Option<VerifyRows>,
         /// Set while `verify` encodes, so the DeltaNet layers write snapshots.
         snapshot_run: Cell<bool>,
-        /// Half copies of a quantized cache's keys and values, which the
-        /// attention reads; made at the first such cache, at its size. The
-        /// layers run one after the other, so they share it.
-        dequantized: RefCell<Option<(Buffer, Buffer)>>,
         /// Set while `verify` encodes: its rows run on the exact kernels
         /// whatever `exact` says, so they match decode.
         force_exact: Cell<bool>,
@@ -685,7 +681,6 @@ mod mac {
             Ok(Prefill {
                 verify_rows: None,
                 snapshot_run: Cell::new(false),
-                dequantized: RefCell::new(None),
                 only: Cell::new(None),
                 force_exact: Cell::new(false),
                 cfg,
@@ -1348,37 +1343,52 @@ mod mac {
                 }
                 return;
             }
-            // A quantized cache goes through a half copy of the tokens so far.
-            let cached = match &cache.quant {
-                None => [whole(&cache.keys), whole(&cache.values)],
-                Some((kq, vq)) => {
-                    let mut copy = self.dequantized.borrow_mut();
-                    let bytes = (cache.capacity * kv_size * 2) as u64;
-                    if copy.as_ref().is_none_or(|(k, _)| k.length() < bytes) {
-                        *copy = Some((gpu.buffer(bytes as usize), gpu.buffer(bytes as usize)));
-                    }
-                    let (hk, hv) = copy.as_ref().unwrap();
-                    let (hk, hv) = (whole(hk), whole(hv));
-                    kq.encode_dequantize(gpu, enc, &hk, pos + t);
-                    vq.encode_dequantize(gpu, enc, &hv, pos + t);
-                    [hk, hv]
-                }
+            let exact = self.exact_now();
+            let kernel = match (&cache.quant, exact) {
+                (None, true) => "attention_rows",
+                (None, false) => attention_half_kernel(),
+                (Some((kq, _)), true) => match kq.bits {
+                    KvBits::Eight => "attention_rows_q8",
+                    _ => "attention_rows_q4",
+                },
+                (Some((kq, _)), false) => match kq.bits {
+                    KvBits::Eight => "attention_rows2_half_q8",
+                    _ => "attention_rows2_half_q4",
+                },
             };
-            let kernel = if self.exact_now() {
-                "attention_rows"
-            } else {
-                attention_half_kernel()
-            };
-            if self.exact_now() {
-                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
-                set_views(enc, 0, &[&q, &cached[0], &cached[1]]);
+            let q_in = if exact {
+                q.clone()
             } else {
                 let q_half = whole(&s.q_half);
                 to_half(gpu, enc, &q, &q_half, t * c.heads * d);
-                enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
-                set_views(enc, 0, &[&q_half, &cached[0], &cached[1]]);
-            }
-            set_views(enc, 3, &[&q_and_gate, &y]);
+                q_half
+            };
+            enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
+            // A quantized cache is read in place (kernels/attention_rows_q.metal).
+            let next = match &cache.quant {
+                None => {
+                    set_views(enc, 0, &[&q_in, &whole(&cache.keys), &whole(&cache.values)]);
+                    3
+                }
+                Some((kq, vq)) => {
+                    let w = |b: &Buffer| whole(b);
+                    set_views(
+                        enc,
+                        0,
+                        &[
+                            &q_in,
+                            &w(&kq.data),
+                            &w(&vq.data),
+                            &w(&kq.scales),
+                            &w(&kq.biases),
+                            &w(&vq.scales),
+                            &w(&vq.biases),
+                        ],
+                    );
+                    7
+                }
+            };
+            set_views(enc, next, &[&q_and_gate, &y]);
             let p = AttentionParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -1386,9 +1396,13 @@ mod mac {
                 tokens: t as u32,
                 scale: 1.0 / (d as f32).sqrt(),
             };
-            params(enc, 5, &p);
+            params(enc, next + 2, &p);
             // Heads of one kv head per threadgroup.
-            let heads = if kernel.ends_with('8') { 8 } else { 4 };
+            let heads = if kernel == "attention_rows2_half8" {
+                8
+            } else {
+                4
+            };
             assert!((c.heads / c.kv_heads).is_multiple_of(heads));
             groups(enc, (t.div_ceil(8), c.heads / heads), 32 * heads);
             self.record(gpu, enc, 2, &y, t * c.heads * d);
