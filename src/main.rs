@@ -140,7 +140,8 @@ fn convert_mtp(file: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
 #[derive(Clone, Copy)]
 struct ServeFlags {
     gpu: bool,
-    /// Tokens the MTP layer drafts per round; 0 turns drafting off.
+    /// Tokens the MTP layer drafts per round; 0 turns drafting off. With
+    /// `--gpu` it is 3 unless `--draft` says otherwise.
     draft: usize,
     port: u16,
     exact_history: bool,
@@ -169,6 +170,7 @@ impl Default for Memory {
 
 /// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
+    let mut draft = None;
     let mut f = ServeFlags {
         gpu: false,
         draft: 0,
@@ -182,12 +184,13 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             "--gpu" => f.gpu = true,
             "--draft" => {
                 let value = it.next().ok_or("--draft needs a number")?;
-                f.draft = value
+                let k: usize = value
                     .parse()
                     .map_err(|_| format!("bad draft count {value}"))?;
-                if f.draft > 7 {
+                if k > 7 {
                     return Err("--draft takes 0 to 7".into());
                 }
+                draft = Some(k);
             }
             "--exact-history" => f.exact_history = true,
             "--context" => {
@@ -213,9 +216,12 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
-    if f.draft > 0 && !f.gpu {
-        return Err("--draft needs --gpu".into());
-    }
+    f.draft = match draft {
+        Some(k) if k > 0 && !f.gpu => return Err("--draft needs --gpu".into()),
+        Some(k) => k,
+        None if f.gpu => 3,
+        None => 0,
+    };
     Ok(f)
 }
 
@@ -855,5 +861,22 @@ fn bench_prefill(dir: &str, tokens: &str, chunk: &str) -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_flags;
+
+    #[test]
+    fn draft_defaults_to_3_on_the_gpu() {
+        let draft = |flags: &[&str]| serve_flags(flags).map(|f| f.draft);
+        assert_eq!(draft(&["--gpu"]), Ok(3));
+        assert_eq!(draft(&["--gpu", "--draft", "0"]), Ok(0));
+        assert_eq!(draft(&["--draft", "5", "--gpu"]), Ok(5));
+        assert_eq!(draft(&[]), Ok(0));
+        assert_eq!(draft(&["--draft", "0"]), Ok(0));
+        assert!(draft(&["--draft", "2"]).is_err());
+        assert!(draft(&["--gpu", "--draft", "8"]).is_err());
     }
 }
