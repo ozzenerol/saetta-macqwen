@@ -14,6 +14,7 @@ pub mod moe;
 pub mod mtp;
 pub mod plan;
 pub mod prefill;
+pub mod profile;
 pub mod qmv;
 pub mod quant;
 pub mod sample;

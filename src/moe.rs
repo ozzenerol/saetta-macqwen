@@ -105,11 +105,12 @@ mod mac {
             h: &View,
             y: &View,
         ) {
-            self.record_gate_up(plan, x, ids, count, h);
+            self.record_gate_up(plan, x, ids, count, h, false);
             self.record_down(plan, h, ids, weights, count, y);
         }
 
         /// h[i] = silu(gate[ids[i]] x) * up[ids[i]] x for i < count.
+        /// `parallel` marks it independent of the op recorded before it.
         pub fn record_gate_up(
             &self,
             plan: &mut Plan,
@@ -117,18 +118,20 @@ mod mac {
             ids: &View,
             count: usize,
             h: &View,
+            parallel: bool,
         ) {
             let (g, u) = (&self.gate, &self.up);
             let shape = plan.constant(&[g.rows as u32, g.cols as u32, count as u32]);
-            plan.op(
-                "moe_gate_up_5bit",
-                &[
-                    &g.words, &g.scales, &g.biases, &u.words, &u.scales, &u.biases, x, h, &shape,
-                    ids,
-                ],
-                MTLSize::new(row_groups(g.rows), count as u64, 1),
-                MTLSize::new(32 * SIMDS as u64, 1, 1),
-            );
+            let buffers = [
+                &g.words, &g.scales, &g.biases, &u.words, &u.scales, &u.biases, x, h, &shape, ids,
+            ];
+            let grid = MTLSize::new(row_groups(g.rows), count as u64, 1);
+            let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
+            if parallel {
+                plan.op_parallel("moe_gate_up_5bit", &buffers, grid, threads);
+            } else {
+                plan.op("moe_gate_up_5bit", &buffers, grid, threads);
+            }
         }
 
         /// y = sum of weights[i] * down[ids[i]] h[i] for i < count.
@@ -268,7 +271,7 @@ mod mac {
             let mut plan = Plan::new(&gpu);
             for (layer, ids) in layers.iter().zip(&ids) {
                 if part != 2 {
-                    layer.record_gate_up(&mut plan, &x, ids, 8, &h);
+                    layer.record_gate_up(&mut plan, &x, ids, 8, &h, false);
                 }
                 if part != 1 {
                     layer.record_down(&mut plan, &h, ids, &w, 8, &y);
