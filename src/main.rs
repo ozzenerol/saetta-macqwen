@@ -69,6 +69,14 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(target_os = "macos")]
+        ["bench-attention-prefill", tokens] => match tokens.parse() {
+            Ok(n) => report(saetta::attention_prefill::bench(n, 1024)),
+            Err(_) => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
+        #[cfg(target_os = "macos")]
         ["bench-qmm2", dir] => report(saetta::qmm::bench(Path::new(dir), &[512, 2048], 10)),
         #[cfg(target_os = "macos")]
         ["bench-qmm", dir, rows] => match rows.parse() {

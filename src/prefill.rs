@@ -39,6 +39,9 @@ mod mac {
             Ok("1") => "attention_rows_half",
             Ok("8") => "attention_rows2_half8",
             Ok("9") => "attention_flash",
+            Ok("10") => "attention_flash_pre",
+            Ok("11") => "attention_flash_dev",
+            Ok("12") => "attention_flash_reg",
             _ => "attention_rows2_half",
         }
     }
@@ -1314,7 +1317,7 @@ mod mac {
                 );
                 to_half(gpu, enc, &keys, &hk, t * kv_size);
                 to_half(gpu, enc, &values, &hv, t * kv_size);
-                if kernel == "attention_flash" {
+                if kernel.starts_with("attention_flash") {
                     let p = crate::attention_prefill::FlashParams {
                         heads: c.heads as u32,
                         kv_heads: c.kv_heads as u32,
@@ -1322,9 +1325,10 @@ mod mac {
                         tokens: t as u32,
                         scale: 1.0 / (d as f32).sqrt(),
                     };
-                    crate::attention_prefill::encode(
+                    crate::attention_prefill::encode_kernel(
                         enc,
                         gpu,
+                        kernel,
                         &q_half,
                         &whole(&half.keys),
                         &whole(&half.values),
