@@ -303,7 +303,7 @@ fn load_gpu(
         saetta::gpu_model::GpuModel::load(gpu, config, weights, config.num_layers(), context)?;
     let layers = model.deltanet_states();
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, cache::DEFAULT_LIMIT + 1);
-    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, context)?;
+    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
     prefill.exact = exact_prefill();
     if draft > 0 {
         prefill.enable_verify(gpu, draft + 1);

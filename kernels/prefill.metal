@@ -585,10 +585,22 @@ constant uint PREFILL_ATT_DIM = 256;
 constant uint PREFILL_ATT_KB = 32;
 constant uint PREFILL_ATT_SIMDS = 4;
 
+// The KV cache is half; T is the type of q, the probabilities and the
+// matrix products.
+template <typename T>
+inline simdgroup_matrix<T, 8, 8> prefill_from_half(simdgroup_half8x8 m) {
+    simdgroup_matrix<T, 8, 8> r;
+    thread auto &re = r.thread_elements();
+    thread auto &me = m.thread_elements();
+    re[0] = T(me[0]);
+    re[1] = T(me[1]);
+    return r;
+}
+
 template <typename T>
 kernel void attention_rows(device const T *q [[buffer(0)]],
-                           device const T *keys [[buffer(1)]],
-                           device const T *values [[buffer(2)]],
+                           device const half *keys [[buffer(1)]],
+                           device const half *values [[buffer(2)]],
                            device const float *q_and_gate [[buffer(3)]],
                            device float *out [[buffer(4)]],
                            constant PrefillAttentionParams &p [[buffer(5)]],
@@ -608,8 +620,8 @@ kernel void attention_rows(device const T *q [[buffer(0)]],
     uint q_stride = p.heads * PREFILL_ATT_DIM;
     uint kv_stride = p.kv_heads * PREFILL_ATT_DIM;
     device const T *qh = q + ulong(q0) * q_stride + h * PREFILL_ATT_DIM;
-    device const T *kh = keys + kv * PREFILL_ATT_DIM;
-    device const T *vh = values + kv * PREFILL_ATT_DIM;
+    device const half *kh = keys + kv * PREFILL_ATT_DIM;
+    device const half *vh = values + kv * PREFILL_ATT_DIM;
     uint end = p.pos + min(q0 + 8, p.tokens);
 
     // For the softmax, lane l handles row l / 4, columns (l % 4) * 8 .. + 8
@@ -635,10 +647,10 @@ kernel void attention_rows(device const T *q [[buffer(0)]],
             simdgroup_matrix<T, 8, 8> qm;
             simdgroup_load(qm, qh + d, q_stride);
             for (uint j = 0; j < PREFILL_ATT_KB / 8; j++) {
-                simdgroup_matrix<T, 8, 8> km;
+                simdgroup_half8x8 km;
                 simdgroup_load(km, kh + ulong(k0 + 8 * j) * kv_stride + d, kv_stride, ulong2(0, 0),
                                true);
-                simdgroup_multiply_accumulate(s[j], qm, km, s[j]);
+                simdgroup_multiply_accumulate(s[j], qm, prefill_from_half<T>(km), s[j]);
             }
         }
         for (uint j = 0; j < PREFILL_ATT_KB / 8; j++) {
@@ -682,9 +694,9 @@ kernel void attention_rows(device const T *q [[buffer(0)]],
             oe[0] *= a;
             oe[1] *= a;
             for (uint j = 0; j < PREFILL_ATT_KB / 8; j++) {
-                simdgroup_matrix<T, 8, 8> vm;
+                simdgroup_half8x8 vm;
                 simdgroup_load(vm, vh + ulong(k0 + 8 * j) * kv_stride + 8 * d, kv_stride);
-                simdgroup_multiply_accumulate(o[d], pm[j], vm, o[d]);
+                simdgroup_multiply_accumulate(o[d], pm[j], prefill_from_half<T>(vm), o[d]);
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);

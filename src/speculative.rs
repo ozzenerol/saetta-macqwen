@@ -675,7 +675,7 @@ mod gpu_real {
             let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 1024).unwrap();
             let mtp = GpuMtp::load(&gpu, &cfg, &weights, 1024).unwrap();
             let mut spec = GpuSpec::new(&model, mtp, &cfg, 3);
-            let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 64, 1024).unwrap();
+            let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 64).unwrap();
             prefill.exact = true;
             prefill.enable_verify(&gpu, 4);
             let mut rows = Vec::with_capacity(prompt.len() * h);
