@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -384,25 +384,28 @@ impl Restore for CpuModel {
 
 struct EvalOptions {
     gpu: bool,
-    ppl: bool,
-    long: usize,
+    gate: saetta::eval::Options,
 }
 
 /// `--gpu` runs the GPU model instead of the CPU one; `--long N` runs the
-/// first N tokens of the long prompt (default 0, off); `--no-ppl` skips the
-/// perplexity text.
+/// first N tokens of the long prompt (default 0, off), through prefill, or
+/// one token at a time with `--decode`; `--no-ppl` skips the perplexity text.
 fn eval_options(options: &[&str]) -> Option<EvalOptions> {
     let mut o = EvalOptions {
         gpu: false,
-        ppl: true,
-        long: 0,
+        gate: saetta::eval::Options {
+            ppl: true,
+            long: 0,
+            decode: false,
+        },
     };
     let mut rest = options.iter();
     while let Some(&option) = rest.next() {
         match option {
             "--gpu" => o.gpu = true,
-            "--no-ppl" => o.ppl = false,
-            "--long" => o.long = rest.next()?.parse().ok()?,
+            "--no-ppl" => o.gate.ppl = false,
+            "--decode" => o.gate.decode = true,
+            "--long" => o.gate.long = rest.next()?.parse().ok()?,
             _ => return None,
         }
     }
@@ -420,7 +423,7 @@ fn eval(dir: &Path, reference: &Path, o: EvalOptions) -> Result<bool, Box<dyn Er
     let model = Model::new(config, weights)?;
     let states = model.new_states();
     let mut model = CpuModel { model, states };
-    saetta::eval::gate(&mut model, &reference, o.ppl, o.long)
+    saetta::eval::gate(&mut model, &reference, &o.gate)
 }
 
 #[cfg(target_os = "macos")]
@@ -433,7 +436,7 @@ fn eval_gpu(
     let mut model = load_gpu(config, weights)?;
     let prefill = if model.prefill.exact { "exact" } else { "fast" };
     println!("GPU model, {prefill} prefill");
-    saetta::eval::gate(&mut model, reference, o.ppl, o.long)
+    saetta::eval::gate(&mut model, reference, &o.gate)
 }
 
 #[cfg(not(target_os = "macos"))]

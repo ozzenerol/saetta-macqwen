@@ -1,4 +1,4 @@
-use saetta::eval::{Reference, gate, kl_divergence, nll, perplexity, top_k};
+use saetta::eval::{Options, Reference, gate, kl_divergence, nll, perplexity, top_k};
 use saetta::server::Model;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,6 +97,10 @@ fn write_reference(dir: &Path, ppl: &[u32], long: &[u32], checkpoints: &[usize])
     }
 }
 
+fn opts(ppl: bool, long: usize, decode: bool) -> Options {
+    Options { ppl, long, decode }
+}
+
 #[test]
 fn gate_passes_same_model_and_fails_a_different_one() {
     let dir = std::env::temp_dir().join(format!("saetta-eval-{}", std::process::id()));
@@ -106,13 +110,15 @@ fn gate_passes_same_model_and_fails_a_different_one() {
     let reference = Reference::load(&dir).unwrap();
 
     let mut same = Fake { pos: 0, noise: 0.0 };
-    assert!(gate(&mut same, &reference, true, 64).unwrap());
+    assert!(gate(&mut same, &reference, &opts(true, 64, false)).unwrap());
     // Only the checkpoint at 15 is below 32 tokens.
-    assert!(gate(&mut same, &reference, false, 32).unwrap());
-    assert!(gate(&mut same, &reference, false, 8).is_err());
+    assert!(gate(&mut same, &reference, &opts(false, 32, false)).unwrap());
+    assert!(gate(&mut same, &reference, &opts(false, 8, false)).is_err());
 
     let mut off = Fake { pos: 0, noise: 0.3 };
-    assert!(!gate(&mut off, &reference, true, 0).unwrap());
-    assert!(!gate(&mut off, &reference, false, 64).unwrap());
+    assert!(!gate(&mut off, &reference, &opts(true, 0, false)).unwrap());
+    assert!(!gate(&mut off, &reference, &opts(false, 64, false)).unwrap());
+    assert!(gate(&mut same, &reference, &opts(false, 64, true)).unwrap());
+    assert!(!gate(&mut off, &reference, &opts(false, 64, true)).unwrap());
     fs::remove_dir_all(&dir).unwrap();
 }

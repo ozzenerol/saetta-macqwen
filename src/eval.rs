@@ -255,16 +255,61 @@ fn verdict(pass: bool) -> &'static str {
     if pass { "ok" } else { "FAIL" }
 }
 
-/// Runs the gate and prints a report. `long` is how many tokens of the long
-/// prompt to run; 0 skips it. Returns whether every check passed.
+pub struct Options {
+    pub ppl: bool,
+    /// How many tokens of the long prompt to run; 0 skips it.
+    pub long: usize,
+    /// Feed the long prompt one token at a time through `step` instead of
+    /// `prefill`, to check the decode path at long positions.
+    pub decode: bool,
+}
+
+/// Mean and max |NLL diff| from MLX float32 per 1024 positions, to show
+/// where along the prompt a model starts to drift.
+fn print_blocks(ours: &[f32], reference: &[f32]) {
+    for (i, (a, b)) in ours.chunks(1024).zip(reference.chunks(1024)).enumerate() {
+        let diffs: Vec<f64> = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (x as f64 - y as f64).abs())
+            .collect();
+        let max = diffs.iter().fold(0.0, |m: f64, &d| m.max(d));
+        println!(
+            "  positions {:5}..{:5}: |NLL diff| mean {:.5} max {:.4}",
+            i * 1024,
+            i * 1024 + a.len(),
+            diffs.iter().sum::<f64>() / diffs.len() as f64,
+            max
+        );
+    }
+}
+
+/// Prefills from a fresh state in segments that end at each checkpoint, and
+/// keeps the logits there.
+fn prefill_to<M: Model>(
+    model: &mut M,
+    tokens: &[u32],
+    checkpoints: &[usize],
+) -> Vec<(usize, Vec<f32>)> {
+    model.reset();
+    let mut done = 0;
+    let mut out = Vec::new();
+    for &pos in checkpoints {
+        out.push((pos, model.prefill(&tokens[done..=pos])));
+        done = pos + 1;
+    }
+    out
+}
+
+/// Runs the gate and prints a report. Returns whether every check passed.
 pub fn gate<M: Model>(
     model: &mut M,
     reference: &Reference,
-    ppl: bool,
-    long: usize,
+    options: &Options,
 ) -> Result<bool, Box<dyn Error>> {
     let mut pass = true;
-    if ppl {
+    let long = options.long;
+    if options.ppl {
         let tokens = &reference.ppl_tokens;
         eprintln!("ppl: {} tokens", tokens.len());
         let ours = run(model, tokens, &[]);
@@ -293,13 +338,26 @@ pub fn gate<M: Model>(
             )
             .into());
         }
-        println!("long: {long} tokens through prefill");
-        model.reset();
+        let path = if options.decode { "step" } else { "prefill" };
+        println!("long: {long} tokens through {path}");
         let start = Instant::now();
-        let mut done = 0;
-        for &pos in &checkpoints {
-            let logits = model.prefill(&tokens[done..=pos]);
-            done = pos + 1;
+        let ours = if options.decode {
+            let ours = run(model, tokens, &checkpoints);
+            let f32_nll = reference.nll("f32", "long")?;
+            let report = PplReport::new(
+                &ours,
+                &f32_nll,
+                &reference.argmax("f32", "long")?,
+                &reference.nll("bf16", "long")?,
+            );
+            report.print("long", long);
+            pass &= report.pass();
+            print_blocks(&ours.nll, &f32_nll);
+            ours.logits
+        } else {
+            prefill_to(model, tokens, &checkpoints)
+        };
+        for (pos, logits) in ours {
             let r = LogitsReport::new(
                 pos,
                 &reference.logits("f32", pos)?,
@@ -309,7 +367,7 @@ pub fn gate<M: Model>(
             r.print();
             pass &= r.pass();
         }
-        eprintln!("  {done} tokens in {:.1} s", start.elapsed().as_secs_f64());
+        eprintln!("  {long} tokens in {:.1} s", start.elapsed().as_secs_f64());
     }
     println!("{}", if pass { "eval passed" } else { "eval FAILED" });
     Ok(pass)
