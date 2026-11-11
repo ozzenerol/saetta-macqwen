@@ -317,6 +317,21 @@ mod mac {
 
     /// Must match DEC_DIM in kernels/attention.metal.
     const DIM: usize = 256;
+    /// Tokens per chunk; must match DEC_CHUNK.
+    const CHUNK: usize = 128;
+    /// Threadgroups per kv head, unless SAETTA_ROWS_SPLITS says otherwise.
+    const SPLITS: usize = 128;
+
+    /// Threadgroups per kv head for a cache of `capacity` tokens: SPLITS or
+    /// SAETTA_ROWS_SPLITS, at most one per chunk.
+    fn splits(capacity: usize) -> usize {
+        let wanted = std::env::var("SAETTA_ROWS_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(SPLITS);
+        wanted.min(capacity.div_ceil(CHUNK)).max(1)
+    }
 
     /// Decode attention for `m` rows (`attention_partial_rows`, then
     /// `attention_reduce_rows`), with the per-row partial results of up to
@@ -340,7 +355,7 @@ mod mac {
             capacity: usize,
             rows: usize,
         ) -> AttentionRows {
-            let splits = crate::attention::splits(capacity);
+            let splits = splits(capacity);
             AttentionRows {
                 heads,
                 kv_heads,

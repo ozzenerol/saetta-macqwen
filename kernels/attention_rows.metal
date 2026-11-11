@@ -1,5 +1,5 @@
 // Split-K decode attention for m rows at once (the speculative verify),
-// with the splits of attention.metal: threadgroup (s, kv) takes the chunks
+// split K over a fixed number of splits: threadgroup (s, kv) takes the chunks
 // s, s + splits, ... of kv head kv and keeps an online softmax per row, so
 // each chunk's keys and values are read once for up to ROWS_PASS rows.
 // Scores S^T = K Q^T and O = P V in 8x8 simdgroup matrices; more rows take
@@ -16,6 +16,44 @@ constant uint ROWS_PASS = 2;
 // Row stride of the score tile: 128 + 4 floats, so the 8 rows of an 8x8
 // tile load fall in different banks.
 constant uint SC_STRIDE = DEC_CHUNK + 4;
+
+// The running max before any score. It is finite, as fast math wants: a row
+// of the verify with no token yet in a chunk keeps m at this, its factor
+// exp(m - m) is 1 and l stays 0, and the first real score sends the factor
+// to 0.
+constant float DEC_NO_SCORE = -1e30f;
+
+// One chunk's softmax step for query head `g` (simdgroup g): turns the raw
+// scores of its first n tokens in `row` into exp(scale * x - m) against the
+// new running max m and the rest into 0, updates m and l, and leaves in
+// alpha[g] the factor that rescales the output summed so far.
+inline void chunk_softmax(threadgroup float *row, uint n, float scale, thread float &m,
+                          thread float &l, threadgroup float *alpha, uint g, uint lane) {
+    float cm = DEC_NO_SCORE;
+    for (uint t = lane; t < n; t += 32) {
+        cm = max(cm, row[t] * scale);
+    }
+    cm = simd_max(cm);
+    float nm = max(m, cm);
+    float a = exp(m - nm);
+    float sum = 0;
+    for (uint t = lane; t < DEC_CHUNK; t += 32) {
+        float e = t < n ? exp(row[t] * scale - nm) : 0;
+        row[t] = e;
+        sum += e;
+    }
+    l = l * a + simd_sum(sum);
+    m = nm;
+    if (lane == 0) {
+        alpha[g] = a;
+    }
+}
+
+// Multiplies this lane's two elements of an 8x8 tile, both in row f.x, by a.
+inline void scale_tile(thread simdgroup_float8x8 &t, float a) {
+    t.thread_elements()[0] *= a;
+    t.thread_elements()[1] *= a;
+}
 
 struct RowsAttentionParams {
     uint heads;
