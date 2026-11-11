@@ -1,0 +1,139 @@
+The harbour town woke up slowly in winter. The ferry left at seven, and by then the bakery on the corner had been open for two hours, its windows fogged from the inside. Most of the fishing boats stayed tied up from December to March, because the wind came off the open sea in long, cold gusts that could turn a small boat in a minute. The men who still went out did it for the price that cod fetched in the city markets, which was high enough in January to be worth the risk.
+
+Ana ran the hardware shop that her father had opened in 1974. She sold rope, paint, nails by weight, lamp oil and, more and more, phone chargers and batteries. She kept the old ledger on a shelf behind the counter even though the shop had used a computer for twenty years. Customers liked to see it. Some of them asked to find the page where their grandfather had bought a stove, and she would look it up while they waited, running her finger down the columns of names and prices written in blue ink.
+
+The town council met on the first Tuesday of each month in the school hall. The agenda rarely changed: the harbour wall, the bus timetable, the price of parking in summer. This year there was a new item. A company from the mainland wanted to build a small data centre on the hill above the old cannery, where the land was cheap and the sea air would cool the machines for free. It promised forty jobs. Half the room thought this was the best news in a decade. The other half wanted to know how much water it would use, and who would pay for the new power line.
+
+Here is a short program in Go that counts words in a file and prints the ten most common ones:
+
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+)
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: wordcount <file>")
+		os.Exit(2)
+	}
+	f, err := os.Open(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	counts := map[string]int{}
+	sc := bufio.NewScanner(f)
+	sc.Split(bufio.ScanWords)
+	for sc.Scan() {
+		w := strings.ToLower(strings.Trim(sc.Text(), ".,;:!?\"'()"))
+		if w != "" {
+			counts[w]++
+		}
+	}
+	words := make([]string, 0, len(counts))
+	for w := range counts {
+		words = append(words, w)
+	}
+	sort.Slice(words, func(i, j int) bool {
+		if counts[words[i]] != counts[words[j]] {
+			return counts[words[i]] > counts[words[j]]
+		}
+		return words[i] < words[j]
+	})
+	for i, w := range words {
+		if i == 10 {
+			break
+		}
+		fmt.Printf("%6d %s\n", counts[w], w)
+	}
+}
+
+The same idea in Rust, reading from standard input and using a BTreeMap so that ties come out in alphabetical order:
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Read};
+
+fn main() -> io::Result<()> {
+    let mut text = String::new();
+    io::stdin().read_to_string(&mut text)?;
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for word in text.split_whitespace() {
+        let word = word
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if !word.is_empty() {
+            *counts.entry(word).or_default() += 1;
+        }
+    }
+
+    let mut by_count: BTreeMap<std::cmp::Reverse<usize>, Vec<String>> = BTreeMap::new();
+    for (word, n) in counts {
+        by_count.entry(std::cmp::Reverse(n)).or_default().push(word);
+    }
+    for (n, mut words) in by_count.into_iter().take(10) {
+        words.sort();
+        println!("{:6} {}", n.0, words.join(", "));
+    }
+    Ok(())
+}
+
+A Python script that reads a CSV of temperature readings and reports the daily minimum, maximum and mean for each station:
+
+import csv
+import statistics
+import sys
+from collections import defaultdict
+from datetime import datetime
+
+
+def load(path):
+    days = defaultdict(list)
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            when = datetime.fromisoformat(row["time"])
+            key = (row["station"], when.date())
+            days[key].append(float(row["celsius"]))
+    return days
+
+
+def main():
+    days = load(sys.argv[1])
+    for (station, day), values in sorted(days.items()):
+        low, high = min(values), max(values)
+        mean = statistics.fmean(values)
+        print(f"{station:<10} {day} min {low:5.1f} max {high:5.1f} mean {mean:5.1f}")
+
+
+if __name__ == "__main__":
+    main()
+
+The service is configured with a JSON file. This one runs two workers, keeps logs for a week and sends alerts to two addresses:
+
+{
+  "name": "harbour-weather",
+  "version": 3,
+  "listen": "127.0.0.1:8088",
+  "workers": 2,
+  "stations": [
+    {"id": "pier-north", "lat": 45.4371, "lon": 28.0412, "interval_s": 60},
+    {"id": "pier-south", "lat": 45.4302, "lon": 28.0455, "interval_s": 60},
+    {"id": "hill", "lat": 45.4418, "lon": 28.0297, "interval_s": 300, "enabled": false}
+  ],
+  "storage": {"path": "/var/lib/harbour-weather", "retention_days": 7, "compress": true},
+  "alerts": {
+    "wind_kmh_above": 75,
+    "temp_c_below": -12.5,
+    "to": ["ops@example.org", "harbourmaster@example.org"]
+  },
+  "log_level": "info"
+}
+
+In the end the council voted seven to four to let the company build, on two conditions: the cooling would use sea water in a closed loop, and the heat that came out of it would warm the new swimming pool next to the school. Ana voted yes. She thought about the ledger on her shelf, and how many of the names in it belonged to people who had left for the city because there was no work, and she decided that forty jobs were worth a power line on the hill. Her father, who was ninety and still came to the shop on Saturdays, said that the town had argued the same way about the ferry in 1961, and nobody remembered now who had been against it.
