@@ -1176,8 +1176,8 @@ kernel void moe_gate_up_mma3(device const uint *gate_w [[buffer(0)]],
     }
 }
 
-// moe_down_mma with qmv_mma3's layout: threadgroup tg owns 8 output rows
-// and loops over the distinct experts; SPLIT simdgroups split the groups.
+// moe_down_mma with qmv_mma3's layout: threadgroup tg owns 8 output rows;
+// its SPLIT simdgroups split the (distinct expert, group) pairs.
 template <uint SPLIT>
 kernel void moe_down_mma3(device const uint *words [[buffer(0)]],
                           device const ushort *scales [[buffer(1)]],
@@ -1202,7 +1202,9 @@ kernel void moe_down_mma3(device const uint *words [[buffer(0)]],
     uint xk = 16 * (f.x / 2) + f.x % 2;
     uint count = list[0];
     simdgroup_float8x8 acc = simdgroup_float8x8(0);
-    for (uint u = 0; u < count; u++) {
+    // (expert, group) pairs spread over the simdgroups.
+    for (uint pair = simd; pair < count * groups; pair += SPLIT) {
+        uint u = pair / groups, k = pair % groups;
         uint row = list[1 + u] * shape.rows + tg * 8 + f.x;
         float2 xs;
         device const float *hj[2];
@@ -1213,10 +1215,8 @@ kernel void moe_down_mma3(device const uint *words [[buffer(0)]],
             xs[i] = slot != NO_SLOT ? weights[j * shape.count + slot] : 0.0f;
             hj[i] = h + (slot != NO_SLOT ? j * shape.count + slot : 0) * shape.cols + xk;
         }
-        for (uint k = simd; k < groups; k += SPLIT) {
-            mma3_group<BITS>(words + row * row_words, scales, biases, row * groups + k, k, wk,
-                             hj[0], hj[1], xs, acc);
-        }
+        mma3_group<BITS>(words + row * row_words, scales, biases, row * groups + k, k, wk, hj[0],
+                         hj[1], xs, acc);
     }
     float sum = mma3_sum<SPLIT>(acc, red, simd, tid);
     uint j = tid % 8;
