@@ -20,7 +20,7 @@ Pure CPU code can also be tested on the PC with plain `cargo test`.
 ## The Mac
 
 - `mlx_lm.server` is stopped for now (2026-11-11), so 40-layer runs are allowed. The weights are mmapped file pages shared by every saetta process, so several can run at once; each adds about 2 GB. Do not start mlx_lm.server; the MLX reference data is already in ~/saetta/golden, ~/saetta/golden-f32 and ~/saetta/eval.
-- Benchmarks and timing runs go through `~/saetta/timed.sh <track> <command...>` on the Mac (scripts/timed.sh). It waits for ~/saetta/bench.lock, runs the command and removes the lock only if it made it. Never remove the lock by hand. Correctness tests need no lock.
+- Benchmarks and timing runs go through `~/saetta/timed.sh <track> <command...>` on the Mac (scripts/timed.sh). It waits for ~/saetta/bench.lock, runs the command and removes the lock only if it made it. Never remove the lock by hand. Anything that runs the 40-layer model on the GPU (`eval --gpu`, `serve --gpu`, whole-model tests) also goes through timed.sh, since it slows every timing run; a server started for a test is stopped when the test ends. Tests on a few layers need no lock.
 - Python with `mlx` and `mlx_lm` is at `~/llm/mlx/bin/python`.
 - Keep GPU benchmarks short and say when you ran them; other agents share the GPU.
 
