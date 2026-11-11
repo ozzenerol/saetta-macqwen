@@ -17,7 +17,8 @@ struct MoeShape {
 
 // Threadgroup row tg.y is the slot. x has `cols` values, h gets
 // count * rows.
-template <uint BITS>
+// NORM: x is RMS-normed first with nw (buffer 10) and eps (11), as qmv_norm.
+template <uint BITS, bool NORM>
 kernel void moe_gate_up(device const uint *gate_w [[buffer(0)]],
                         device const ushort *gate_s [[buffer(1)]],
                         device const ushort *gate_b [[buffer(2)]],
@@ -28,6 +29,8 @@ kernel void moe_gate_up(device const uint *gate_w [[buffer(0)]],
                         device float *h [[buffer(7)]],
                         constant MoeShape &shape [[buffer(8)]],
                         device const uint *ids [[buffer(9)]],
+                        device const float *nw [[buffer(10)]],
+                        constant float &eps [[buffer(11)]],
                         uint2 tg [[threadgroup_position_in_grid]],
                         uint simd [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
@@ -38,10 +41,11 @@ kernel void moe_gate_up(device const uint *gate_w [[buffer(0)]],
     uint groups = shape.cols / 64;
     float g[MOE_ROWS] = {0};
     float u[MOE_ROWS] = {0};
+    float sq = 0;
 
     for (uint k = lane * 32; k < shape.cols; k += 32 * 32) {
         float xv[32];
-        float xsum = load_x32(x + k, xv);
+        float xsum = NORM ? load_x32_norm(x + k, nw + k, xv, sq) : load_x32(x + k, xv);
 #pragma clang loop unroll(full)
         for (uint r = 0; r < MOE_ROWS; r++) {
             uint row = e * shape.rows + row0 + r;
@@ -52,9 +56,10 @@ kernel void moe_gate_up(device const uint *gate_w [[buffer(0)]],
         }
     }
 
+    float inv = NORM ? norm_inv(sq, shape.cols, eps) : 1.0f;
     for (uint r = 0; r < MOE_ROWS; r++) {
-        float gs = simd_sum(g[r]);
-        float us = simd_sum(u[r]);
+        float gs = simd_sum(g[r]) * inv;
+        float us = simd_sum(u[r]) * inv;
         if (lane == 0) {
             h[slot * shape.rows + row0 + r] = gs / (1.0f + exp(-gs)) * us;
         }
@@ -105,5 +110,6 @@ kernel void moe_down(device const uint *words [[buffer(0)]],
     }
 }
 
-template [[host_name("moe_gate_up_5bit")]] kernel decltype(moe_gate_up<5>) moe_gate_up<5>;
+template [[host_name("moe_gate_up_5bit")]] kernel decltype(moe_gate_up<5, false>) moe_gate_up<5, false>;
+template [[host_name("moe_gate_up_norm_5bit")]] kernel decltype(moe_gate_up<5, true>) moe_gate_up<5, true>;
 template [[host_name("moe_down_5bit")]] kernel decltype(moe_down<5>) moe_down<5>;

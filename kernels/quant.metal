@@ -39,6 +39,32 @@ inline float load_x32(device const float *x, thread float *xv) {
     return sum;
 }
 
+// load_x32 for x times a norm weight: xv = x * nw, returns sum(xv) and
+// adds sum(x * x) to sq. The RMS scale is applied after the dot products,
+// which are linear in x.
+inline float load_x32_norm(device const float *x, device const float *nw, thread float *xv, thread float &sq) {
+    device const float4 *x4 = (device const float4 *)x;
+    device const float4 *w4 = (device const float4 *)nw;
+    float sum = 0;
+#pragma clang loop unroll(full)
+    for (uint i = 0; i < 8; i++) {
+        float4 v = x4[i];
+        float4 n = v * w4[i];
+        sq += dot(v, v);
+        xv[4 * i] = n.x;
+        xv[4 * i + 1] = n.y;
+        xv[4 * i + 2] = n.z;
+        xv[4 * i + 3] = n.w;
+        sum += n.x + n.y + n.z + n.w;
+    }
+    return sum;
+}
+
+// The RMS norm scale from the lanes' sums of squares of all `cols` values.
+inline float norm_inv(float sq, uint cols, float eps) {
+    return rsqrt(simd_sum(sq) / float(cols) + eps);
+}
+
 // dot(w, x) over 32 values. `w` points at their BITS packed words, `group`
 // is the index of their group in scales and biases.
 template <uint BITS>
