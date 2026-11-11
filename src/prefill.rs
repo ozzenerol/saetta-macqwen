@@ -28,8 +28,19 @@ mod mac {
     const PREFIX: &str = "language_model.model";
     /// Rows and columns of a qmm tile; must match PREFILL_MM_BM and PREFILL_MM_BN.
     const TILE: usize = 64;
-    /// Key block of attention_rows; the KV cache needs this much slack.
-    const KEY_BLOCK: usize = 32;
+    /// Key block of attention_rows2 (attention_rows takes 32); the KV
+    /// cache needs this much slack.
+    const KEY_BLOCK: usize = 64;
+
+    /// The fast-path attention kernel: SAETTA_ATT=1 picks the old one, to
+    /// compare.
+    fn attention_half_kernel() -> &'static str {
+        if std::env::var("SAETTA_ATT").is_ok_and(|v| v == "1") {
+            "attention_rows_half"
+        } else {
+            "attention_rows2_half"
+        }
+    }
 
     fn at(buffer: &Buffer, floats: usize) -> View {
         View {
@@ -601,7 +612,8 @@ mod mac {
                 });
             }
             let chunk = chunk.next_multiple_of(TILE);
-            let half_size = capacity * attention.kv_heads * attention.head_dim * 2;
+            let half_size =
+                capacity.next_multiple_of(KEY_BLOCK) * attention.kv_heads * attention.head_dim * 2;
             let half_kv = layers
                 .iter()
                 .filter(|l| matches!(l.mixer, Mixer::Full(_)))
@@ -739,7 +751,7 @@ mod mac {
             let half = match state {
                 State::Full(cache) => {
                     assert!(pos + n <= cache.capacity, "KV cache is full");
-                    // attention_rows reads keys in blocks of KEY_BLOCK.
+                    // The attention kernels read keys in blocks of up to KEY_BLOCK.
                     assert!(cache.capacity.is_multiple_of(KEY_BLOCK));
                     let half = &self.half_kv[self.attention_index(l)];
                     // A reset or a truncation may have moved back.
@@ -1249,7 +1261,7 @@ mod mac {
                 );
                 to_half(gpu, enc, &keys, &hk, t * kv_size);
                 to_half(gpu, enc, &values, &hv, t * kv_size);
-                enc.set_compute_pipeline_state(&gpu.pipeline("attention_rows_half"));
+                enc.set_compute_pipeline_state(&gpu.pipeline(attention_half_kernel()));
                 set_views(enc, 0, &[&q_half, &whole(&half.keys), &whole(&half.values)]);
             }
             set_views(enc, 3, &[&q_and_gate, &y]);

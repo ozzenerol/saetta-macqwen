@@ -863,6 +863,153 @@ kernel void attention_rows(device const T *q [[buffer(0)]],
 template [[host_name("attention_rows")]] kernel decltype(attention_rows<float>) attention_rows<float>;
 template [[host_name("attention_rows_half")]] kernel decltype(attention_rows<half>) attention_rows<half>;
 
+// attention_rows over a half cache, with q held in registers for the whole
+// key loop and 64 keys per block. T is the type of q and of the
+// probabilities; the products accumulate in f32.
+constant uint PREFILL_ATT2_KB = 64;
+
+template <typename T>
+inline simdgroup_matrix<T, 8, 8> prefill_att2_widen(simdgroup_half8x8 m) {
+    simdgroup_matrix<T, 8, 8> r;
+    thread auto &re = r.thread_elements();
+    thread auto &me = m.thread_elements();
+    re[0] = T(me[0]);
+    re[1] = T(me[1]);
+    return r;
+}
+
+template <typename T>
+kernel void attention_rows2(device const T *q [[buffer(0)]],
+                            device const half *keys [[buffer(1)]],
+                            device const half *values [[buffer(2)]],
+                            device const float *q_and_gate [[buffer(3)]],
+                            device float *out [[buffer(4)]],
+                            constant PrefillAttentionParams &p [[buffer(5)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint simd [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint KB = PREFILL_ATT2_KB;
+    constexpr uint D = PREFILL_ATT_DIM;
+    threadgroup float s_all[PREFILL_ATT_SIMDS][8 * KB];
+    threadgroup T p_all[PREFILL_ATT_SIMDS][8 * KB];
+    threadgroup float a_all[PREFILL_ATT_SIMDS][8];
+    threadgroup float *sc = s_all[simd];
+    threadgroup T *pt = p_all[simd];
+    threadgroup float *al = a_all[simd];
+
+    uint h = tg.y * PREFILL_ATT_SIMDS + simd;
+    uint kv = h / (p.heads / p.kv_heads);
+    uint q0 = tg.x * 8;
+    uint q_stride = p.heads * D;
+    uint kv_stride = p.kv_heads * D;
+    device const half *kh = keys + kv * D;
+    device const half *vh = values + kv * D;
+    uint end = p.pos + min(q0 + 8, p.tokens);
+
+    simdgroup_matrix<T, 8, 8> qm[D / 8];
+    {
+        device const T *qh = q + ulong(q0) * q_stride + h * D;
+        for (uint d = 0; d < D / 8; d++) {
+            simdgroup_load(qm[d], qh + 8 * d, q_stride);
+        }
+    }
+
+    // For the softmax, lane l handles row l / 4, columns (l % 4) * 16 .. + 16
+    // of the scores. In the matrices it holds row fp.x.
+    constexpr uint PER = KB / 4;
+    uint r = lane / 4;
+    uint c0 = (lane % 4) * PER;
+    uint last = p.pos + q0 + r;  // the newest key this row may see
+    uint2 fp = frag_pos(lane);
+    float m = -INFINITY;
+    float l = 0;
+
+    simdgroup_float8x8 o[D / 8];
+    for (uint i = 0; i < D / 8; i++) {
+        o[i] = simdgroup_float8x8(0);
+    }
+
+    for (uint k0 = 0; k0 < end; k0 += KB) {
+        simdgroup_float8x8 s[KB / 8];
+        for (uint j = 0; j < KB / 8; j++) {
+            s[j] = simdgroup_float8x8(0);
+        }
+        for (uint d = 0; d < D / 8; d++) {
+            for (uint j = 0; j < KB / 8; j++) {
+                simdgroup_half8x8 km;
+                simdgroup_load(km, kh + ulong(k0 + 8 * j) * kv_stride + 8 * d, kv_stride, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s[j], qm[d], prefill_att2_widen<T>(km), s[j]);
+            }
+        }
+        for (uint j = 0; j < KB / 8; j++) {
+            simdgroup_store(s[j], sc + 8 * j, KB);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float v[PER];
+        float bm = -INFINITY;
+        for (uint i = 0; i < PER; i++) {
+            uint key = k0 + c0 + i;
+            v[i] = key <= last && key < end ? sc[r * KB + c0 + i] * p.scale : -INFINITY;
+            bm = max(bm, v[i]);
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 2));
+        float m_new = max(m, bm);
+        float sum = 0;
+        for (uint i = 0; i < PER; i++) {
+            float e = exp(v[i] - m_new);
+            pt[r * KB + c0 + i] = T(e);
+            sum += e;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        float alpha = exp(m - m_new);
+        l = l * alpha + sum;
+        m = m_new;
+        if (lane % 4 == 0) {
+            al[r] = alpha;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float a = al[fp.x];
+        simdgroup_matrix<T, 8, 8> pm[KB / 8];
+        for (uint j = 0; j < KB / 8; j++) {
+            simdgroup_load(pm[j], pt + 8 * j, KB);
+        }
+        for (uint d = 0; d < D / 8; d++) {
+            thread auto &oe = o[d].thread_elements();
+            oe[0] *= a;
+            oe[1] *= a;
+            for (uint j = 0; j < KB / 8; j++) {
+                simdgroup_half8x8 vm;
+                simdgroup_load(vm, vh + ulong(k0 + 8 * j) * kv_stride + 8 * d, kv_stride);
+                simdgroup_multiply_accumulate(o[d], pm[j], prefill_att2_widen<T>(vm), o[d]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Lane l writes row l / 4, two values per 8 x 8 block.
+    float inv = 1.0f / l;
+    uint row_t = q0 + r;
+    for (uint d = 0; d < D / 8; d++) {
+        simdgroup_store(o[d], sc, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (row_t < p.tokens) {
+            for (uint i = (lane % 4) * 2; i < (lane % 4) * 2 + 2; i++) {
+                uint col = 8 * d + i;
+                float gate = q_and_gate[ulong(row_t) * 2 * q_stride + h * 2 * D + D + col];
+                out[ulong(row_t) * q_stride + h * D + col] = sc[r * 8 + i] * inv * sigmoid(gate);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template [[host_name("attention_rows2")]] kernel decltype(attention_rows2<float>) attention_rows2<float>;
+template [[host_name("attention_rows2_half")]] kernel decltype(attention_rows2<half>) attention_rows2<half>;
+
 kernel void to_half(device const float *x [[buffer(0)]],
                     device half *y [[buffer(1)]],
                     uint i [[thread_position_in_grid]]) {
