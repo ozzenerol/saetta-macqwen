@@ -321,8 +321,19 @@ mod mac {
         hidden: View,
         final_hidden: View,
         logits: View,
+        scratch: Scratch,
         capacity: usize,
         position: usize,
+    }
+
+    /// The MoE router of the last layer that ran, for debugging.
+    pub struct RouteDebug {
+        /// The router's input, after the post-attention norm.
+        pub normed: Vec<f32>,
+        /// One logit per expert.
+        pub logits: Vec<f32>,
+        pub ids: Vec<u32>,
+        pub weights: Vec<f32>,
     }
 
     impl<'a> GpuModel<'a> {
@@ -375,6 +386,7 @@ mod mac {
                 hidden: x,
                 final_hidden,
                 logits,
+                scratch,
                 capacity,
                 position: 0,
             })
@@ -438,6 +450,18 @@ mod mac {
         /// It holds the last token's until the next run.
         pub fn final_hidden(&self) -> &View {
             &self.final_hidden
+        }
+
+        /// The router of the last loaded layer at the last token.
+        pub fn route_debug(&self) -> RouteDebug {
+            let m = &self.scratch.moe;
+            let k = self.cfg.num_experts_per_tok;
+            RouteDebug {
+                normed: contents::<f32>(&m.normed.buffer, self.cfg.hidden_size).to_vec(),
+                logits: contents::<f32>(&m.router.buffer, self.cfg.num_experts).to_vec(),
+                ids: contents::<u32>(&m.ids.buffer, k).to_vec(),
+                weights: contents::<f32>(&m.weights.buffer, k).to_vec(),
+            }
         }
 
         /// The hidden state after the last layer, before the final norm.
