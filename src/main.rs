@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta profile-prefill <model dir> <tokens> | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -55,6 +55,19 @@ fn main() -> ExitCode {
         ["bench-prefill", dir, tokens] => bench_prefill(dir, tokens, "1024"),
         #[cfg(target_os = "macos")]
         ["bench-prefill", dir, tokens, chunk] => bench_prefill(dir, tokens, chunk),
+        #[cfg(target_os = "macos")]
+        ["profile-prefill", dir, tokens] => match tokens.parse() {
+            Ok(t) => report(saetta::prefill::bench_profile(
+                Path::new(dir),
+                t,
+                PREFILL_CHUNK,
+                exact_prefill(),
+            )),
+            Err(_) => {
+                eprintln!("{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
         #[cfg(target_os = "macos")]
         ["bench-qmm2", dir] => report(saetta::qmm::bench(Path::new(dir), &[512, 2048], 10)),
         #[cfg(target_os = "macos")]
@@ -468,9 +481,11 @@ struct Drafting {
 #[cfg(target_os = "macos")]
 const MTP_WINDOW: usize = 32;
 
-/// Tokens per prefill dispatch.
+/// Tokens per prefill dispatch. Measured with bench-prefill: 2048 is about
+/// 5% faster than 1024 at 4k and 15k tokens (more rows per expert tile),
+/// and 4096 no better at 15k.
 #[cfg(target_os = "macos")]
-const PREFILL_CHUNK: usize = 1024;
+const PREFILL_CHUNK: usize = 2048;
 
 #[cfg(target_os = "macos")]
 /// Fast prefill unless SAETTA_EXACT=1: track F's eval found it within
