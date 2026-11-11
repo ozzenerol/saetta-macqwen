@@ -8,7 +8,7 @@ mod mac {
     use crate::config::Quantization;
     use crate::gpu::Gpu;
     use crate::plan::Plan;
-    use crate::qmv::{GpuQuant, View};
+    use crate::qmv::{GpuQuant, Norm, View};
     use crate::weights::Weights;
     use metal::MTLSize;
 
@@ -120,17 +120,41 @@ mod mac {
             h: &View,
             parallel: bool,
         ) {
+            self.record_gate_up_norm(plan, x, None, ids, count, h, parallel);
+        }
+
+        /// `record_gate_up` on norm(x) when `norm` is given.
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_gate_up_norm(
+            &self,
+            plan: &mut Plan,
+            x: &View,
+            norm: Option<Norm>,
+            ids: &View,
+            count: usize,
+            h: &View,
+            parallel: bool,
+        ) {
             let (g, u) = (&self.gate, &self.up);
             let shape = plan.constant(&[g.rows as u32, g.cols as u32, count as u32]);
-            let buffers = [
+            let mut buffers = vec![
                 &g.words, &g.scales, &g.biases, &u.words, &u.scales, &u.biases, x, h, &shape, ids,
             ];
+            let eps;
+            let kernel = match norm {
+                Some(n) => {
+                    eps = plan.constant(&[n.eps]);
+                    buffers.extend([n.weight, &eps]);
+                    "moe_gate_up_norm_5bit"
+                }
+                None => "moe_gate_up_5bit",
+            };
             let grid = MTLSize::new(row_groups(g.rows), count as u64, 1);
             let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
             if parallel {
-                plan.op_parallel("moe_gate_up_5bit", &buffers, grid, threads);
+                plan.op_parallel(kernel, &buffers, grid, threads);
             } else {
-                plan.op("moe_gate_up_5bit", &buffers, grid, threads);
+                plan.op(kernel, &buffers, grid, threads);
             }
         }
 
@@ -200,17 +224,38 @@ mod mac {
         /// Records out[..experts] = gate x and out[experts] = shared_gate x,
         /// as one op.
         pub fn record(&self, plan: &mut Plan, x: &View, out: &View, parallel: bool) {
+            self.record_norm(plan, x, None, out, parallel);
+        }
+
+        /// `record` on norm(x) when `norm` is given.
+        pub fn record_norm(
+            &self,
+            plan: &mut Plan,
+            x: &View,
+            norm: Option<Norm>,
+            out: &View,
+            parallel: bool,
+        ) {
             let (g, s) = (&self.gate, &self.shared_gate);
             let shape = plan.constant(&[g.rows as u32, g.cols as u32]);
-            let buffers = [
+            let mut buffers = vec![
                 &g.words, &g.scales, &g.biases, &s.words, &s.scales, &s.biases, x, out, &shape,
             ];
+            let eps;
+            let kernel = match norm {
+                Some(n) => {
+                    eps = plan.constant(&[n.eps]);
+                    buffers.extend([n.weight, &eps]);
+                    "router_norm_8bit"
+                }
+                None => "router_8bit",
+            };
             let grid = MTLSize::new(self.outputs().div_ceil(ROUTER_SIMDS) as u64, 1, 1);
             let threads = MTLSize::new(32 * ROUTER_SIMDS as u64, 1, 1);
             if parallel {
-                plan.op_parallel("router_8bit", &buffers, grid, threads);
+                plan.op_parallel(kernel, &buffers, grid, threads);
             } else {
-                plan.op("router_8bit", &buffers, grid, threads);
+                plan.op(kernel, &buffers, grid, threads);
             }
         }
     }

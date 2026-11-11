@@ -100,14 +100,28 @@ mod mac {
         /// Records y = W x. `x` holds `cols` f32 values, `y` gets `rows`.
         /// `parallel` marks it independent of the op recorded before it.
         pub fn record(&self, plan: &mut Plan, x: &View, y: &View, parallel: bool) {
+            self.record_mode(plan, x, y, parallel, Mode::Plain);
+        }
+
+        /// `record` with an RMS norm of x first or an add into y; see Mode.
+        pub fn record_mode(&self, plan: &mut Plan, x: &View, y: &View, parallel: bool, mode: Mode) {
             assert_eq!(self.experts, 1, "stacked experts go through moe");
-            let kernel = match self.bits {
-                5 => "qmv_5bit",
-                8 => "qmv_8bit",
-                b => panic!("no qmv kernel for {b} bits"),
+            let kernel = match (self.bits, &mode) {
+                (5, Mode::Plain) => "qmv_5bit",
+                (8, Mode::Plain) => "qmv_8bit",
+                (5, Mode::Norm(_)) => "qmv_norm_5bit",
+                (8, Mode::Norm(_)) => "qmv_norm_8bit",
+                (5, Mode::Acc) => "qmv_acc_5bit",
+                (8, Mode::Acc) => "qmv_acc_8bit",
+                (b, _) => panic!("no qmv kernel for {b} bits"),
             };
             let shape = plan.constant(&[self.rows as u32, self.cols as u32]);
-            let buffers = [&self.words, &self.scales, &self.biases, x, y, &shape];
+            let mut buffers = vec![&self.words, &self.scales, &self.biases, x, y, &shape];
+            let eps;
+            if let Mode::Norm(norm) = &mode {
+                eps = plan.constant(&[norm.eps]);
+                buffers.extend([norm.weight, &eps]);
+            }
             let grid = MTLSize::new(self.rows.div_ceil(ROWS_PER_SIMD * SIMDS) as u64, 1, 1);
             let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
             if parallel {
@@ -116,6 +130,24 @@ mod mac {
                 plan.op(kernel, &buffers, grid, threads);
             }
         }
+    }
+
+    /// An RMS norm folded into the op that reads its output: x is replaced
+    /// by x * weight / sqrt(mean(x^2) + eps). `weight` holds `cols` f32.
+    #[derive(Clone, Copy)]
+    pub struct Norm<'a> {
+        pub weight: &'a View,
+        pub eps: f32,
+    }
+
+    /// What qmv does around y = W x.
+    #[derive(Clone, Copy)]
+    pub enum Mode<'a> {
+        Plain,
+        /// y = W norm(x).
+        Norm(Norm<'a>),
+        /// y += W x, as a residual add.
+        Acc,
     }
 
     /// Wraps `bytes` without a copy when they start 16-byte aligned, else
