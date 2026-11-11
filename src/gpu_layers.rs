@@ -281,16 +281,19 @@ mod mac {
             self.k_proj.record(plan, x, &k, true);
             self.v_proj.record(plan, x, &v, true);
             self.record_store(plan, cache);
-            if cache.quant.is_some() {
-                // Decode attention over a quantized cache comes with track B's
-                // kernels; GpuModel::run refuses to run until then.
-                return;
+            match &cache.quant {
+                Some((keys, values)) => {
+                    cache
+                        .decode
+                        .record_quant(plan, &q, keys, values, &q_and_gate, &attn)
+                }
+                None => {
+                    let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+                    cache
+                        .decode
+                        .record(plan, &q, &keys, &values, &q_and_gate, &attn);
+                }
             }
-
-            let (keys, values) = (whole(&cache.keys), whole(&cache.values));
-            cache
-                .decode
-                .record(plan, &q, &keys, &values, &q_and_gate, &attn);
 
             self.o_proj.record(plan, &attn, out, false);
         }

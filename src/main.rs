@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -67,9 +67,11 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(target_os = "macos")]
-        ["bench-decode", dir] => bench_decode(dir, None),
+        ["bench-decode", dir] => bench_decode(dir, None, None),
         #[cfg(target_os = "macos")]
-        ["bench-decode", dir, context] => bench_decode(dir, Some(context)),
+        ["bench-decode", dir, context] => bench_decode(dir, Some(context), None),
+        #[cfg(target_os = "macos")]
+        ["bench-decode", dir, context, bits] => bench_decode(dir, Some(context), Some(bits)),
         #[cfg(target_os = "macos")]
         ["profile-token", dir] => report(saetta::profile::profile_token(Path::new(dir), 40, 9)),
         #[cfg(target_os = "macos")]
@@ -84,11 +86,15 @@ fn main() -> ExitCode {
 }
 
 /// Decode at lengths up to the context, 32768 by default. The model is
-/// loaded with room for the context.
+/// loaded with room for the context and a KV cache of `bits`, 16 by default.
 #[cfg(target_os = "macos")]
-fn bench_decode(dir: &str, context: Option<&str>) -> ExitCode {
+fn bench_decode(dir: &str, context: Option<&str>, bits: Option<&str>) -> ExitCode {
     let Some(context) = context.map_or(Some(32768), |c| c.parse::<usize>().ok()) else {
         eprintln!("bad context");
+        return ExitCode::FAILURE;
+    };
+    let Some(bits) = bits.map_or(Some(KvBits::Half), KvBits::parse) else {
+        eprintln!("bad KV bits: 16, 8 or 4");
         return ExitCode::FAILURE;
     };
     let lengths: Vec<usize> = [40, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
@@ -99,6 +105,7 @@ fn bench_decode(dir: &str, context: Option<&str>) -> ExitCode {
         Path::new(dir),
         &lengths,
         context,
+        bits,
         5,
     ))
 }
@@ -224,10 +231,6 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     }
     if f.draft > 0 && !f.gpu {
         return Err("--draft needs --gpu".into());
-    }
-    if f.memory.kv_bits != KvBits::Half {
-        // Prefill runs over it already (saetta eval --no-ppl --long N).
-        return Err("--kv-bits 8 and 4 need the decode attention kernels; use 16 for now".into());
     }
     Ok(f)
 }

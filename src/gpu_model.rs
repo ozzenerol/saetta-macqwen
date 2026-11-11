@@ -387,7 +387,6 @@ mod mac {
         /// Samples the next token from `logits` in the same command buffer.
         sampler: GpuSampler,
         capacity: usize,
-        kv_bits: KvBits,
         position: usize,
     }
 
@@ -414,8 +413,7 @@ mod mac {
             GpuModel::load_with_bits(gpu, cfg, weights, layers, capacity, KvBits::Half)
         }
 
-        /// As `load`, with the KV caches stored as `bits`. Prefill works on
-        /// such a model; decode needs track B's attention kernels first.
+        /// As `load`, with the KV caches stored as `bits`.
         pub fn load_with_bits(
             gpu: &'a Gpu,
             cfg: &'a Config,
@@ -482,7 +480,6 @@ mod mac {
                 scratch,
                 sampler,
                 capacity,
-                kv_bits: bits,
                 position: 0,
             })
         }
@@ -548,11 +545,6 @@ mod mac {
 
         /// Runs one token and leaves the results on the GPU.
         pub fn run(&mut self, token: u32) {
-            assert!(
-                self.kv_bits == KvBits::Half,
-                "decode over a {:?} KV cache needs track B's attention kernels",
-                self.kv_bits
-            );
             assert!(
                 self.position < self.capacity,
                 "context is full ({} tokens)",
@@ -735,16 +727,33 @@ mod mac {
         #[test]
         #[ignore = "needs the whole model on the GPU"]
         fn whole_model_matches_cpu() {
+            check_whole_model(KvBits::Half);
+        }
+
+        /// As above over an 8-bit and a 4-bit cache. The codes are the CPU's
+        /// (tests/kv_quant.rs) and decode reads them as f32, as the CPU does.
+        #[test]
+        #[ignore = "needs the whole model on the GPU"]
+        fn whole_model_quantized_matches_cpu() {
+            for bits in [KvBits::Eight, KvBits::Four] {
+                println!("{bits:?}:");
+                check_whole_model(bits);
+            }
+        }
+
+        fn check_whole_model(bits: KvBits) {
             let (cfg, weights) = open();
             let cpu = Model::new(&cfg, &weights).unwrap();
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), 256).unwrap();
+            let mut model =
+                GpuModel::load_with_bits(&gpu, &cfg, &weights, cfg.num_layers(), 256, bits)
+                    .unwrap();
             let mut states = cpu.new_states();
-            // The GPU cache is half; the CPU rounds its keys and values the
-            // same way, so what is left is the f32 arithmetic.
+            // The CPU rounds its keys and values as the GPU cache stores
+            // them, so what is left is the f32 arithmetic.
             for s in &mut states {
                 if let crate::cpu::model::LayerState::Full(c) = s {
-                    c.round_to_half();
+                    c.round_to(bits);
                 }
             }
             let mut cpu_logits = Vec::new();
