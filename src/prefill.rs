@@ -1948,7 +1948,7 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 5e-3, 1e-2, KvBits::Half);
+            assert_passes(&check_prefill(true, 5e-3, 1e-2, KvBits::Half));
         }
 
         /// Prefill over an 8-bit and a 4-bit KV cache against the CPU storing
@@ -1960,10 +1960,12 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn quantized_prefill_matches_token_by_token() {
+            let mut failed = Vec::new();
             for bits in [KvBits::Eight, KvBits::Four] {
                 println!("{bits:?}:");
-                check_prefill(true, 5e-3, 1e-2, bits);
+                failed.extend(check_prefill(true, 5e-3, 1e-2, bits));
             }
+            assert_passes(&failed);
         }
 
         /// With half inputs the typical token is off by the rounding of x to
@@ -1981,7 +1983,7 @@ mod mac {
             // the median token peaks at 6.1e-2 (layer 26), state 7.4e-2,
             // logits 4.2e-2. MLX in bf16 is off by 1.6e-2 at layer 3.
             // Bounds are about twice what was measured.
-            check_prefill(false, 0.12, 0.1, KvBits::Half);
+            assert_passes(&check_prefill(false, 0.12, 0.1, KvBits::Half));
         }
 
         /// Fast prefill (gemm attention reading the codes in place) over an
@@ -1990,18 +1992,21 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn fast_quantized_prefill_matches_token_by_token() {
+            let mut failed = Vec::new();
             for bits in [KvBits::Eight, KvBits::Four] {
                 println!("{bits:?}:");
-                check_prefill(false, 0.12, 0.1, bits);
+                failed.extend(check_prefill(false, 0.12, 0.1, bits));
             }
+            assert_passes(&failed);
         }
 
         /// 166 tokens in two calls (150 then 16) with chunks of 128 rounded
         /// from 100, so the first call runs a 128-row chunk on the large-m
         /// kernels and a 22-row one on qmm_few: the hidden state after each layer and every layer state
         /// must be within `bound` of the CPU fed one token at a time, the
-        /// logits within `logits_bound`, with the same argmax.
-        fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) {
+        /// logits within `logits_bound`, with the same argmax. Returns what
+        /// went over instead of stopping, so one run shows every layer.
+        fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) -> Vec<String> {
             let slack = crate::kv_quant::test_slack(bits);
             let (bound, logits_bound) = (bound * slack, logits_bound * slack);
             let (cfg, weights) = open();
@@ -2028,9 +2033,11 @@ mod mac {
                 .map(|p| p.iter().map(|&t| model.embed(t)).collect())
                 .collect();
             let gpu_x: Vec<Buffer> = parts.iter().map(|p| prefill.embed(&gpu, p)).collect();
+            let mut failed = Vec::new();
             for l in 0..cfg.num_layers() {
                 let mut err = 0.0f32;
-                let mut median = 0.0f32;
+                let mut all = Vec::with_capacity(tokens.len());
+                let mut last_median = 0.0f32;
                 let mut pos = 0;
                 for (i, part) in parts.iter().enumerate() {
                     for x in cpu_x[i].iter_mut() {
@@ -2052,7 +2059,8 @@ mod mac {
                         .fold((0, 0.0f32), |b, (i, &e)| if e > b.1 { (i, e) } else { b });
                     let mut sorted = per_token.clone();
                     sorted.sort_by(f32::total_cmp);
-                    median = median.max(sorted[sorted.len() / 2]);
+                    last_median = sorted[sorted.len() / 2];
+                    all.extend_from_slice(&per_token);
                     if e > bound {
                         println!(
                             "  part {i}: worst token {worst} at {e:.2e}, median {:.2e}",
@@ -2096,8 +2104,10 @@ mod mac {
                     }
                     _ => panic!("layer {l}: state types differ"),
                 };
+                all.sort_by(f32::total_cmp);
+                let median = all[all.len() / 2];
                 println!(
-                    "layer {l}: hidden rel rms {err:.2e}, median token {median:.2e}, state {state:.2e}"
+                    "layer {l}: hidden rel rms {err:.2e}, median token {median:.2e}, last call median {last_median:.2e}, state {state:.2e}"
                 );
                 // The half path may pick another expert at a near tie for a
                 // token, as bf16 MLX does, so only the median token counts.
@@ -2105,11 +2115,8 @@ mod mac {
                 // few tokens far more than the rest (8 bits, layer 14: rms
                 // 2.2e-2, median 5.1e-3), and F's KL gate covers the whole.
                 // `bound` has the slack of a quantized cache in it.
-                let hidden = if exact && bits == KvBits::Half {
-                    err
-                } else {
-                    median
-                };
+                let by_median = !(exact && bits == KvBits::Half);
+                let hidden = if by_median { median } else { err };
                 // The state of an attention layer over a quantized cache is
                 // its codes: a key that moved with the hidden state lands on
                 // the next code, one step (1.9e-2 of the rms at 8 bits)
@@ -2121,7 +2128,20 @@ mod mac {
                 } else {
                     bound * 1.25
                 };
-                assert!(hidden < bound && state < state_bound, "layer {l}");
+                if hidden >= bound || state >= state_bound {
+                    failed.push(format!(
+                        "{bits:?} layer {l}: hidden {hidden:.2e} (bound {bound:.2e}), state {state:.2e} (bound {state_bound:.2e})"
+                    ));
+                }
+                // The median over all tokens is mostly the first call. The
+                // 16 tokens of the second read the states the first left,
+                // so they get the state's room, which still catches an
+                // order 1 error from a wrong position or slot.
+                if by_median && last_median >= state_bound {
+                    failed.push(format!(
+                        "{bits:?} layer {l}: second call median {last_median:.2e} (bound {state_bound:.2e})"
+                    ));
+                }
             }
 
             let norm = weights
@@ -2139,10 +2159,21 @@ mod mac {
             let got = prefill.logits(&gpu, &gpu_x[1], parts[1].len());
             let err = rel_rms(&got, &want);
             println!("logits: rel rms {err:.2e}");
-            assert!(err < logits_bound);
-            if exact {
-                assert_eq!(argmax(&got), argmax(&want));
+            if err >= logits_bound {
+                failed.push(format!("{bits:?} logits {err:.2e} (bound {logits_bound:.2e})"));
             }
+            if exact && argmax(&got) != argmax(&want) {
+                failed.push(format!(
+                    "{bits:?} argmax {} vs {}",
+                    argmax(&got),
+                    argmax(&want)
+                ));
+            }
+            failed
+        }
+
+        fn assert_passes(failed: &[String]) {
+            assert!(failed.is_empty(), "over the bounds:\n{}", failed.join("\n"));
         }
 
         /// The prefill kernels compile (no dispatch, so no GPU work).
