@@ -91,3 +91,67 @@ fn bf16s(bytes: &[u8]) -> Vec<half::bf16> {
         .map(|c| half::bf16::from_bits(u16::from_le_bytes(*c)))
         .collect()
 }
+
+#[test]
+fn staged_matches_plain() {
+    use saetta::qmv::Variant;
+    let Some(dir) = model_dir() else {
+        eprintln!("skipped: no model");
+        return;
+    };
+    let config = Config::load(&dir).unwrap();
+    let weights = Weights::open(&dir).unwrap();
+    let gpu = Gpu::new().unwrap();
+    for module in [
+        "linear_attn.in_proj_qkv",
+        "linear_attn.out_proj",
+        "mlp.shared_expert.down_proj",
+        "mlp.gate",
+    ] {
+        let q = weights
+            .quantized(
+                &format!("language_model.model.layers.0.{module}"),
+                &config.quantization,
+            )
+            .unwrap();
+        let m = GpuQuant::new(&gpu, &q);
+        let x = input(m.cols);
+        let nw: Vec<f32> = (0..m.cols).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+        let eps = 1e-6f32;
+        let mean = x.iter().map(|v| v * v).sum::<f32>() / m.cols as f32;
+        let inv = 1.0 / (mean + eps).sqrt();
+        let normed: Vec<f32> = x.iter().zip(&nw).map(|(a, w)| a * w * inv).collect();
+        let (xb, nb, wb) = (
+            View::new(gpu.buffer_from(&x)),
+            View::new(gpu.buffer_from(&normed)),
+            View::new(gpu.buffer_from(&nw)),
+        );
+        let read = |v: &View| contents::<f32>(&v.buffer, m.rows).to_vec();
+        let top = |v: &[f32]| v.iter().fold(0f32, |a, b| a.max(b.abs()));
+        let want = View::new(gpu.buffer(m.rows * 4));
+        let want_n = View::new(gpu.buffer(m.rows * 4));
+        let mut plan = Plan::new(&gpu);
+        m.record(&mut plan, &xb, &want, false);
+        m.record(&mut plan, &nb, &want_n, false);
+        plan.run_serial();
+        let (w, wn) = (read(&want), read(&want_n));
+        let mut variants = vec![(Variant::Staged(4), false), (Variant::Staged(8), false)];
+        if m.bits == 5 {
+            variants.push((Variant::StagedNorm(&wb, eps), true));
+        }
+        for (variant, norm) in variants {
+            let got = View::new(gpu.buffer(m.rows * 4));
+            let mut plan = Plan::new(&gpu);
+            m.record_variant(&mut plan, variant, &xb, &got, false);
+            plan.run_serial();
+            let g = read(&got);
+            let r = if norm { &wn } else { &w };
+            let err = g.iter().zip(r).fold(0f32, |a, (x, y)| a.max((x - y).abs())) / top(r);
+            eprintln!("{module} {variant:?}: {err:e}");
+            assert!(
+                err < if norm { 1e-5 } else { 1e-6 },
+                "{module} {variant:?}: {err}"
+            );
+        }
+    }
+}
