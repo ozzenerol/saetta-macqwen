@@ -853,7 +853,7 @@ mod gpu_real {
         let capacity = (tokens.len() + 64).next_multiple_of(128);
         let mut model = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), capacity).unwrap();
         let mut prefill = crate::prefill::Prefill::new(&gpu, &cfg, &weights, 1024).unwrap();
-        prefill.exact = !crate::prefill::fast_from_env();
+        prefill.exact = crate::prefill::exact_from_env();
         for piece in prompt.chunks(1024) {
             let pos = model.position();
             let states: Vec<_> = model.states().collect();
