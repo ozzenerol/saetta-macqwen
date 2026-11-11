@@ -853,17 +853,7 @@ mod mac {
                     t[5]
                 };
                 let base = time(0);
-                for (t, simds) in [
-                    (1, 2),
-                    (1, 4),
-                    (1, 8),
-                    (2, 2),
-                    (2, 4),
-                    (2, 8),
-                    (4, 2),
-                    (4, 4),
-                    (4, 8),
-                ] {
+                for (t, simds) in [(1, 4), (1, 8), (5, 2), (5, 4), (5, 8)] {
                     MMA_T.store(t, std::sync::atomic::Ordering::Relaxed);
                     MMA2_SIMDS.store(simds, std::sync::atomic::Ordering::Relaxed);
                     let times: Vec<String> = [1, 4, 8]
