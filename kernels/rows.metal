@@ -1020,13 +1020,17 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
 
     simdgroup_float8x8 acc = simdgroup_float8x8(0);
     // Two groups per step, loads first, so two are in flight.
-    for (uint g0 = 2 * simd; g0 < groups; g0 += 2 * SPLIT) {
+    // Simdgroup simd takes a contiguous run of groups, so its loads of a row
+    // share cache lines.
+    uint per = (groups + SPLIT - 1) / SPLIT;
+    uint g_end = min(groups, (simd + 1) * per);
+    for (uint g0 = simd * per; g0 < g_end; g0 += 2) {
         uint packed[2][NW];
         float s[2], b[2];
         uint off[2];
 #pragma clang loop unroll(full)
         for (uint u = 0; u < 2; u++) {
-            uint g = min(g0 + u, groups - 1);
+            uint g = min(g0 + u, g_end - 1);
             uint bit0 = (g * 64 + wk) * BITS;
             device const uint *w = wrow + bit0 / 32;
 #pragma clang loop unroll(full)
@@ -1034,13 +1038,13 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
                 packed[u][i] = w[i];
             }
             off[u] = bit0 % 32;
-            bool live = g0 + u < groups;
+            bool live = g0 + u < g_end;
             s[u] = live ? bf16_to_float(scales[row * groups + g]) : 0.0f;
             b[u] = live ? bf16_to_float(biases[row * groups + g]) : 0.0f;
         }
 #pragma clang loop unroll(full)
         for (uint u = 0; u < 2; u++) {
-            uint k = min(g0 + u, groups - 1) * 64;
+            uint k = min(g0 + u, g_end - 1) * 64;
 #pragma clang loop unroll(full)
             for (uint i = 0; i < 8; i++) {
                 simdgroup_float8x8 wt, xt;
@@ -1158,7 +1162,8 @@ kernel void moe_gate_up_mma3(device const uint *gate_w [[buffer(0)]],
     device const float *x0 = x + f.y * shape.cols + 16 * (f.x / 2) + f.x % 2;
     device const float *x1 = x0 + shape.cols;
     simdgroup_float8x8 g = simdgroup_float8x8(0), up = simdgroup_float8x8(0);
-    for (uint k = simd; k < groups; k += SPLIT) {
+    uint per = (groups + SPLIT - 1) / SPLIT;
+    for (uint k = simd * per; k < min(groups, (simd + 1) * per); k++) {
         mma3_group<BITS>(gate_w + row * row_words, gate_s, gate_b, row * groups + k, k, wk, x0,
                          x1, float2(1), g);
         mma3_group<BITS>(up_w + row * row_words, up_s, up_b, row * groups + k, k, wk, x0, x1,

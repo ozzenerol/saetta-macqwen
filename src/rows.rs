@@ -404,7 +404,7 @@ mod mac {
     }
 
     /// Simdgroups per threadgroup of moe_gate_up_mma3 and moe_down_mma3.
-    pub static MOE_SPLIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4);
+    pub static MOE_SPLIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8);
 
     /// The distinct experts of `m` rows, for `MoeRows::record`.
     pub struct MoeRows {
@@ -420,7 +420,7 @@ mod mac {
             MoeRows {
                 list: View::new(gpu.buffer((1 + most) * 4)),
                 slots: View::new(gpu.buffer(most * MAX_ROWS * 4)),
-                mma: false,
+                mma: true,
             }
         }
 
@@ -740,13 +740,14 @@ mod mac {
                 t[5]
             };
             let base = time(0, false);
-            for split in [2, 8, 4] {
+            for split in [2, 4, 8] {
                 MOE_SPLIT.store(split, std::sync::atomic::Ordering::Relaxed);
                 let t: Vec<String> = [1, 2, 4, 8]
                     .map(|m| format!("m{m} {:.1}", time(m, true)))
                     .to_vec();
                 println!("moe mma3 split {split}: {}", t.join(", "));
             }
+            MOE_SPLIT.store(8, std::sync::atomic::Ordering::Relaxed);
             let all: Vec<String> = (1..=MAX_ROWS)
                 .map(|m| format!("m{m} {:.1}/{:.1}", time(m, false), time(m, true)))
                 .collect();
