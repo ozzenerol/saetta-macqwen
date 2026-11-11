@@ -2,6 +2,7 @@
 //! Checks the split-K decode attention against an f64 CPU version on random
 //! data, at lengths around the 128-token chunk size and longer.
 
+use half::f16;
 use saetta::attention::DecodeAttention;
 use saetta::gpu::{Gpu, contents};
 use saetta::plan::{Plan, TokenParams};
@@ -61,9 +62,14 @@ fn matches_cpu_at_several_lengths() {
         .map(|x| x * 4.0)
         .collect();
     let values = noise(capacity * KV * DIM, 2);
+    // The cache is half; the reference uses the same rounded values.
+    let round = |x: &[f32]| -> Vec<f32> { x.iter().map(|&v| f16::from_f32(v).to_f32()).collect() };
+    let (keys, values) = (round(&keys), round(&values));
+    let to_half = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
     let q = noise(HEADS * DIM, 3);
     let q_and_gate = noise(HEADS * 2 * DIM, 4);
-    let [kb, vb, qb, gb] = [&keys, &values, &q, &q_and_gate].map(|d| View::new(gpu.buffer_from(d)));
+    let [kb, vb] = [&keys, &values].map(|d| View::new(gpu.buffer_from(&to_half(d))));
+    let [qb, gb] = [&q, &q_and_gate].map(|d| View::new(gpu.buffer_from(d)));
     let out = View::new(gpu.buffer(HEADS * DIM * 4));
 
     let mut plan = Plan::new(&gpu);

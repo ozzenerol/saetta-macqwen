@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk] | saetta bench-attention | saetta bench-decode <model dir> [context] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -66,11 +66,9 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(target_os = "macos")]
-        ["bench-decode", dir] => report(saetta::attention::bench_decode(
-            Path::new(dir),
-            &[40, 1024, 4096, 8192, 16384, 32768],
-            5,
-        )),
+        ["bench-decode", dir] => bench_decode(dir, None),
+        #[cfg(target_os = "macos")]
+        ["bench-decode", dir, context] => bench_decode(dir, Some(context)),
         #[cfg(target_os = "macos")]
         ["profile-token", dir] => report(saetta::profile::profile_token(Path::new(dir), 40, 9)),
         #[cfg(target_os = "macos")]
@@ -82,6 +80,26 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Decode at lengths up to the context, 32768 by default. The model is
+/// loaded with room for the context.
+#[cfg(target_os = "macos")]
+fn bench_decode(dir: &str, context: Option<&str>) -> ExitCode {
+    let Some(context) = context.map_or(Some(32768), |c| c.parse::<usize>().ok()) else {
+        eprintln!("bad context");
+        return ExitCode::FAILURE;
+    };
+    let lengths: Vec<usize> = [40, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+        .into_iter()
+        .filter(|&n| n <= context)
+        .collect();
+    report(saetta::attention::bench_decode(
+        Path::new(dir),
+        &lengths,
+        context,
+        5,
+    ))
 }
 
 fn report(result: Result<(), Box<dyn Error>>) -> ExitCode {
@@ -132,7 +150,8 @@ struct ServeFlags {
 /// What the GPU server may allocate besides the weights.
 #[derive(Clone, Copy)]
 struct Memory {
-    /// Tokens of context: the KV caches are allocated for this many.
+    /// Tokens of context: the KV caches are allocated for this many. A page
+    /// of them takes memory only once a token is written there.
     context: usize,
     /// Bytes for prompt cache snapshots.
     cache_bytes: usize,
@@ -141,7 +160,8 @@ struct Memory {
 impl Default for Memory {
     fn default() -> Memory {
         Memory {
-            context: 32768,
+            // The full context of Qwen3.6.
+            context: 262144,
             cache_bytes: 1 << 30,
         }
     }
@@ -319,7 +339,7 @@ fn load_gpu(
     // The cache adds a snapshot before it evicts one, so the pool has one more.
     let snapshots = (memory.cache_bytes / snapshot).max(2) - 1;
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, snapshots + 1);
-    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK, context)?;
+    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
     prefill.exact = exact_prefill();
     if draft > 0 {
         prefill.enable_verify(gpu, draft + 1);
@@ -371,13 +391,12 @@ fn report_memory(
         .iter()
         .map(|c| (c.keys.length() + c.values.length()) as usize)
         .sum();
-    // Keys and values of one token in every attention layer.
-    let row = decode / memory.context;
+    // Keys and values of one token in every attention layer; the caches
+    // round the context up to KV_ALIGN.
+    let row = decode / caches[0].capacity;
     let one_layer = row / caches.len();
-    // Prefill keeps its own f16 copy of the f32 decode cache.
-    let prefill = decode / 2;
     let mtp_kv = usize::from(mtp) * one_layer * memory.context;
-    let kv = decode + prefill + mtp_kv;
+    let kv = decode + mtp_kv;
     let cache = (snapshots + 1) * snapshot;
     let backup = cache::BACKUP_ROWS * row;
     let mb = |b: usize| b >> 20;
@@ -615,10 +634,9 @@ impl Restore for GpuServed {
         }
     }
 
-    /// The KV rows stay in their slots. The fast prefill keeps a half copy
-    /// of them that would not see rows put back, so only the exact one.
+    /// The KV rows stay in their slots.
     fn keeps_rows(&self) -> bool {
-        self.prefill.exact
+        true
     }
 
     fn backup_rows(&mut self, from: usize, n: usize) {

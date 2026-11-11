@@ -7,9 +7,9 @@
 // attention_reduce: one threadgroup per q head merges the chunks and applies
 // the sigmoid output gate.
 //
-// The cache is f32, token-major, kv_heads * 256 floats per token, the layout
-// kv_store writes. Head dim 256 and 8 q heads per kv head are fixed here;
-// src/attention.rs checks them.
+// The cache is half, token-major, kv_heads * 256 values per token, the
+// layout attention_prep writes. The math is f32. Head dim 256 and 8 q heads per
+// kv head are fixed here; src/attention.rs checks them.
 
 constant uint DEC_CHUNK = 128;
 constant uint DEC_GROUP = 8;
@@ -23,8 +23,8 @@ struct DecodeParams {
 };
 
 kernel void attention_partial(device const float *q [[buffer(0)]],
-                              device const float *keys [[buffer(1)]],
-                              device const float *values [[buffer(2)]],
+                              device const half *keys [[buffer(1)]],
+                              device const half *values [[buffer(2)]],
                               device float *part_o [[buffer(3)]],
                               device float *part_ml [[buffer(4)]],
                               constant DecodeParams &p [[buffer(5)]],
@@ -54,9 +54,9 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
 
     // Scores: simdgroup s takes tokens s, s + 8, ...
     for (uint t = simd; t < n; t += 8) {
-        device const float4 *k4 =
-            (device const float4 *)(keys + (start + t) * stride + kv * DEC_DIM + lane * 8);
-        float4 a = k4[0], b = k4[1];
+        device const half4 *k4 =
+            (device const half4 *)(keys + (start + t) * stride + kv * DEC_DIM + lane * 8);
+        float4 a = float4(k4[0]), b = float4(k4[1]);
         for (uint g = 0; g < DEC_GROUP; g++) {
             float d = qv[g][0] * a.x + qv[g][1] * a.y + qv[g][2] * a.z + qv[g][3] * a.w +
                       qv[g][4] * b.x + qv[g][5] * b.y + qv[g][6] * b.z + qv[g][7] * b.w;
@@ -91,17 +91,32 @@ kernel void attention_partial(device const float *q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Weighted values: thread tid owns dim tid for all 8 heads.
-    float acc[DEC_GROUP] = {0};
-    device const float *v = values + start * stride + kv * DEC_DIM + tid;
-    for (uint t = 0; t < n; t++) {
-        float x = v[t * stride];
+    // Weighted values: thread tid owns dims 4 * (tid % 64) .. + 3 of all 8
+    // heads, for the tokens t with t % 4 == tid / 64. One half4 load per
+    // token; the four token phases are summed through `sum` afterwards.
+    threadgroup float4 sum[DEC_GROUP][DEC_DIM / 4];
+    uint d4 = tid % 64, phase = tid / 64;
+    float4 acc[DEC_GROUP] = {0};
+    device const half4 *v = (device const half4 *)(values + start * stride + kv * DEC_DIM) + d4;
+    for (uint t = phase; t < n; t += 4) {
+        float4 x = float4(v[t * stride / 4]);
         for (uint g = 0; g < DEC_GROUP; g++) {
             acc[g] += sc[g][t] * x;
         }
     }
-    for (uint g = 0; g < DEC_GROUP; g++) {
-        part_o[(tg.x * p.heads + kv * DEC_GROUP + g) * DEC_DIM + tid] = acc[g];
+    for (uint step = 3; step > 0; step--) {
+        if (phase == step) {
+            for (uint g = 0; g < DEC_GROUP; g++) {
+                sum[g][d4] = step == 3 ? acc[g] : sum[g][d4] + acc[g];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (phase == 0) {
+        for (uint g = 0; g < DEC_GROUP; g++) {
+            device float4 *o = (device float4 *)(part_o + (tg.x * p.heads + kv * DEC_GROUP + g) * DEC_DIM);
+            o[d4] = sum[g][d4] + acc[g];
+        }
     }
 }
 

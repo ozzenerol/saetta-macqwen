@@ -16,7 +16,7 @@ saetta keeps copies of the state at chosen points and goes back to the nearest o
 
 1. At the end of every prefill, one token before the prompt length. The server always runs at least one token to get logits, so a retry of the same prompt goes back to length - 1 and reruns a single token.
 2. At the end of every generation, at the final length (saved when the next request starts).
-3. Every 1024 tokens inside a long prefill, so a change in the middle of a long prompt does not start from zero.
+3. Every 1024 tokens inside a long prefill, so a change in the middle of a long prompt does not start from zero. Of these, one prefill keeps the first and the last three. A 200k-token prompt would otherwise take all 16 places and push out every other conversation.
 
 ## Using them
 

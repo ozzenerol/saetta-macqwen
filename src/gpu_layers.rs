@@ -154,9 +154,10 @@ mod mac {
         ))
     }
 
-    /// The keys (after norm and rope) and values on the GPU, each token
-    /// `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p` goes in
-    /// slot `p`.
+    /// The keys (after norm and rope) and values on the GPU as half, each
+    /// token `[kv_heads * head_dim]`, room for `capacity` tokens. Token `p`
+    /// goes in slot `p`. A page of the buffers takes memory only once
+    /// something is written there, so the full context costs nothing up front.
     pub struct GpuKvCache {
         pub keys: Buffer,
         pub values: Buffer,
@@ -164,9 +165,15 @@ mod mac {
         pub capacity: usize,
     }
 
+    /// The capacity is a multiple of this: the decode attention chunk, and a
+    /// multiple of the prefill key block.
+    pub const KV_ALIGN: usize = 128;
+
     impl GpuKvCache {
+        /// Room for at least `capacity` tokens, rounded up to `KV_ALIGN`.
         pub fn new(gpu: &Gpu, cfg: &AttentionConfig, capacity: usize) -> GpuKvCache {
-            let token = cfg.kv_heads * cfg.head_dim * 4;
+            let capacity = capacity.next_multiple_of(KV_ALIGN);
+            let token = cfg.kv_heads * cfg.head_dim * 2;
             GpuKvCache {
                 keys: gpu.buffer(capacity * token),
                 values: gpu.buffer(capacity * token),
@@ -443,6 +450,8 @@ mod mac {
         const TOKENS: usize = 6;
         /// Only the summation order differs from the CPU.
         const BOUND: f32 = 1e-5;
+        /// The KV cache is half: 11 bits of mantissa, a relative step of 5e-4.
+        const HALF_BOUND: f32 = 1e-3;
 
         fn open() -> (Config, Weights) {
             let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
@@ -643,14 +652,20 @@ mod mac {
                 );
                 let err = rel_rms(&serial, &want);
                 println!("attention token {t}: rel rms {err:.2e}");
-                assert!(err < BOUND, "token {t}");
+                assert!(err < HALF_BOUND, "token {t}");
             }
             let kv_n = cpu_cache.keys().len();
             let cache = &runs[0].1;
-            let keys = rel_rms(&read(&cache.keys, kv_n), cpu_cache.keys());
-            let values = rel_rms(&read(&cache.values, kv_n), cpu_cache.values());
+            let half = |b: &Buffer| -> Vec<f32> {
+                crate::gpu::contents::<half::f16>(b, kv_n)
+                    .iter()
+                    .map(|h| h.to_f32())
+                    .collect()
+            };
+            let keys = rel_rms(&half(&cache.keys), cpu_cache.keys());
+            let values = rel_rms(&half(&cache.values), cpu_cache.values());
             println!("attention cache: keys {keys:.2e}, values {values:.2e}");
-            assert!(keys < BOUND && values < BOUND);
+            assert!(keys < HALF_BOUND && values < HALF_BOUND);
         }
     }
 }

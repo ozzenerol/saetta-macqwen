@@ -14,6 +14,10 @@ use crate::speculative::Decider;
 pub const DEFAULT_LIMIT: usize = 16;
 /// A long prefill takes a snapshot at every multiple of this many tokens.
 pub const DEFAULT_EVERY: usize = 1024;
+/// Of the snapshots one prefill takes on the way, it keeps the first and
+/// the last few, so a long prompt does not push out every other
+/// conversation.
+const KEEP_ON_THE_WAY: usize = 4;
 
 /// Snapshots at the end of a first message that eviction keeps.
 pub const MAX_ANCHORS: usize = 2;
@@ -139,6 +143,12 @@ impl<S> Snapshots<S> {
                 None => break,
             };
         }
+    }
+
+    /// Drops the snapshot of exactly these tokens, unless it is pinned or an anchor.
+    pub fn remove(&mut self, tokens: &[u32]) {
+        self.items
+            .retain(|s| s.pinned || s.anchored || s.tokens != tokens);
     }
 
     /// The tokens of each snapshot.
@@ -303,6 +313,8 @@ impl<M: Model + Restore> Model for Cached<M> {
         let last = start + tokens.len() - 1;
         let anchor = self.anchor_in(tokens).filter(|&a| a <= last);
         let mut done = 0;
+        // Lengths of the snapshots taken on the way that were new.
+        let mut taken: Vec<usize> = Vec::new();
         while start + done < last {
             if !alive() {
                 return Err(start + done);
@@ -316,7 +328,18 @@ impl<M: Model + Restore> Model for Cached<M> {
             self.model.prefill(chunk);
             self.tokens.extend_from_slice(chunk);
             done = stop - start;
-            self.save_as(stop == last, Some(stop) == anchor);
+            let at_anchor = Some(stop) == anchor;
+            if stop == last || at_anchor {
+                // The anchor is not one of the snapshots on the way.
+                self.save_as(stop == last, at_anchor);
+            } else if !self.snapshots.contains(&self.tokens) {
+                self.save(false);
+                taken.push(stop);
+                if taken.len() > KEEP_ON_THE_WAY {
+                    let len = taken.remove(1);
+                    self.snapshots.remove(&self.tokens[..len]);
+                }
+            }
         }
         if start == last {
             self.save(true);
@@ -676,6 +699,15 @@ mod tests {
     }
 
     #[test]
+    fn long_prefill_keeps_the_first_and_last_snapshots() {
+        let mut c = Cached::new(Toy::default(), 16, 4);
+        c.prefill(&tokens(10, 9));
+        c.reset();
+        c.prefill(&tokens(42, 0));
+        assert_eq!(c.snapshots().lengths(), vec![4, 4, 8, 9, 32, 36, 40, 41]);
+    }
+
+    #[test]
     fn restore_gives_the_same_logits() {
         let mut c = Cached::new(Toy::default(), 16, 4);
         let a = tokens(10, 0);
@@ -783,6 +815,19 @@ mod tests {
         // Three anchors: [1], used least recently, is a plain snapshot again.
         s.insert(&[10], || 10, false, false);
         assert!(!s.contains(&[1]) && s.contains(&[8]) && s.contains(&[9]));
+    }
+
+    #[test]
+    fn thinning_keeps_the_anchor() {
+        const END: u32 = 1_000_000;
+        let mut c = Cached::new(Toy::keeping(), 16, 2).anchor_after(END);
+        let mut prompt = tokens(5, 0);
+        prompt.push(END);
+        prompt.extend(tokens(30, 1));
+        c.prefill(&prompt);
+        let lengths = c.snapshots().lengths();
+        assert!(lengths.contains(&6), "{lengths:?}");
+        assert_eq!(lengths.len(), KEEP_ON_THE_WAY + 2, "{lengths:?}");
     }
 
     /// A long conversation pushes every early snapshot out, but a new one
