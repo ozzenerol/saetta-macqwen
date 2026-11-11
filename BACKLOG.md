@@ -22,10 +22,12 @@
 - C1 `src/cpu/`: RMSNorm, SiLU, partial RoPE, full attention with q_norm, k_norm, GQA and the output gate, for one token with a KV cache. f32, unit tests on small shapes.
 - C2 Gated DeltaNet for one token: conv1d state, recurrent state, gating, matching `gated_delta.py`.
 - C3 MoE block: router softmax, top 8, experts, shared expert with its gate.
-- C4 Layers 0 to 3 end to end against `golden/` (needs A1, A2, B1).
+- C4 Layers 0 to 3 end to end against `golden/` (needs A1, A2, B1). Done: 1.4e-6 relative RMS against MLX f32.
+- C5 All 40 layers and the logits on the CPU, greedy generation, compared with `mlx_lm.server` greedy output.
+- C6 Metal versions of the Gated DeltaNet step, full attention and RMSNorm, checked against the CPU layers.
 
 ## Later
 
-- Metal versions of C1 to C3, all 40 layers, logits and sampling
+- B5 One command buffer per token for the whole model, fused small ops, GPU router
 - MTP weights and speculative decoding
 - state snapshots per turn
