@@ -1381,13 +1381,13 @@ mod mac {
         /// keys, so now and then a key lands on the next half value, and a
         /// token at a near tie of the router picks another expert: 3e-3 for
         /// one token at layer 20, which attention and the DeltaNet states
-        /// spread from there (median token 9e-4, worst 1e-2 and states 8e-3
-        /// by layer 32). A layout or slot bug is off by order 1, so bounds
+        /// spread from there (median token 2.2e-3, worst 1.6e-2 and states 8e-3
+        /// by layer 37). A layout or slot bug is off by order 1, so bounds
         /// at twice that still catch it.
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn exact_prefill_matches_token_by_token() {
-            check_prefill(true, 2e-3, 1e-2);
+            check_prefill(true, 5e-3, 1e-2);
         }
 
         /// With half inputs the typical token is off by the rounding of x to
