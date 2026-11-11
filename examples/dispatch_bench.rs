@@ -1,6 +1,9 @@
 //! How much does one dependent dispatch cost? A chain of N small kernels,
 //! each reading the previous one's output, encoded five ways.
 
+// The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+#![allow(unexpected_cfgs)]
+
 #[cfg(target_os = "macos")]
 fn main() {
     use metal::objc::{msg_send, sel, sel_impl};
