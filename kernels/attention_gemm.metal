@@ -198,9 +198,11 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
                           uint3 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]],
                           uint simd [[simdgroup_index_in_threadgroup]]) {
-    threadgroup half pt[64 * PREFILL_AG_LD];
-    threadgroup half vt[PREFILL_AG_BK * PREFILL_AG_VLD];
+    // The P and value tiles while the product runs, then the 64 x 64 sums
+    // for the update: one 16 KB buffer, not 26 KB (5 + 4.5 + 16).
     threadgroup float c[64 * 64];
+    threadgroup half *pt = (threadgroup half *)c;
+    threadgroup half *vt = pt + 64 * PREFILL_AG_LD;
     uint g = tg.z, r0 = tg.y * 64, d0 = tg.x * 64;
     if (r0 >= p.rows) {
         return;
@@ -252,6 +254,7 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // The loop ended on a barrier, so the tiles are free for the sums.
     for (uint i = 0; i < 4; i++) {
         for (uint j = 0; j < 4; j++) {
             simdgroup_store(acc[i][j], c + (sm + 8 * i) * 64 + sn + 8 * j, 64);
