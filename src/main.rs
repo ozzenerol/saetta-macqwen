@@ -455,7 +455,10 @@ fn serve_gpu(
         memory,
         ..
     } = flags;
-    let served = load_gpu(config, weights, draft, lookup, memory)?;
+    let mut served = load_gpu(config, weights, draft, lookup, memory)?;
+    if std::env::var("SAETTA_WARM_UP").map_or(true, |v| v != "0") {
+        warm_up(&mut served);
+    }
     let snapshots = served.snapshots;
     let mut model = anchored(
         Cached::new(served, snapshots, SNAPSHOT_EVERY).min_piece(serve_chunk()),
@@ -546,6 +549,42 @@ fn load_gpu(
         decoded: 0,
     })
 }
+
+/// Runs a throwaway prefill and decode step at load, then resets the model.
+/// The first prefill of a process spent about 0.4 s encoding (batch 16);
+/// pipeline builds were at most 80 ms of it (batch 17). This moves that
+/// cost, whatever it is, off the first request and prints where it went.
+#[cfg(target_os = "macos")]
+fn warm_up(served: &mut GpuServed) {
+    use server::Model;
+    let start = Instant::now();
+    served.model.gpu().commit_residency();
+    let residency = start.elapsed();
+    let tokens = saetta::prefill::test_tokens(WARM_UP_TOKENS);
+    let t = Instant::now();
+    served.prefill(&tokens);
+    let first = t.elapsed();
+    let t = Instant::now();
+    served.prefill(&tokens);
+    let second = t.elapsed();
+    let t = Instant::now();
+    served.step(tokens[0]);
+    let step = t.elapsed();
+    served.reset();
+    eprintln!(
+        "warm-up: residency commit {:.1} ms, prefill of {WARM_UP_TOKENS} {:.0} ms then {:.0} ms, decode step {:.0} ms, {:.2} s in all",
+        residency.as_secs_f64() * 1e3,
+        first.as_secs_f64() * 1e3,
+        second.as_secs_f64() * 1e3,
+        step.as_secs_f64() * 1e3,
+        start.elapsed().as_secs_f64()
+    );
+}
+
+/// Tokens of the warm-up prefill: enough for experts with tiles of more
+/// than the few-MoE limit, so the 64-row gate,up path runs too.
+#[cfg(target_os = "macos")]
+const WARM_UP_TOKENS: usize = 512;
 
 /// The GPU buffers each part of the served model allocates at load, besides
 /// the weights (which are no-copy views of the model files). Metal charges a

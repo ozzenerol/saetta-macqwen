@@ -407,7 +407,7 @@ mod mac {
     impl Gpu {
         /// Commits weight buffers added since the last command buffer to
         /// the residency set.
-        fn commit_residency(&self) {
+        pub fn commit_residency(&self) {
             if let Some(r) = &self.residency {
                 r.commit();
             }
