@@ -313,6 +313,7 @@ mod mac {
         g_half: &View,
         g: &Grouped,
         rows64: bool,
+        half_only: bool,
     ) {
         let shape = MmShape {
             m: 0,
@@ -320,7 +321,7 @@ mod mac {
             k: gate.cols as u32,
             gather: 1,
         };
-        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, rows64);
+        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, rows64, half_only);
         set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
         groups(enc, (gate.rows.div_ceil(64), g.max_tiles), threads);
 
@@ -347,6 +348,7 @@ mod mac {
         g_half: &View,
         shape: &MmShape,
         rows64: bool,
+        half_only: bool,
     ) -> usize {
         assert!(
             matches!(gate.bits, 5 | 8),
@@ -354,7 +356,11 @@ mod mac {
             gate.bits
         );
         let (name, threads) = if rows64 {
-            ("prefill_gate_up64", 256)
+            if half_only {
+                ("prefill_gate_up64h", 256)
+            } else {
+                ("prefill_gate_up64", 256)
+            }
         } else {
             ("prefill_gate_up", 128)
         };
@@ -385,7 +391,7 @@ mod mac {
             k: gate.cols as u32,
             gather: 0,
         };
-        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, true);
+        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, true, false);
         // Unused in plain mode, but bound so the kernel sees valid buffers.
         set_views(enc, 10, &[x_half, x_half, x_half]);
         groups(enc, (gate.rows.div_ceil(64), m.div_ceil(64)), threads);
@@ -481,6 +487,12 @@ mod mac {
     fn gate_up64() -> bool {
         std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
             && std::env::var("SAETTA_EXPERT_VARIANT").is_err()
+    }
+
+    /// Expert tiles skip the f32 g output in prefill_gate_up64h unless
+    /// SAETTA_GU_HALF=0.
+    fn gate_up_half() -> bool {
+        std::env::var("SAETTA_GU_HALF").map_or(true, |v| v != "0")
     }
 
     /// The shared expert's gate, up and silu in one prefill_gate_up64 pass
@@ -1895,6 +1907,9 @@ mod mac {
                         &expert_half,
                         &g,
                         fused64,
+                        // Down reads g_half; the f32 g is only kept for
+                        // range tracking.
+                        self.ranges.is_none() && gate_up_half(),
                     );
                 } else {
                     if !half_early {

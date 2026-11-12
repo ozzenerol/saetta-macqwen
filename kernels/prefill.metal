@@ -1783,7 +1783,8 @@ inline void dequant16(thread const uint *packed, float scale, float bias,
     }
 }
 
-template <uint BITS>
+// HALF_ONLY skips the f32 g output (expert tiles: down reads g_half).
+template <uint BITS, bool HALF_ONLY>
 kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                               device const ushort *gate_scales [[buffer(1)]],
                               device const ushort *gate_biases [[buffer(2)]],
@@ -1928,7 +1929,9 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
             for (uint e = 0; e < 2; e++) {
                 if (n0 + c + e < s.n) {
                     float v = silu(ge[e]) * ue[e];
-                    g[out + c + e] = v;
+                    if (!HALF_ONLY) {
+                        g[out + c + e] = v;
+                    }
                     g_half[out + c + e] = half(v);
                 }
             }
@@ -1936,8 +1939,10 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
     }
 }
 
-template [[host_name("prefill_gate_up64_5bit")]] kernel decltype(prefill_gate_up64<5>) prefill_gate_up64<5>;
-template [[host_name("prefill_gate_up64_8bit")]] kernel decltype(prefill_gate_up64<8>) prefill_gate_up64<8>;
+template [[host_name("prefill_gate_up64_5bit")]] kernel decltype(prefill_gate_up64<5, false>) prefill_gate_up64<5, false>;
+template [[host_name("prefill_gate_up64_8bit")]] kernel decltype(prefill_gate_up64<8, false>) prefill_gate_up64<8, false>;
+template [[host_name("prefill_gate_up64h_5bit")]] kernel decltype(prefill_gate_up64<5, true>) prefill_gate_up64<5, true>;
+template [[host_name("prefill_gate_up64h_8bit")]] kernel decltype(prefill_gate_up64<8, true>) prefill_gate_up64<8, true>;
 
 // g = silu(g) * u and g_half = g for the rows of the tiles of PREFILL_FEW
 // rows or fewer, which prefill_gate_up skips. One threadgroup per tile.
