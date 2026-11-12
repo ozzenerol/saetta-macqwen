@@ -601,6 +601,10 @@ impl<M: Model + Restore> Model for Cached<M> {
     fn capacity(&self) -> usize {
         self.model.capacity()
     }
+
+    fn keep_warm(&mut self) {
+        self.model.keep_warm();
+    }
 }
 
 /// The CPU model's snapshot: the DeltaNet layers' states, in layer order.

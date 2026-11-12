@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The engine behind the server. Calls append to the model's state.
 pub trait Model: Send {
@@ -64,7 +64,13 @@ pub trait Model: Send {
     fn capacity(&self) -> usize {
         usize::MAX
     }
+    /// Called between requests (`Settings::keep_warm`) to keep the GPU
+    /// working set resident; it must not change the state.
+    fn keep_warm(&mut self) {}
 }
+
+/// How long after a request `keep_warm` keeps going.
+const WARM_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 pub struct Settings {
     pub model_name: String,
@@ -75,6 +81,9 @@ pub struct Settings {
     /// conversation that continues from our last answer keeps the tokens the
     /// model generated instead of the re-rendered ones (see `splice`).
     pub exact_history: bool,
+    /// Call `Model::keep_warm` this often while no request runs, for
+    /// WARM_WINDOW after the last one. None never calls it.
+    pub keep_warm: Option<Duration>,
 }
 
 pub struct Server<M: Model> {
@@ -85,6 +94,8 @@ pub struct Server<M: Model> {
     requests: AtomicU64,
     /// `Model::capacity`, read once.
     capacity: usize,
+    /// When the last request ended or started.
+    last_request: Mutex<Instant>,
 }
 
 struct Engine<M> {
@@ -129,11 +140,16 @@ impl<M: Model + 'static> Server<M> {
             settings,
             special,
             requests: AtomicU64::new(0),
+            last_request: Mutex::new(Instant::now()),
         })
     }
 
     /// Accepts connections until the listener fails, one thread each.
     pub fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+        if let Some(period) = self.settings.keep_warm {
+            let server = Arc::clone(&self);
+            thread::spawn(move || server.keep_warm(period));
+        }
         for stream in listener.incoming() {
             let stream = stream?;
             let server = Arc::clone(&self);
@@ -144,6 +160,31 @@ impl<M: Model + 'static> Server<M> {
             });
         }
         Ok(())
+    }
+
+    /// Every `period`, while the last request is under WARM_WINDOW old,
+    /// lets the model keep its GPU memory resident. It skips a turn when a
+    /// request holds the engine, so it never makes one wait.
+    fn keep_warm(&self, period: Duration) {
+        loop {
+            thread::sleep(period);
+            let since = self
+                .last_request
+                .lock()
+                .map_or(WARM_WINDOW, |t| t.elapsed());
+            if since >= WARM_WINDOW {
+                continue;
+            }
+            if let Ok(mut engine) = self.engine.try_lock() {
+                engine.model.keep_warm();
+            }
+        }
+    }
+
+    fn mark_request(&self) {
+        if let Ok(mut t) = self.last_request.lock() {
+            *t = Instant::now();
+        }
     }
 
     fn handle(&self, stream: TcpStream) -> io::Result<()> {
@@ -324,6 +365,19 @@ impl<M: Model + 'static> Server<M> {
         mut emit: impl FnMut(Event) -> bool,
     ) -> Done {
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+        self.mark_request();
+        let done = self.generate_locked(&mut engine, r, &mut alive, &mut emit);
+        self.mark_request();
+        done
+    }
+
+    fn generate_locked(
+        &self,
+        engine: &mut Engine<M>,
+        r: &ChatRequest,
+        mut alive: impl FnMut() -> bool,
+        mut emit: impl FnMut(Event) -> bool,
+    ) -> Done {
         let held = engine.tokens.clone();
         let spliced = match engine.last.take() {
             Some(last) if !self.settings.exact_history => self.splice(&last, &held, r),

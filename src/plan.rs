@@ -235,6 +235,11 @@ mod mac {
     }
 
     impl Built {
+        /// Every buffer the recorded ops use.
+        pub fn resources(&self) -> &[Buffer] {
+            &self.resources
+        }
+
         /// Replays the recorded ops in one command buffer and waits.
         // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
         #[allow(unexpected_cfgs)]

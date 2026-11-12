@@ -52,6 +52,10 @@ mod mac {
     }
 
     impl AttGemm {
+        pub fn buffers(&self) -> Vec<&Buffer> {
+            vec![&self.s, &self.p, &self.o, &self.m, &self.l, &self.alpha]
+        }
+
         /// About 7 KB per query row: 112 KB per token of chunk with 2 kv
         /// heads, 230 MB for 2048 tokens.
         pub fn new(gpu: &Gpu, chunk: usize, kv_heads: usize) -> AttGemm {

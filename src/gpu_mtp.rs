@@ -167,6 +167,14 @@ mod mac {
             self.record_plan = record_plan;
         }
 
+        /// Every buffer its plans use.
+        pub fn resources(&self) -> impl Iterator<Item = &metal::Buffer> {
+            self.built
+                .resources()
+                .iter()
+                .chain(self.record_built.resources())
+        }
+
         /// The KV cache's buffer bytes as allocated now.
         pub fn kv_bytes(&self) -> u64 {
             self.layer.kv_bytes()

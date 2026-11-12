@@ -508,6 +508,37 @@ mod mac {
     }
 
     impl Scratch {
+        fn buffers(&self) -> Vec<&Buffer> {
+            vec![
+                &self.normed,
+                &self.wide,
+                &self.mixed,
+                &self.z,
+                &self.y,
+                &self.a,
+                &self.b,
+                &self.mixer_out,
+                &self.q_half,
+                &self.router,
+                &self.shared_gate,
+                &self.shared_g,
+                &self.shared_u,
+                &self.shared_out,
+                &self.ids,
+                &self.expert_weights,
+                &self.order,
+                &self.rows,
+                &self.tiles,
+                &self.tile_count,
+                &self.expert_g,
+                &self.expert_u,
+                &self.expert_out,
+                &self.normed_half,
+                &self.expert_half,
+                &self.x_half,
+            ]
+        }
+
         fn new(gpu: &Gpu, cfg: &Config, chunk: usize) -> Scratch {
             let f = |n: usize| gpu.buffer(n.max(1) * 4);
             let h = cfg.hidden_size;
@@ -798,6 +829,21 @@ mod mac {
                 exact: true,
                 ranges: None,
             })
+        }
+
+        /// The buffers prefill keeps between calls: its scratch, the
+        /// matrix-product attention's and verify's. The weights are the
+        /// decode model's buffers.
+        pub fn buffers(&self) -> Vec<Buffer> {
+            let mut out: Vec<Buffer> = self.scratch.buffers().into_iter().cloned().collect();
+            if let Some(g) = &self.gemm {
+                out.extend(g.buffers().into_iter().cloned());
+            }
+            if let Some(v) = &self.verify_rows {
+                out.extend(v.conv.iter().chain(&v.recurrent).cloned());
+                out.extend([v.hidden.clone(), v.logits.clone(), v.argmax.clone()]);
+            }
+            out
         }
 
         /// Starts recording the largest |x| at each of `RANGES`.

@@ -632,6 +632,18 @@ mod mac {
             }
         }
 
+        /// Every buffer the decode and verify plans use, once each.
+        pub fn resources(&self) -> Vec<Buffer> {
+            let mut out: Vec<Buffer> = Vec::new();
+            let verify = self.verify.iter().flat_map(|v| v.resources());
+            for b in self.built.resources().iter().chain(verify) {
+                if !out.iter().any(|o| std::ptr::eq(o.as_ref(), b.as_ref())) {
+                    out.push(b.clone());
+                }
+            }
+            out
+        }
+
         /// Tokens the attention caches hold now; `capacity` is the most.
         pub fn allocated(&self) -> usize {
             self.allocated

@@ -93,6 +93,17 @@ mod mac {
         last: Option<(usize, usize)>,
     }
 
+    impl GpuVerify<'_> {
+        /// Every buffer its plans use.
+        pub(crate) fn resources(&self) -> impl Iterator<Item = &Buffer> {
+            self.plans
+                .iter()
+                .map(|(_, b)| b)
+                .chain(&self.restores)
+                .flat_map(|b| b.resources())
+        }
+    }
+
     impl GpuLayer<'_> {
         /// `GpuLayer::record` for `m` rows of `x`. `s.normed` must hold
         /// `input_norm(x)`.

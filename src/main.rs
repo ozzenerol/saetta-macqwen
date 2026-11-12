@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] [--keep-warm S] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -228,6 +228,8 @@ struct ServeFlags {
     draft: usize,
     port: u16,
     exact_history: bool,
+    /// Seconds between keep-warm touches of the GPU buffers; None is off.
+    keep_warm: Option<std::time::Duration>,
     memory: Memory,
 }
 
@@ -268,6 +270,7 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
         draft: 0,
         port: 8090,
         exact_history: false,
+        keep_warm: None,
         memory: Memory::default(),
     };
     let mut it = flags.iter();
@@ -315,6 +318,15 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                 f.memory.cache_idle =
                     (min > 0.0).then(|| std::time::Duration::from_secs_f64(min * 60.0));
             }
+            "--keep-warm" => {
+                let value = it.next().ok_or("--keep-warm needs seconds")?;
+                let secs: f64 = value
+                    .parse()
+                    .ok()
+                    .filter(|s: &f64| *s >= 0.0 && s.is_finite())
+                    .ok_or(format!("bad --keep-warm {value}"))?;
+                f.keep_warm = (secs > 0.0).then(|| std::time::Duration::from_secs_f64(secs));
+            }
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
                 f.port = value.parse().map_err(|_| format!("bad port {value}"))?;
@@ -338,6 +350,7 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
         gpu,
         port,
         exact_history,
+        keep_warm,
         ..
     } = flags;
     // The model borrows these for as long as the server runs.
@@ -355,6 +368,7 @@ fn serve(dir: &Path, flags: ServeFlags) -> Result<(), Box<dyn Error>> {
         max_tokens: 16384,
         eos_token_ids: config.eos_token_ids.clone(),
         exact_history,
+        keep_warm,
     };
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let what = format!("{} on 127.0.0.1:{port}", dir.display());
@@ -482,6 +496,7 @@ fn load_gpu(
         last_blit: RefCell::new(None),
         drafting: spec,
         rows: saetta::gpu_cache::RowBackup::new(),
+        warm: gpu.buffer(4),
     })
 }
 
@@ -549,6 +564,8 @@ struct GpuServed {
     drafting: Option<Drafting>,
     /// KV rows kept aside during a detour (cache::Restore::backup_rows).
     rows: saetta::gpu_cache::RowBackup,
+    /// The 4 bytes `keep_warm` writes.
+    warm: metal::Buffer,
 }
 
 /// The KV cache of each attention layer.
@@ -738,6 +755,22 @@ impl server::Model for GpuServed {
         if let Some(d) = &mut self.drafting {
             d.spec.reset();
         }
+    }
+
+    /// Makes the decode, verify, MTP and prefill buffers resident with one
+    /// tiny dispatch, so the first prefill after a pause does not wait for
+    /// the driver to map them again.
+    fn keep_warm(&mut self) {
+        let mut buffers = self.model.resources();
+        buffers.extend(self.prefill.buffers());
+        if let Some(d) = &self.drafting {
+            buffers.extend(d.spec.mtp.resources().cloned());
+        }
+        let refs: Vec<&metal::ResourceRef> = buffers
+            .iter()
+            .map(|b| -> &metal::ResourceRef { b })
+            .collect();
+        self.model.gpu().touch(&refs, &self.warm);
     }
 
     /// A drafting round runs up to 8 tokens past the ones it keeps

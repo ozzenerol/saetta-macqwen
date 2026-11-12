@@ -257,6 +257,20 @@ mod mac {
     }
 
     impl Gpu {
+        /// Runs one tiny dispatch on `scratch` (at least 4 bytes) in a
+        /// command buffer that also makes `buffers` resident, so the driver
+        /// keeps them mapped while the server waits for the next request.
+        pub fn touch(&self, buffers: &[&metal::ResourceRef], scratch: &Buffer) {
+            let pipeline = self.pipeline("add_one");
+            self.run(|enc| {
+                enc.use_resources(
+                    buffers,
+                    metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
+                );
+                dispatch_1d(enc, &pipeline, &[(scratch, 0)], 1);
+            });
+        }
+
         /// Encodes buffer copies and commits them without waiting. Work
         /// committed later on the queue runs after the copies, so callers
         /// only wait (on the returned command buffer) to time them.

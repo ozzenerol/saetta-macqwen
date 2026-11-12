@@ -29,3 +29,5 @@ Nothing else is kept per request.
 Before the caches grew, the same server held 6879 MB 6 s after an 18k conversation: the whole 5 GB of KV was resident from the first request.
 
 Right after every request the footprint is about 1160 MB higher, and it drops back within 5 s. The step is the same at every context, for a 5-word prompt and for one answered from the cache without a prefill, so it is not the KV caches, prefill or a per-request buffer. Where it comes from is not known yet; plan for a peak of the steady state plus 1.2 GB.
+
+The first prefill of every request also takes about 0.6 s more than the pieces after it (batch 6, 2026-11-12), likely the same effect: the driver drops the residency after a few idle seconds and maps it again on the next use. `serve --keep-warm S` (off by default, being measured) touches the decode, verify, MTP and prefill buffers with one tiny dispatch every S seconds for 10 minutes after a request, and skips a turn while a request runs.

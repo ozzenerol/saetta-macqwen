@@ -76,6 +76,7 @@ struct Log {
     resets: usize,
     restores: Vec<usize>,
     steps: usize,
+    warms: usize,
 }
 
 /// Writes `script` after every prefill, one token per step.
@@ -118,6 +119,9 @@ impl Model for Fake {
     fn reset(&mut self) {
         self.len = 0;
         self.log.lock().unwrap().resets += 1;
+    }
+    fn keep_warm(&mut self) {
+        self.log.lock().unwrap().warms += 1;
     }
 }
 
@@ -163,6 +167,14 @@ fn serve(model: impl Model + 'static) -> String {
 }
 
 fn serve_with(model: impl Model + 'static, exact_history: bool) -> String {
+    serve_settings(model, exact_history, None)
+}
+
+fn serve_settings(
+    model: impl Model + 'static,
+    exact_history: bool,
+    keep_warm: Option<Duration>,
+) -> String {
     let settings = Settings {
         model_name: "fake".into(),
         sampling: Params {
@@ -173,6 +185,7 @@ fn serve_with(model: impl Model + 'static, exact_history: bool) -> String {
         max_tokens: 1000,
         eos_token_ids: vec![IM_END, 306],
         exact_history,
+        keep_warm,
     };
     let server = Arc::new(Server::new(model, tokenizer(), settings).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -225,6 +238,27 @@ fn lists_model() {
     assert_eq!(status, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["data"][0]["id"], "fake");
+}
+
+/// keep_warm runs between requests, and not while one holds the engine.
+#[test]
+fn keeps_warm_between_requests() {
+    let (mut model, log) = fake(script(&[Ok("hello")]));
+    model.delay = Duration::from_millis(40);
+    let addr = serve_settings(model, false, Some(Duration::from_millis(10)));
+    let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+    let (status, _) = post(&addr, body.clone());
+    assert_eq!(status, 200);
+    thread::sleep(Duration::from_millis(200));
+    let idle = log.lock().unwrap().warms;
+    assert!(idle >= 5, "{idle} calls in 200 ms of idle");
+    // A slow request: the steps hold the engine, so no call lands then.
+    let during = {
+        let before = log.lock().unwrap().warms;
+        post(&addr, body);
+        log.lock().unwrap().warms - before
+    };
+    assert!(during <= 2, "{during} calls during a 300 ms request");
 }
 
 #[test]
