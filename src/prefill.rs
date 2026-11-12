@@ -522,8 +522,9 @@ mod mac {
         })
     }
 
-    /// Lanes per state row in delta_rows3: SAETTA_DELTA_LANES=4 (default),
-    /// 8, 16 or 32.
+    /// Lanes per state row in delta_rows3: 8 by default (delta 11% faster
+    /// than 4 at 2048 tokens, batch 22; 16 and 32 lose), or
+    /// SAETTA_DELTA_LANES=4, 16 or 32.
     fn delta_lanes() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
@@ -531,7 +532,7 @@ mod mac {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|n| matches!(n, 4 | 8 | 16 | 32))
-                .unwrap_or(4)
+                .unwrap_or(8)
         })
     }
 
