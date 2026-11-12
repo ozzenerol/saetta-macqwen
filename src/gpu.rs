@@ -88,7 +88,7 @@ mod mac {
     impl Residency {
         fn new(device: &Device, queue: &CommandQueue) -> Option<Residency> {
             use metal::foreign_types::ForeignType;
-            use metal::objc::runtime::{Class, Object, BOOL, NO};
+            use metal::objc::runtime::{BOOL, Class, NO, Object};
             use metal::objc::{class, msg_send, sel, sel_impl};
             if std::env::var("SAETTA_RESIDENCY").is_ok_and(|v| v == "0") {
                 return None;
@@ -98,7 +98,9 @@ mod mac {
                 let queue = queue.as_ptr() as *mut Object;
                 let ok: BOOL = msg_send![device, respondsToSelector: sel!(newResidencySetWithDescriptor:error:)];
                 if ok == NO || Class::get("MTLResidencySetDescriptor").is_none() {
-                    eprintln!("no residency sets before macOS 15; weights may go cold between requests");
+                    eprintln!(
+                        "no residency sets before macOS 15; weights may go cold between requests"
+                    );
                     return None;
                 }
                 let desc: *mut Object = msg_send![class!(MTLResidencySetDescriptor), new];
@@ -111,7 +113,10 @@ mod mac {
                     return None;
                 }
                 let _: () = msg_send![queue, addResidencySet: set];
-                Some(Residency { set, dirty: std::cell::Cell::new(false) })
+                Some(Residency {
+                    set,
+                    dirty: std::cell::Cell::new(false),
+                })
             }
         }
 
@@ -416,6 +421,21 @@ mod mac {
                 self.commit_residency();
                 let commands = self.queue.new_command_buffer().to_owned();
                 let encoder = commands.new_blit_command_encoder();
+                encode(encoder);
+                encoder.end_encoding();
+                commands.commit();
+                commands
+            })
+        }
+
+        /// `blit` for compute work: one serial encoder, committed without
+        /// waiting.
+        pub fn commit(&self, encode: impl FnOnce(&ComputeCommandEncoderRef)) -> CommandBuffer {
+            metal::objc::rc::autoreleasepool(|| {
+                self.commit_residency();
+                let commands = self.queue.new_command_buffer().to_owned();
+                let encoder =
+                    commands.compute_command_encoder_with_dispatch_type(MTLDispatchType::Serial);
                 encode(encoder);
                 encoder.end_encoding();
                 commands.commit();
