@@ -616,6 +616,31 @@ mod gpu {
             logits
         }
 
+        /// Runs prompt tokens as `step` does one by one, but through the
+        /// multi-row verify, `k + 1` tokens per pass, keeping all of them;
+        /// returns the logits after the last. For a prompt's short tail.
+        pub fn run_rows(&mut self, model: &mut GpuModel<'a>, tokens: &[u32]) -> Vec<f32> {
+            let mut logits = Vec::new();
+            for piece in tokens.chunks(self.k + 1) {
+                let pos = model.position();
+                model.verify(piece);
+                model.accept(piece.len());
+                for (r, &t) in piece.iter().enumerate() {
+                    if pos + r > 0 {
+                        let h = match r {
+                            0 => self.last.clone(),
+                            _ => model.verify_hidden(r - 1),
+                        };
+                        self.mtp_record(&h, pos + r - 1, t);
+                    }
+                }
+                let n = piece.len();
+                copy(&model.verify_hidden(n - 1), &self.last, self.hidden);
+                logits = model.verify_logits(n - 1);
+            }
+            logits
+        }
+
         /// `step` without the MTP entry, for prompt tokens before the MTP
         /// window: the drafts only look back that far.
         pub fn step_plain(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
