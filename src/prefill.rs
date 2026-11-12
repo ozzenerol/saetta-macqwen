@@ -1809,6 +1809,102 @@ mod mac {
         Ok(())
     }
 
+    /// Looks for what the first prefill after a pause pays for: the driver
+    /// gives back about 1.1 GB of its own memory between requests and the
+    /// next prefill takes about 0.55 s longer. Prints the wall time of a
+    /// whole prefill right after another and after `gap` seconds, then of
+    /// each layer and of each stage of layers 0 (DeltaNet) and 3 (attention)
+    /// after a gap and right after. A stage that costs much more after the
+    /// gap is one that makes the driver allocate again.
+    pub fn bench_gap(
+        dir: &std::path::Path,
+        tokens: usize,
+        chunk: usize,
+        gap: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::{Duration, Instant};
+        let cfg = Config::load(dir)?;
+        let weights = Weights::open(dir)?;
+        let gpu = Gpu::new()?;
+        let capacity = tokens.next_multiple_of(KEY_BLOCK);
+        let mut prefill = Prefill::new(&gpu, &cfg, &weights, chunk)?;
+        // The kernels serve runs.
+        prefill.exact = exact_from_env();
+        let prompt = test_tokens(tokens);
+        let owned = OwnedState::new_all(&gpu, &cfg, capacity);
+        let states: Vec<State> = owned.iter().map(|s| s.state()).collect();
+        let pause = || std::thread::sleep(Duration::from_secs_f64(gap));
+        let footprint = || {
+            let pid = std::process::id().to_string();
+            let out = std::process::Command::new("footprint").arg(&pid).output();
+            out.ok()
+                .and_then(|o| {
+                    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+                    let line = text.lines().find(|l| l.contains("Footprint:"))?.to_string();
+                    Some(line.split("Footprint:").nth(1)?.trim().to_string())
+                })
+                .unwrap_or_else(|| "?".into())
+        };
+        let whole = || {
+            let start = Instant::now();
+            prefill.run(&gpu, &prompt, 0, &states);
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        whole();
+        let warm = whole();
+        let before = footprint();
+        pause();
+        let after_gap = footprint();
+        let cold = whole();
+        println!(
+            "whole prefill of {tokens} tokens: {warm:.0} ms right after one, {cold:.0} ms after {gap} s (footprint {before} before the pause, {after_gap} after it)"
+        );
+
+        let x = prefill.embed(&gpu, &prompt);
+        let bytes = tokens * cfg.hidden_size * 4;
+        let ptr = x.contents() as *mut u8;
+        let mut input = vec![0u8; bytes];
+        unsafe { std::ptr::copy_nonoverlapping(ptr, input.as_mut_ptr(), bytes) };
+        let layer = |l: usize| {
+            unsafe { std::ptr::copy_nonoverlapping(input.as_ptr(), ptr, bytes) };
+            let start = Instant::now();
+            prefill.layer(&gpu, l, &x, tokens, 0, &states[l]);
+            start.elapsed().as_secs_f64() * 1e3
+        };
+        pause();
+        let cold: Vec<f64> = (0..states.len()).map(layer).collect();
+        let warm: Vec<f64> = (0..states.len()).map(layer).collect();
+        println!("layers after {gap} s (ms, right after in brackets):");
+        for (l, (c, w)) in cold.iter().zip(&warm).enumerate() {
+            let mark = if c - w > 5.0 { "  <-" } else { "" };
+            println!("  layer {l:2}: {c:7.1} ({w:6.1}){mark}");
+        }
+
+        let stages = |l: usize| -> Vec<f64> {
+            (0..STAGES.len())
+                .map(|k| {
+                    prefill.only.set(Some(k));
+                    let t = layer(l);
+                    prefill.only.set(None);
+                    t
+                })
+                .collect()
+        };
+        for l in [0, 3] {
+            pause();
+            let cold = stages(l);
+            let warm = stages(l);
+            println!(
+                "layer {l} by stage after {gap} s, stages 0 ..= k (ms, right after in brackets):"
+            );
+            for (k, (c, w)) in cold.iter().zip(&warm).enumerate() {
+                let mark = if c - w > 5.0 { "  <-" } else { "" };
+                println!("  {:>22}: {c:7.1} ({w:6.1}){mark}", STAGES[k]);
+            }
+        }
+        Ok(())
+    }
+
     /// Prints the GPU time per stage of a `tokens`-token prefill (see
     /// `Prefill::profile`), after one warm-up run.
     /// Profiles the prefill of `tokens` tokens, or with `last`, only of the
