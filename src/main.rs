@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--half-snapshots] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta prefill-gap <model dir> <tokens> <gap s> | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--full-snapshots] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta prefill-gap <model dir> <tokens> <gap s> | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -240,7 +240,7 @@ struct ServeFlags {
     /// `--gpu` it is 3 unless `--draft` says otherwise.
     draft: usize,
     /// Most tokens a round copies from the context (`speculative::lookup`);
-    /// `--draft` unless `--lookup` says otherwise, 0 turns it off. The verify
+    /// 7 with drafting unless `--lookup` says otherwise, 0 turns it off. The verify
     /// takes `max(draft, lookup) + 1` rows, and each row past `draft + 1`
     /// adds 63 MB of DeltaNet snapshots plus 16 KB per 128 tokens of context.
     lookup: usize,
@@ -263,7 +263,8 @@ struct Memory {
     /// Snapshots unused for this long go when they keep the KV caches more
     /// than twice as long as a request needs; None keeps them.
     cache_idle: Option<std::time::Duration>,
-    /// Prompt cache snapshots in f16 (`--half-snapshots`): half the bytes,
+    /// Prompt cache snapshots in f16 (the default; `--full-snapshots` keeps
+    /// f32): half the bytes,
     /// and a restore starts from rounded DeltaNet states.
     half_snapshots: bool,
 }
@@ -273,15 +274,16 @@ impl Default for Memory {
         Memory {
             // The full context of Qwen3.6.
             context: 262144,
-            cache_bytes: 1 << 30,
-            kv_bits: KvBits::Half,
+            // 15 f16 snapshots.
+            cache_bytes: 512 << 20,
+            kv_bits: KvBits::Eight,
             cache_idle: Some(std::time::Duration::from_secs(15 * 60)),
-            half_snapshots: false,
+            half_snapshots: true,
         }
     }
 }
 
-/// `[--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--half-snapshots] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N]
+/// `[--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--full-snapshots] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N]
 /// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut draft = None;
@@ -333,6 +335,7 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                 f.memory.kv_bits = KvBits::parse(value).ok_or(format!("bad --kv-bits {value}"))?;
             }
             "--half-snapshots" => f.memory.half_snapshots = true,
+            "--full-snapshots" => f.memory.half_snapshots = false,
             "--cache-mb" => {
                 let value = it.next().ok_or("--cache-mb needs a number")?;
                 let mb: usize = value
@@ -366,7 +369,8 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     f.lookup = match lookup {
         Some(k) if k > 0 && f.draft == 0 => return Err("--lookup needs drafting".into()),
         Some(k) => k,
-        None => f.draft,
+        None if f.draft > 0 => 7,
+        None => 0,
     };
     Ok(f)
 }
@@ -1267,10 +1271,11 @@ mod tests {
     }
 
     #[test]
-    fn lookup_defaults_to_the_draft() {
+    fn lookup_defaults_to_7_with_drafting() {
         let lookup = |flags: &[&str]| serve_flags(flags).map(|f| f.lookup);
-        assert_eq!(lookup(&["--gpu"]), Ok(3));
-        assert_eq!(lookup(&["--gpu", "--draft", "2"]), Ok(2));
+        assert_eq!(lookup(&["--gpu"]), Ok(7));
+        assert_eq!(lookup(&["--gpu", "--draft", "2"]), Ok(7));
+        assert_eq!(lookup(&["--gpu", "--draft", "0"]), Ok(0));
         assert_eq!(lookup(&["--gpu", "--lookup", "7"]), Ok(7));
         assert_eq!(lookup(&["--gpu", "--lookup", "0"]), Ok(0));
         assert_eq!(lookup(&[]), Ok(0));
