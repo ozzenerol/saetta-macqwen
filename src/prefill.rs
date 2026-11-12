@@ -354,7 +354,14 @@ mod mac {
             gate.bits
         );
         let (name, threads) = if rows64 {
-            ("prefill_gate_up64", 256)
+            let deep = shape.k.is_multiple_of(128);
+            match gate_up_deep() {
+                // The f32 output is only skipped for expert tiles, whose
+                // down reads g_half.
+                2 if deep && shape.gather != 0 => ("prefill_gate_up64dh", 256),
+                1 | 2 if deep => ("prefill_gate_up64d", 256),
+                _ => ("prefill_gate_up64", 256),
+            }
         } else {
             ("prefill_gate_up", 128)
         };
@@ -481,6 +488,16 @@ mod mac {
     fn gate_up64() -> bool {
         std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
             && std::env::var("SAETTA_EXPERT_VARIANT").is_err()
+    }
+
+    /// SAETTA_GU_DEEP=1: prefill_gate_up64d, with the loads 4 steps ahead;
+    /// 2: also no f32 output on the expert tiles (prefill_gate_up64dh).
+    /// Unset or 0: prefill_gate_up64.
+    fn gate_up_deep() -> u32 {
+        std::env::var("SAETTA_GU_DEEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
     /// The shared expert's gate, up and silu in one prefill_gate_up64 pass
