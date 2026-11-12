@@ -185,7 +185,10 @@ kernel void prefill_ag_softmax(device const float *s [[buffer(0)]],
 }
 
 // O[g][r][d] = alpha[r] O + P V for rows tg.y * 64 .., dims tg.x * 64 ..
-// alpha 0 (the first block) ignores the old O, which is not set yet.
+// The accumulators start as alpha O, loaded and scaled row by row in
+// registers, so no tile is staged in threadgroup memory for the update
+// (that took 16 KB of the 26 KB and slowed pv to 10 TFLOP/s against the
+// scores' 12). The first block starts from 0: O is not set yet.
 template <uint BITS>
 kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
                           device const half *values [[buffer(1)]],
@@ -197,10 +200,10 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
                           device const half *biases [[buffer(7)]],
                           uint3 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]],
-                          uint simd [[simdgroup_index_in_threadgroup]]) {
+                          uint simd [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
     threadgroup half pt[64 * PREFILL_AG_LD];
     threadgroup half vt[PREFILL_AG_BK * PREFILL_AG_VLD];
-    threadgroup float c[64 * 64];
     uint g = tg.z, r0 = tg.y * 64, d0 = tg.x * 64;
     if (r0 >= p.rows) {
         return;
@@ -219,10 +222,23 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
     threadgroup half4 *vd = (threadgroup half4 *)(vt + vr * PREFILL_AG_VLD + vc);
 
     uint sm = (simd / 2) * 32, sn = (simd % 2) * 32;
+    // O of this simdgroup's 32 x 32: rows r0 + sm .., dims d0 + sn ..
+    ulong row0 = ulong(g) * p.rows_pad + r0;
+    device float *ot = o + (row0 + sm) * PREFILL_AG_D + d0 + sn;
+    uint2 f = frag(lane);
     simdgroup_float8x8 acc[4][4];
     for (uint i = 0; i < 4; i++) {
+        // Both elements of this lane are in row sm + 8 i + f.x.
+        uint r = r0 + sm + 8 * i + f.x;
+        float a = r < p.rows ? alpha[row0 + sm + 8 * i + f.x] : 0.0f;
         for (uint j = 0; j < 4; j++) {
-            acc[i][j] = simdgroup_float8x8(0);
+            if (p.j0 == 0) {
+                acc[i][j] = simdgroup_float8x8(0);
+            } else {
+                simdgroup_load(acc[i][j], ot + 8 * i * PREFILL_AG_D + 8 * j, PREFILL_AG_D);
+                acc[i][j].thread_elements()[0] *= a;
+                acc[i][j].thread_elements()[1] *= a;
+            }
         }
     }
     for (uint k0 = 0; k0 < padded; k0 += PREFILL_AG_BK) {
@@ -252,22 +268,10 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    // Rows past p.rows are padding in o, which prefill_ag_final skips.
     for (uint i = 0; i < 4; i++) {
         for (uint j = 0; j < 4; j++) {
-            simdgroup_store(acc[i][j], c + (sm + 8 * i) * 64 + sn + 8 * j, 64);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Thread t writes 32 dims of row t / 2.
-    uint r = r0 + tid / 2, cc = (tid % 2) * 32;
-    if (r < p.rows) {
-        ulong row = ulong(g) * p.rows_pad + r;
-        float a = alpha[row];
-        device float *orow = o + row * PREFILL_AG_D + d0 + cc;
-        threadgroup const float *crow = c + (tid / 2) * 64 + cc;
-        for (uint j = 0; j < 32; j++) {
-            orow[j] = a == 0.0f ? crow[j] : a * orow[j] + crow[j];
+            simdgroup_store(acc[i][j], ot + 8 * i * PREFILL_AG_D + 8 * j, PREFILL_AG_D);
         }
     }
 }
