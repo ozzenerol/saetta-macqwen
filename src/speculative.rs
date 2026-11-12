@@ -405,6 +405,12 @@ impl DraftLength {
         }
     }
 
+    /// The measured time of a round with `k` drafts at `context`, 0 when
+    /// unmeasured.
+    pub fn time(&mut self, context: usize, k: usize) -> f64 {
+        self.times(context)[k]
+    }
+
     /// The length `pick` gave is the one that runs.
     pub fn take(&mut self, k: usize) {
         self.tried[k] = self.rounds;
@@ -486,9 +492,63 @@ pub fn lookup(context: &[u32], max: usize) -> Option<(usize, Vec<u32>)> {
 }
 
 /// The lookup draft statistics by match length: 2, 3, and 4 or more tokens.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn lookup_bucket(len: usize) -> usize {
     len.min(4) - LOOKUP_MIN
+}
+
+/// How often `lookup` drafts are kept, by match length. It learns on every
+/// round that had a match, also the ones the MTP layer drafted: the lookup
+/// drafts are checked against the tokens that round produced. So a lookup
+/// round runs only once the context has earned it, never to explore.
+pub struct LookupAccept {
+    /// `accept[bucket][i]`: the chance draft `i` is kept when the drafts
+    /// before it were.
+    accept: Vec<Vec<f64>>,
+}
+
+/// Starting chance a lookup draft is kept: below what the MTP layer gets
+/// on code (0.7 to 0.8), so lookup has to show it does better first.
+const LOOKUP_PRIOR: f64 = 0.4;
+/// Weight of a new round in the lookup acceptance. Higher than the MTP
+/// one: copying starts and stops quickly.
+const LOOKUP_WEIGHT: f64 = 0.15;
+
+impl LookupAccept {
+    pub fn new(max: usize) -> LookupAccept {
+        LookupAccept {
+            accept: vec![vec![LOOKUP_PRIOR; max]; 3],
+        }
+    }
+
+    /// Tokens a round with `k` lookup drafts of match length `len` yields.
+    pub fn expected(&self, len: usize, k: usize) -> f64 {
+        let mut chance = 1.0;
+        let mut tokens = 1.0;
+        for a in &self.accept[lookup_bucket(len)][..k] {
+            chance *= a;
+            tokens += chance;
+        }
+        tokens
+    }
+
+    /// The lookup offered `drafts` (match length `len`), and the round
+    /// produced `truth` after the pending token: its kept drafts and next
+    /// token. Draft `i` counts as kept or not only where `truth` tells.
+    pub fn score(&mut self, len: usize, drafts: &[u32], truth: &[u32]) {
+        let accept = &mut self.accept[lookup_bucket(len)];
+        for (i, (&d, a)) in drafts.iter().zip(accept.iter_mut()).enumerate() {
+            let Some(&t) = truth.get(i) else { break };
+            let kept = if d == t { 1.0 } else { 0.0 };
+            *a += (kept - *a) * LOOKUP_WEIGHT;
+            if d != t {
+                break;
+            }
+        }
+    }
+
+    pub fn accept(&self) -> &[Vec<f64>] {
+        &self.accept
+    }
 }
 
 /// The rounds `generate` makes over tokens whose draft lengths are `lengths`.
@@ -533,7 +593,7 @@ mod gpu {
     //! The same rounds as `generate`, on the GPU model with the GPU MTP
     //! layer.
 
-    use super::{Decider, DraftLength, Stats, UNKNOWN, lookup, lookup_bucket};
+    use super::{Decider, DraftLength, LookupAccept, Stats, UNKNOWN, lookup};
     use crate::config::Config;
     use crate::gpu::Gpu;
     use crate::gpu_model::GpuModel;
@@ -556,8 +616,8 @@ mod gpu {
         /// For each MTP cache entry, the model position of its hidden state.
         mtp_positions: Vec<usize>,
         length: DraftLength,
-        /// The same for drafts from `lookup`, one per `lookup_bucket`.
-        lookup: Vec<DraftLength>,
+        /// How well drafts from `lookup` do.
+        lookup: LookupAccept,
         /// False with SAETTA_LOOKUP=0: MTP drafts only.
         use_lookup: bool,
         /// The tokens the model ran, one per position: 4 bytes a token.
@@ -580,7 +640,7 @@ mod gpu {
                 last: View::new(gpu.buffer(hidden * 4)),
                 mtp_positions: Vec::new(),
                 length: DraftLength::new(k),
-                lookup: (0..3).map(|_| DraftLength::new(k)).collect(),
+                lookup: LookupAccept::new(k),
                 use_lookup: std::env::var("SAETTA_LOOKUP").map_or(true, |v| v != "0"),
                 history: Vec::new(),
                 lengths: vec![0; k + 1],
@@ -692,7 +752,7 @@ mod gpu {
                     "lookup drafts: {} rounds, {} accepted, accept by match length {:?}",
                     self.lookup_rounds,
                     self.lookup_accepted,
-                    self.lookup.iter().map(|d| &d.accept).collect::<Vec<_>>()
+                    self.lookup.accept()
                 );
             }
             self.lengths.fill(0);
@@ -756,46 +816,45 @@ mod gpu {
             } else {
                 None
             };
-            let (k, from_context) = match found {
-                None => (self.length.next(context), None),
-                Some((len, drafts)) => {
-                    let b = lookup_bucket(len);
-                    let (kl, rate) = self.lookup[b].pick(context, 1, drafts.len());
-                    let (km, mtp_rate) = self.length.pick(context, 0, self.k);
-                    // An unmeasured lookup length runs first, then an
-                    // unmeasured MTP one; otherwise the faster.
-                    let lookup_wins = match (rate, mtp_rate) {
-                        (None, _) => true,
-                        (_, None) => false,
-                        (Some(l), Some(m)) => l >= m,
-                    };
-                    if lookup_wins {
-                        self.lookup[b].take(kl);
-                        (kl, Some((b, drafts[..kl].to_vec())))
-                    } else {
-                        self.length.take(km);
-                        (km, None)
-                    }
-                }
+            let (km, mtp_rate) = self.length.pick(context, 0, self.k);
+            // A lookup round when its expected tokens over the time of an
+            // MTP round of the same length (which also pays for the draft
+            // steps, so this is on the safe side) beat the best MTP round.
+            // Never while the MTP lengths are still being measured.
+            let from_context = match (&found, mtp_rate) {
+                (Some((len, drafts)), Some(best)) => (1..=drafts.len())
+                    .map(|kl| {
+                        let t = self.length.time(context, kl);
+                        (kl, self.lookup.expected(*len, kl) / t)
+                    })
+                    .filter(|&(_, rate)| rate > best)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(kl, _)| drafts[..kl].to_vec()),
+                _ => None,
             };
+            let k = from_context.as_ref().map_or(km, |d| d.len());
+            let from_lookup = from_context.is_some();
+            if !from_lookup {
+                self.length.take(km);
+            }
             let start = Instant::now();
-            let lookup_bucket = from_context.as_ref().map(|(b, _)| *b);
             let (drafts, next) = if k == 0 {
                 self.plain(model, pending, decide)
             } else {
-                self.round(model, pending, decide, k, from_context.map(|(_, d)| d))
+                self.round(model, pending, decide, k, from_context)
             };
             let seconds = start.elapsed().as_secs_f64();
-            match lookup_bucket {
-                Some(b) => {
-                    self.lookup[b].record(context, k, drafts.len(), seconds);
-                    self.lookup_rounds += 1;
-                    self.lookup_accepted += drafts.len();
-                }
-                None => {
-                    self.length.record(context, k, drafts.len(), seconds);
-                    self.lengths[k] += 1;
-                }
+            if let Some((len, offered)) = &found {
+                let mut truth = drafts.clone();
+                truth.push(next);
+                self.lookup.score(*len, offered, &truth);
+            }
+            if from_lookup {
+                self.lookup_rounds += 1;
+                self.lookup_accepted += drafts.len();
+            } else {
+                self.length.record(context, k, drafts.len(), seconds);
+                self.lengths[k] += 1;
             }
             (drafts, next)
         }
@@ -1469,6 +1528,27 @@ mod tests {
         assert_eq!(lookup(&c, 3), None);
         let c = [9, 2, 3, 5, UNKNOWN, 9, 2, 3];
         assert_eq!(lookup(&c, 3), Some((3, vec![5])));
+    }
+
+    #[test]
+    fn lookup_accept_learns_only_what_the_round_tells() {
+        let mut a = LookupAccept::new(3);
+        let prior = a.expected(4, 3);
+        // All three drafts were right: up.
+        for _ in 0..20 {
+            a.score(5, &[1, 2, 3], &[1, 2, 3, 4]);
+        }
+        assert!(a.expected(4, 3) > 3.5);
+        // Other buckets did not move.
+        assert_eq!(a.expected(2, 3), prior);
+        // The first draft wrong: only draft 0 learns it.
+        let before = a.accept()[2].clone();
+        a.score(4, &[9, 2, 3], &[1, 2, 3, 4]);
+        assert!(a.accept()[2][0] < before[0]);
+        assert_eq!(a.accept()[2][1..], before[1..]);
+        // A plain round tells only about draft 0.
+        a.score(4, &[1, 2, 3], &[1]);
+        assert_eq!(a.accept()[2][1..], before[1..]);
     }
 
     #[test]
