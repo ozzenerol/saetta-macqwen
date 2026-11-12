@@ -2586,7 +2586,9 @@ mod mac {
             let err = rel_rms(&got, &want);
             println!("logits: rel rms {err:.2e}");
             if err >= logits_bound {
-                failed.push(format!("{bits:?} logits {err:.2e} (bound {logits_bound:.2e})"));
+                failed.push(format!(
+                    "{bits:?} logits {err:.2e} (bound {logits_bound:.2e})"
+                ));
             }
             // Over a quantized cache the GPU and CPU round some codes
             // differently, and at a near tie the top token can flip from run
@@ -2598,9 +2600,17 @@ mod mac {
             if exact && g != w {
                 let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
                 let gap = want[w] - want[g];
-                println!("argmax {g} vs {w}: CPU logits {:.3} vs {:.3}, gap {:.2e} of the rms", want[g], want[w], gap / rms);
+                println!(
+                    "argmax {g} vs {w}: CPU logits {:.3} vs {:.3}, gap {:.2e} of the rms",
+                    want[g],
+                    want[w],
+                    gap / rms
+                );
                 if bits == KvBits::Half || gap > logits_bound * rms {
-                    failed.push(format!("{bits:?} argmax {g} vs {w}, gap {:.2e} of the rms", gap / rms));
+                    failed.push(format!(
+                        "{bits:?} argmax {g} vs {w}, gap {:.2e} of the rms",
+                        gap / rms
+                    ));
                 }
             }
             failed
