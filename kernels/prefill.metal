@@ -909,6 +909,10 @@ kernel void delta_rows2(device const float *mixed [[buffer(0)]],
 // Needs k_dim 128 and at least 2 simdgroups per threadgroup.
 constant uint DR3_TB = 8;
 
+// LANES lanes per state row (4 in delta_rows3), each with 128 / LANES of
+// its values: more lanes give more threads and shorter dot products per
+// token, for a longer simd reduction.
+template <uint LANES>
 kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                         device const float *g [[buffer(1)]],
                         device const float *beta [[buffer(2)]],
@@ -922,15 +926,15 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                         uint simds [[simdgroups_per_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint K_DIM = 128;
-    constexpr uint PER = 32;
+    constexpr uint PER = 128 / LANES;
     constexpr uint F4 = 2 * K_DIM / 4;  // float4s of q and k per token
     constexpr uint MAX_PER_THREAD = DR3_TB * F4 / 64;
     threadgroup float4 qk[2][DR3_TB][F4];
     threadgroup float gb[2][DR3_TB][2];
 
     uint h = tg.y;
-    uint row = (tg.x * simds + simd) * 8 + lane / 4;
-    uint part = lane % 4;
+    uint row = (tg.x * simds + simd) * (32 / LANES) + lane / LANES;
+    uint part = lane % LANES;
     bool live = row < p.v_dim;
     uint kh = h / (p.v_heads / p.k_heads);
     uint key_size = p.k_heads * K_DIM;
@@ -1035,8 +1039,10 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                     st[4 * j + 3] = s4.w;
                     mem += dot(s4, k4);
                 }
-                mem += simd_shuffle_xor(mem, 1);
-                mem += simd_shuffle_xor(mem, 2);
+#pragma clang loop unroll(full)
+                for (uint m = 1; m < LANES; m *= 2) {
+                    mem += simd_shuffle_xor(mem, m);
+                }
                 float delta = (v[i] - mem) * bt;
                 float out = 0;
 #pragma clang loop unroll(full)
@@ -1049,8 +1055,10 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                     st[4 * j + 3] = s4.w;
                     out += dot(s4, qv[j]);
                 }
-                out += simd_shuffle_xor(out, 1);
-                out += simd_shuffle_xor(out, 2);
+#pragma clang loop unroll(full)
+                for (uint m = 1; m < LANES; m *= 2) {
+                    out += simd_shuffle_xor(out, m);
+                }
                 if (part == 0) {
                     y[ulong(t) * value_size + h * p.v_dim + row] = out;
                 }
@@ -1086,6 +1094,11 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
         }
     }
 }
+
+template [[host_name("delta_rows3")]] kernel decltype(delta_rows3<4>) delta_rows3<4>;
+template [[host_name("delta_rows3_l8")]] kernel decltype(delta_rows3<8>) delta_rows3<8>;
+template [[host_name("delta_rows3_l16")]] kernel decltype(delta_rows3<16>) delta_rows3<16>;
+template [[host_name("delta_rows3_l32")]] kernel decltype(delta_rows3<32>) delta_rows3<32>;
 
 // ---------------------------------------------------------------------------
 // Causal attention of T new tokens over the KV cache, which already holds

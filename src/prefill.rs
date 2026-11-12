@@ -522,6 +522,20 @@ mod mac {
         })
     }
 
+    /// Lanes per state row in delta_rows3: 8 by default (delta 11% faster
+    /// than 4 at 2048 tokens, batch 22; 16 and 32 lose), or
+    /// SAETTA_DELTA_LANES=4, 16 or 32.
+    fn delta_lanes() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_DELTA_LANES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| matches!(n, 4 | 8 | 16 | 32))
+                .unwrap_or(8)
+        })
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -1466,8 +1480,13 @@ mod mac {
                 params(enc, 5, &p);
                 groups(enc, (t, 2 * c.k_heads + 1), 32);
 
-                let kernel = if d3 > 0 { "delta_rows3" } else { "delta_rows2" };
-                let pipeline = gpu.pipeline(kernel);
+                let lanes = delta_lanes();
+                let kernel = match (d3 > 0, lanes) {
+                    (false, _) => "delta_rows2".to_string(),
+                    (true, 4) => "delta_rows3".to_string(),
+                    (true, l) => format!("delta_rows3_l{l}"),
+                };
+                let pipeline = gpu.pipeline(&kernel);
                 assert!(
                     pipeline.max_total_threads_per_threadgroup() as usize >= 32 * d3,
                     "delta_rows3 takes at most {} threads per threadgroup",
@@ -1479,8 +1498,8 @@ mod mac {
                 params(enc, 7, &p);
                 set_views(enc, 8, &[&whole(delta_snaps)]);
                 if d3 > 0 {
-                    // d3 simdgroups of 8 rows each per threadgroup.
-                    groups(enc, (c.v_dim.div_ceil(8 * d3), c.v_heads), 32 * d3);
+                    // d3 simdgroups of 32 / lanes rows each per threadgroup.
+                    groups(enc, (c.v_dim.div_ceil(32 / lanes * d3), c.v_heads), 32 * d3);
                 } else {
                     // 2 simdgroups of 4 rows each per threadgroup.
                     groups(enc, (c.v_dim.div_ceil(8), c.v_heads), 64);
