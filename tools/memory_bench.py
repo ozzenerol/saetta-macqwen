@@ -15,6 +15,7 @@
 # Thinking is off and temperature 0, so runs repeat.
 import argparse
 import json
+import os
 import re
 import subprocess
 import time
@@ -39,6 +40,18 @@ def footprint_mb(pid):
     return foot, int(rss.strip() or 0) / 1024
 
 
+def detail(args, name):
+    """With --detail DIR: footprint(1) and vmmap -summary of the server."""
+    if not args.detail or args.detail_left <= 0:
+        return
+    os.makedirs(args.detail, exist_ok=True)
+    for cmd, suffix in ((["footprint", str(args.pid)], "footprint"),
+                        (["vmmap", "-summary", str(args.pid)], "vmmap")):
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        with open(os.path.join(args.detail, f"{name}.{suffix}.txt"), "w") as f:
+            f.write(out.stdout + out.stderr)
+
+
 def chat(url, messages, max_tokens):
     body = json.dumps({
         "messages": messages,
@@ -58,8 +71,12 @@ def chat(url, messages, max_tokens):
 def measure(args, label, messages):
     message, prompt, cached, secs = chat(args.url, messages, args.tokens)
     now = footprint_mb(args.pid)
+    name = label.replace(" ", "-")
+    detail(args, f"{name}.now")
     time.sleep(args.settle)
     later = footprint_mb(args.pid)
+    detail(args, f"{name}.later")
+    args.detail_left -= 1
     fmt = lambda f: "?" if f[0] is None else f"{f[0]:.0f}"
     print(f"{label}: prompt {prompt}, cached {cached}, {secs:.1f} s, footprint {fmt(now)} MB "
           f"then {fmt(later)} MB after {args.settle} s, rss {now[1]:.0f} then {later[1]:.0f} MB",
@@ -77,7 +94,11 @@ def main():
     ap.add_argument("--idle", type=float, default=0, help="seconds to wait after the long prompt; 0 skips it")
     ap.add_argument("--others", type=int, default=4)
     ap.add_argument("--settle", type=float, default=6)
+    ap.add_argument("--detail", help="directory for footprint and vmmap -summary output, "
+                    "right after and --settle seconds after the first --detail-turns requests")
+    ap.add_argument("--detail-turns", type=int, default=3)
     args = ap.parse_args()
+    args.detail_left = args.detail_turns
 
     f = footprint_mb(args.pid)
     print(f"idle: footprint {f[0]} MB, rss {f[1]:.0f} MB", flush=True)
