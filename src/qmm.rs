@@ -62,6 +62,14 @@ pub const HALVES: Variant = Variant {
     sub: 2,
 };
 
+/// HALVES double buffered: the next step's loads overlap the MACs.
+pub const HALVES_DB: Variant = Variant {
+    name: "qmm2_32x2_db",
+    rows: 64,
+    cols: 128,
+    sub: 2,
+};
+
 /// The fastest in bench-qmm2: 32 x 128 tiles, single buffered.
 pub const DEFAULT: Variant = VARIANTS[2];
 /// For expert tiles of 16 rows or fewer: 7.5 TFLOP/s there against 5.0 for

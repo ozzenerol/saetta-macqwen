@@ -410,8 +410,11 @@ mod mac {
                 if gate_up64() {
                     // SAETTA_DOWN64=1: down on qmm2 64 x 64 instead (slower
                     // in batch 6: 201 against 174 ms per 2k chunk).
+                    // SAETTA_DOWN_DB=1: the double-buffered halves.
                     if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
                         crate::qmm::VARIANTS[0]
+                    } else if std::env::var("SAETTA_DOWN_DB").is_ok_and(|v| v == "1") {
+                        crate::qmm::HALVES_DB
                     } else {
                         crate::qmm::HALVES
                     }
