@@ -190,25 +190,34 @@ mod mac {
         /// Records the quantizing of one token's values `x` into its slot,
         /// at the plan's position.
         pub fn record(&self, plan: &mut Plan, x: &View) {
+            let params = plan.params.clone();
+            self.record_at(plan, x, &params, false);
+        }
+
+        /// As `record`, at the position in `params` (a TokenParams view),
+        /// and with `parallel` alongside the op before it.
+        pub fn record_at(&self, plan: &mut Plan, x: &View, params: &View, parallel: bool) {
             let p = plan.constant(&[Params {
                 groups: self.per_token as u32,
                 per_token: self.per_token as u32,
             }]);
-            let params = plan.params.clone();
             let views = [
                 x,
                 &View::new(self.data.clone()),
                 &View::new(self.scales.clone()),
                 &View::new(self.biases.clone()),
                 &p,
-                &params,
+                params,
             ];
-            plan.op(
-                self.kernel(),
-                &views,
+            let (grid, group) = (
                 MTLSize::new(self.per_token as u64, 1, 1),
                 MTLSize::new(32, 1, 1),
             );
+            if parallel {
+                plan.op_parallel(self.kernel(), &views, grid, group);
+            } else {
+                plan.op(self.kernel(), &views, grid, group);
+            }
         }
 
         /// Encodes writing the values of tokens 0..`tokens` as half into
