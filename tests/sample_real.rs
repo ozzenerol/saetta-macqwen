@@ -225,7 +225,7 @@ fn gpu_sampler_matches_real_distributions() {
     let mut worst_verify = 0.0f64;
     for (name, text) in texts {
         let prompt = prompt(&m.tok, text, false);
-        let (plain, verified) = plain_and_verify(&mut model, &prompt, 32);
+        let (plain, verified) = plain_and_verify(&mut model, &prompt, 64);
         for i in 0..plain.len() {
             let (a, b) = (exact(&plain[i], &PARAMS), exact(&verified[i], &PARAMS));
             let mut d = 0.0;
@@ -240,7 +240,19 @@ fn gpu_sampler_matches_real_distributions() {
             worst_verify = worst_verify.max(d / 2.0);
         }
 
-        for step in [0, 5, 13, 21, 29] {
+        // The 5 steps whose cut distribution has the most entropy; most
+        // greedy steps have a single candidate.
+        let entropy =
+            |l: &[f32]| -> f64 { exact(l, &PARAMS).iter().map(|q| -q.1 * q.1.ln()).sum() };
+        let mut steps: Vec<usize> = (0..plain.len()).collect();
+        steps.sort_by(|&a, &b| {
+            entropy(&plain[b])
+                .total_cmp(&entropy(&plain[a]))
+                .then(a.cmp(&b))
+        });
+        steps.truncate(5);
+        steps.sort();
+        for step in steps {
             for (source, logits) in [("plain", &plain[step]), ("verify", &verified[step])] {
                 let p = exact(logits, &PARAMS);
                 let mut order: Vec<u32> = (0..logits.len() as u32).collect();
