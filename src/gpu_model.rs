@@ -343,11 +343,11 @@ mod mac {
             self.moe.record(plan, cfg, x, &s.moe, next_norm, next_out);
         }
 
-        /// Grows an attention layer's cache to `capacity` tokens; a DeltaNet
-        /// layer has nothing to grow.
-        pub(crate) fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+        /// Moves an attention layer's cache to `capacity` tokens; a DeltaNet
+        /// layer has nothing to move.
+        pub(crate) fn resize(&mut self, gpu: &Gpu, capacity: usize) {
             if let Mixer::Full(_, cache) = &mut self.mixer {
-                cache.grow(gpu, capacity);
+                cache.resize(gpu, capacity);
             }
         }
 
@@ -593,12 +593,32 @@ mod mac {
                 return;
             }
             let allocated = kv_grow(self.allocated, need, self.capacity);
+            self.resize(allocated);
+        }
+
+        /// Shrinks the attention caches to the smallest step that holds the
+        /// first `need` tokens, when that is at most half of what they hold
+        /// now, and returns the tokens they hold then. Rows past that are
+        /// lost: `need` must cover every row the prompt cache may use.
+        pub fn shrink(&mut self, need: usize) -> usize {
+            let fit = kv_grow(
+                kv_start(self.capacity),
+                need.clamp(1, self.capacity),
+                self.capacity,
+            );
+            if fit * 2 <= self.allocated {
+                self.resize(fit);
+            }
+            self.allocated
+        }
+
+        fn resize(&mut self, allocated: usize) {
             let before = self.kv_bytes();
             for layer in &mut self.layers {
-                layer.grow(self.gpu, allocated);
+                layer.resize(self.gpu, allocated);
             }
             eprintln!(
-                "KV grows from {} to {} tokens: {} MB now, {} MB more for the copy",
+                "KV moves from {} to {} tokens: {} MB now, {} MB more for the copy",
                 self.allocated,
                 allocated,
                 self.kv_bytes() >> 20,

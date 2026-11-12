@@ -184,7 +184,9 @@ mod mac {
             k: w.cols as u32,
             gather: 0,
         };
-        if m <= FEW_MAX {
+        // The exact (split) kernels keep qmm_few's f32 up to FEW_MAX rows.
+        let few = m <= FEW_MAX && (kernel.ends_with("_split") || m <= fast_few_max());
+        if few {
             enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
         } else {
             enc.set_compute_pipeline_state(&gpu.pipeline(kernel));
@@ -192,7 +194,7 @@ mod mac {
         set_quant(enc, 0, w);
         set_views(enc, 3, &[x, y, x, x, x]);
         params(enc, 5, &shape);
-        if m <= FEW_MAX {
+        if few {
             groups(enc, (w.rows.div_ceil(FEW_OUT), m.div_ceil(FEW)), 64);
         } else {
             groups(enc, (w.rows.div_ceil(TILE), m.div_ceil(TILE)), 128);
@@ -202,10 +204,45 @@ mod mac {
     /// Up to this many rows, qmm uses qmm_few: weights are read once per 8
     /// rows of x instead of computing a 64-row tile.
     const FEW_MAX: usize = 64;
+
+    /// The FEW_MAX of the fast (qmm_dq) dense products: more rows go to the
+    /// 64-row tiles, which read the weights once where qmm_few reads them
+    /// once per 8 rows. bench-prefill (batch 6): qmm_few wins at 17 tokens
+    /// (0.093 against 0.110 s), qmm_dq at 48 (0.142 against 0.186 s); the
+    /// lines cross near 26. SAETTA_FEW_MAX=<n> sets it, at most FEW_MAX.
+    const FAST_FEW_MAX: usize = 24;
+
+    fn fast_few_max() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_FEW_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(FAST_FEW_MAX, |n: usize| n.min(FEW_MAX))
+        })
+    }
     /// x rows per qmm_few threadgroup; must match PREFILL_FEW.
     const FEW: usize = 8;
     /// y columns per qmm_few threadgroup: 2 simdgroups of 4.
     const FEW_OUT: usize = 8;
+
+    /// Rows per pass of encode_few_experts: the rows kernels take 8.
+    const FEW_MOE_ROWS: usize = crate::rows::MAX_ROWS;
+    /// Simdgroups of moe_gate_up_mma3 and moe_down_mma3, as rows::MOE_SPLIT.
+    const FEW_MOE_SPLIT: usize = 8;
+
+    /// Up to this many tokens a chunk's experts run on encode_few_experts:
+    /// 32 (at 48 the grouped path is faster), or SAETTA_FEW_MOE=<n> (0 turns
+    /// it off).
+    fn few_moe_max() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_FEW_MOE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32)
+        })
+    }
 
     fn few_pipeline(gpu: &Gpu, w: &GpuQuant) -> metal::ComputePipelineState {
         match w.bits {
@@ -275,25 +312,17 @@ mod mac {
         u: &View,
         g_half: &View,
         g: &Grouped,
+        rows64: bool,
     ) {
-        let name = match gate.bits {
-            5 => "prefill_gate_up_5bit",
-            8 => "prefill_gate_up_8bit",
-            b => panic!("no prefill_gate_up kernel for {b} bits"),
-        };
-        enc.set_compute_pipeline_state(&gpu.pipeline(name));
-        set_quant(enc, 0, gate);
-        set_quant(enc, 3, up);
-        set_views(enc, 6, &[x_half, g_out, g_half]);
         let shape = MmShape {
             m: 0,
             n: gate.rows as u32,
             k: gate.cols as u32,
             gather: 1,
         };
-        params(enc, 9, &shape);
+        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, rows64);
         set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
-        groups(enc, (gate.rows.div_ceil(64), g.max_tiles), 128);
+        groups(enc, (gate.rows.div_ceil(64), g.max_tiles), threads);
 
         few_grouped(gpu, enc, gate, x, g_out, g, true);
         few_grouped(gpu, enc, up, x, u, g, true);
@@ -302,6 +331,64 @@ mod mac {
         params(enc, 3, &(gate.rows as u32));
         set_views(enc, 4, &[g.tiles, g.tile_count]);
         groups(enc, (g.max_tiles, 1), 256);
+    }
+
+    /// Binds prefill_gate_up (32-row tiles) or, with `rows64`,
+    /// prefill_gate_up64 and their buffers up to the shape; returns the
+    /// threads per threadgroup.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_gate_up(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x_half: &View,
+        g_out: &View,
+        g_half: &View,
+        shape: &MmShape,
+        rows64: bool,
+    ) -> usize {
+        assert!(
+            matches!(gate.bits, 5 | 8),
+            "no prefill_gate_up kernel for {} bits",
+            gate.bits
+        );
+        let (name, threads) = if rows64 {
+            ("prefill_gate_up64", 256)
+        } else {
+            ("prefill_gate_up", 128)
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("{name}_{}bit", gate.bits)));
+        set_quant(enc, 0, gate);
+        set_quant(enc, 3, up);
+        set_views(enc, 6, &[x_half, g_out, g_half]);
+        params(enc, 9, shape);
+        threads
+    }
+
+    /// g = silu(x gate^T) * (x up^T) for `m` rows of half x, in f32 and in
+    /// half, with prefill_gate_up64 in plain mode.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_up_plain(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x_half: &View,
+        g_out: &View,
+        g_half: &View,
+        m: usize,
+    ) {
+        let shape = MmShape {
+            m: m as u32,
+            n: gate.rows as u32,
+            k: gate.cols as u32,
+            gather: 0,
+        };
+        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, true);
+        // Unused in plain mode, but bound so the kernel sees valid buffers.
+        set_views(enc, 10, &[x_half, x_half, x_half]);
+        groups(enc, (gate.rows.div_ceil(64), m.div_ceil(64)), threads);
     }
 
     /// qmm_few on the tiles of FEW rows or fewer of a grouped product.
@@ -337,7 +424,20 @@ mod mac {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&i| i < 4)
-            .map_or(crate::qmm::DEFAULT, |i| crate::qmm::VARIANTS[i])
+            .map_or(
+                if gate_up64() {
+                    // SAETTA_DOWN64=1: down on qmm2 64 x 64 instead (slower
+                    // in batch 6: 201 against 174 ms per 2k chunk).
+                    if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
+                        crate::qmm::VARIANTS[0]
+                    } else {
+                        crate::qmm::HALVES
+                    }
+                } else {
+                    crate::qmm::DEFAULT
+                },
+                |i| crate::qmm::VARIANTS[i],
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -374,9 +474,25 @@ mod mac {
         std::env::var("SAETTA_QMM2").is_ok_and(|v| v == "1")
     }
 
-    /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
+    /// Expert tiles of up to 64 rows, gate and up in prefill_gate_up64,
+    /// down on qmm2 32 x 128 over each half of a tile (3-4% faster at 1k
+    /// to 15k tokens than 32-row tiles, batch 6), unless SAETTA_GATE_UP64=0
+    /// or SAETTA_EXPERT_VARIANT picks a variant.
+    fn gate_up64() -> bool {
+        std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
+            && std::env::var("SAETTA_EXPERT_VARIANT").is_err()
+    }
+
+    /// The shared expert's gate, up and silu in one prefill_gate_up64 pass
+    /// on normed in half, unless SAETTA_SHARED_GU=0.
+    fn shared_gate_up() -> bool {
+        std::env::var("SAETTA_SHARED_GU").map_or(true, |v| v != "0")
+    }
+
+    /// The fast path runs the router on the fast kernels too (about 70 ms
+    /// less per 2k chunk than qmm_split), unless SAETTA_ROUTER_FAST=0.
     fn fast_router() -> bool {
-        std::env::var("SAETTA_ROUTER_FAST").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_ROUTER_FAST").map_or(true, |v| v != "0")
     }
 
     /// SAETTA_CONV=1 runs the DeltaNet conv on conv_rows, one thread per
@@ -485,6 +601,9 @@ mod mac {
         expert_half: Buffer,
         /// the x of a dense qmm2 in fast mode
         x_half: Buffer,
+        /// moe_union's distinct experts and slots for encode_few_experts
+        few_list: Buffer,
+        few_slots: Buffer,
         max_tiles: usize,
     }
 
@@ -527,6 +646,8 @@ mod mac {
                 normed_half: f(chunk * h / 2),
                 x_half: f(chunk * h.max(narrow) / 2),
                 expert_half: f(pairs * size / 2),
+                few_list: f(1 + FEW_MOE_ROWS * cfg.num_experts_per_tok),
+                few_slots: f(FEW_MOE_ROWS * FEW_MOE_ROWS * cfg.num_experts_per_tok),
                 max_tiles,
             }
         }
@@ -1461,11 +1582,27 @@ mod mac {
                 };
                 let (k, v) = (whole(&cache.keys), whole(&cache.values));
                 match &self.gemm {
-                    Some(gemm) if kernel == "gemm" => {
-                        gemm.encode(enc, gpu, &q_in, &k, &v, cache.quant.as_ref(), &q_and_gate, &y, p)
-                    }
+                    Some(gemm) if kernel == "gemm" => gemm.encode(
+                        enc,
+                        gpu,
+                        &q_in,
+                        &k,
+                        &v,
+                        cache.quant.as_ref(),
+                        &q_and_gate,
+                        &y,
+                        p,
+                    ),
                     _ => crate::attention_prefill::encode(
-                        enc, gpu, kernel, &q_in, &k, &v, &q_and_gate, &y, p,
+                        enc,
+                        gpu,
+                        kernel,
+                        &q_in,
+                        &k,
+                        &v,
+                        &q_and_gate,
+                        &y,
+                        p,
                     ),
                 }
                 self.record(gpu, enc, 2, &y, t * c.heads * d);
@@ -1522,6 +1659,67 @@ mod mac {
             }
         }
 
+        /// The experts of `t` <= few_moe_max() tokens, 8 rows at a time on
+        /// the verify rows' kernels (moe_union, moe_gate_up_mma3,
+        /// moe_down_mma3), in f32 as decode: each distinct expert of the 8
+        /// rows is read once, where the grouped path launches a tile grid
+        /// for all 256 experts. Leaves sum over k of weight * expert out in
+        /// expert_out `[t, hidden]`.
+        fn encode_few_experts(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            e: &Experts,
+            normed: &View,
+            t: usize,
+        ) {
+            let s = &self.scratch;
+            let top_k = self.cfg.num_experts_per_tok;
+            let h = self.cfg.hidden_size;
+            let (g, up, d) = (&e.gate, &e.up, &e.down);
+            assert!(g.bits == 5 && d.bits == 5, "the rows MoE kernels are 5-bit");
+            let (list, slots) = (whole(&s.few_list), whole(&s.few_slots));
+            let eg = whole(&s.expert_g);
+            let split = FEW_MOE_SPLIT;
+            let threads = MTLSize::new(32 * split as u64, 1, 1);
+            for r0 in (0..t).step_by(FEW_MOE_ROWS) {
+                let m = FEW_MOE_ROWS.min(t - r0);
+                let ids = at(&s.ids, r0 * top_k);
+                let weights = at(&s.expert_weights, r0 * top_k);
+                // x reads FEW_MOE_ROWS rows from r0: the chunk scratch has them.
+                let x = View {
+                    buffer: normed.buffer.clone(),
+                    offset: normed.offset + (r0 * h * 4) as u64,
+                };
+                let y = at(&s.expert_out, r0 * h);
+
+                enc.set_compute_pipeline_state(&gpu.pipeline("moe_union"));
+                set_views(enc, 0, &[&ids, &list, &slots]);
+                params(enc, 3, &[m as u32, top_k as u32]);
+                groups(enc, (1, 1), 32);
+
+                enc.set_compute_pipeline_state(&gpu.pipeline(&format!("moe_gate_up_mma3_{split}")));
+                set_quant(enc, 0, g);
+                set_quant(enc, 3, up);
+                set_views(enc, 6, &[&x, &eg]);
+                params(enc, 8, &[g.rows as u32, g.cols as u32, top_k as u32]);
+                set_views(enc, 9, &[&list, &slots]);
+                params(enc, 11, &(m as u32));
+                enc.dispatch_thread_groups(
+                    MTLSize::new((g.rows / 8) as u64, (m * top_k) as u64, 1),
+                    threads,
+                );
+
+                enc.set_compute_pipeline_state(&gpu.pipeline(&format!("moe_down_mma3_{split}")));
+                set_quant(enc, 0, d);
+                set_views(enc, 3, &[&eg, &y]);
+                params(enc, 5, &[d.rows as u32, d.cols as u32, top_k as u32]);
+                set_views(enc, 6, &[&list, &slots, &weights]);
+                params(enc, 9, &(m as u32));
+                enc.dispatch_thread_groups(MTLSize::new((d.rows / 8) as u64, 1, 1), threads);
+            }
+        }
+
         /// x += moe(normed) for `t` tokens.
         fn encode_moe(
             &self,
@@ -1544,10 +1742,11 @@ mod mac {
                 &s.shared_out,
             ]
             .map(whole);
+            let fast = !self.exact_now();
             if self.on("router") {
-                // Routing stays close to f32 so it picks the experts decode
-                // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
-                if !self.exact_now() && fast_router() {
+                // In half like the other matrices: the quality gate held. With
+                // SAETTA_ROUTER_FAST=0 it stays close to f32, as decode.
+                if fast && fast_router() {
                     self.mm(gpu, enc, &layer.router, normed, &router, t);
                 } else {
                     qmm(gpu, enc, &layer.router, normed, &router, t, true);
@@ -1555,15 +1754,27 @@ mod mac {
                 self.mm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
             }
             let silu_mul = gpu.pipeline("silu_mul_rows");
+            let normed_half = whole(&s.normed_half);
+            // normed in half, for the fused shared expert and the experts.
+            let half_early = fast && shared_gate_up();
+            if half_early && self.on("router") {
+                to_half(gpu, enc, normed, &normed_half, t * h);
+            }
             if self.on("shared expert") {
-                self.mm(gpu, enc, &layer.shared[0], normed, &sg, t);
-                self.mm(gpu, enc, &layer.shared[1], normed, &su, t);
-                dispatch_1d(
-                    enc,
-                    &silu_mul,
-                    &[(&s.shared_g, 0), (&s.shared_u, 0)],
-                    t * layer.shared[0].rows,
-                );
+                if half_early && t > FEW_MAX {
+                    let [gate, up, _] = &layer.shared;
+                    let shared_half = whole(&s.expert_half);
+                    gate_up_plain(gpu, enc, gate, up, &normed_half, &sg, &shared_half, t);
+                } else {
+                    self.mm(gpu, enc, &layer.shared[0], normed, &sg, t);
+                    self.mm(gpu, enc, &layer.shared[1], normed, &su, t);
+                    dispatch_1d(
+                        enc,
+                        &silu_mul,
+                        &[(&s.shared_g, 0), (&s.shared_u, 0)],
+                        t * layer.shared[0].rows,
+                    );
+                }
                 self.record(gpu, enc, 3, &sg, t * layer.shared[0].rows);
                 self.mm(gpu, enc, &layer.shared[2], &sg, &sd, t);
             }
@@ -1592,7 +1803,24 @@ mod mac {
                 };
                 params(enc, 3, &p);
                 groups(enc, (t, 1), 32);
-
+            }
+            if t <= few_moe_max() {
+                let e = &layer.experts;
+                if self.on("experts gate, up") {
+                    self.encode_few_experts(gpu, enc, e, normed, t);
+                }
+                if self.on("combine") {
+                    enc.set_compute_pipeline_state(&gpu.pipeline("moe_add_rows"));
+                    set_views(enc, 0, &[x, &sd, &shared_gate, &whole(&s.expert_out)]);
+                    params(enc, 4, &(h as u32));
+                    enc.dispatch_threads(
+                        MTLSize::new(h as u64, t as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+                return;
+            }
+            if self.on("route, group") {
                 enc.set_compute_pipeline_state(&gpu.pipeline("moe_group"));
                 set_views(enc, 0, &[&ids, &order, &rows, &tiles, &tile_count]);
                 let p = GroupParams {
@@ -1609,24 +1837,40 @@ mod mac {
                 tiles: &tiles,
                 rows: &rows,
                 tile_count: &tile_count,
-                max_tiles: (t * top_k).div_ceil(tile_rows) + cfg.num_experts,
+                // Every tile has a row: no more tiles than pairs.
+                max_tiles: ((t * top_k).div_ceil(tile_rows) + cfg.num_experts).min(t * top_k),
             };
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
-            let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
-            let fused = !self.exact_now() && fused_gate_up();
+            let expert_half = whole(&s.expert_half);
+            let fused64 = fast && gate_up64();
+            let fused = fast && (fused64 || fused_gate_up());
             if self.on("experts gate, up") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
                     qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
                 } else if fused {
-                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    if !half_early {
+                        to_half(gpu, enc, normed, &normed_half, t * h);
+                    }
                     gate_up_grouped(
-                        gpu, enc, &e.gate, &e.up, normed, &normed_half, &eg, &eu, &expert_half, &g,
+                        gpu,
+                        enc,
+                        &e.gate,
+                        &e.up,
+                        normed,
+                        &normed_half,
+                        &eg,
+                        &eu,
+                        &expert_half,
+                        &g,
+                        fused64,
                     );
                 } else {
-                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    if !half_early {
+                        to_half(gpu, enc, normed, &normed_half, t * h);
+                    }
                     qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
                     qmm2_grouped(gpu, enc, &e.up, normed, &normed_half, &eu, &g, true);
                 }

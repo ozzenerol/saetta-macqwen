@@ -81,8 +81,9 @@ struct QmmLoader {
 
 // BM x BN tile, 4 simdgroups of TM x TN (2 x 2 of 32 x 32 for 64 x 64,
 // 1 x 4 of 32 x 32 for 32 x 128, 1 x 4 of 16 x 32 for 16 x 128).
-// DB: double buffered.
-template <uint BITS, uint BM, uint BN, uint TM, uint TN, bool DB>
+// DB: double buffered. SUB: threadgroups per expert tile in gather mode,
+// each taking BM rows of a tile of up to SUB BM.
+template <uint BITS, uint BM, uint BN, uint TM, uint TN, bool DB, uint SUB = 1>
 kernel void qmm2(device const uint *words [[buffer(0)]],
                  device const ushort *scales [[buffer(1)]],
                  device const ushort *biases [[buffer(2)]],
@@ -103,16 +104,17 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
 
     uint expert = 0, first, count;
     if (s.gather != 0) {
-        if (tg.y >= tile_count[0]) {
+        uint ti = tg.y / SUB, part = tg.y % SUB;
+        if (ti >= tile_count[0]) {
             return;
         }
-        uint4 tile = tiles[tg.y];
-        if (tile.z <= QMM_FEW) {
-            return;  // qmm_few takes it
+        uint4 tile = tiles[ti];
+        if (tile.z <= QMM_FEW || part * BM >= tile.z) {
+            return;  // qmm_few takes it, or the tile has no rows here
         }
         expert = tile.x;
-        first = tile.y;
-        count = tile.z;
+        first = tile.y + part * BM;
+        count = min(BM, tile.z - part * BM);
     } else {
         first = tg.y * BM;
         count = min(BM, s.m - first);
@@ -139,6 +141,8 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
 
     uint sm = (simd / WN) * TM;
     uint sn = (simd % WN) * TN;
+    // Rows past the end of a partial tile: no MACs, nothing to write.
+    bool active = sm < count;
     simdgroup_float8x8 acc[FM][FN];
     for (uint i = 0; i < FM; i++) {
         for (uint j = 0; j < FN; j++) {
@@ -164,19 +168,21 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         threadgroup const QmmStage<BM, BN> &st = stage[cur];
+        if (active) {
 #pragma clang loop unroll(full)
-        for (uint kk = 0; kk < QMM_BK; kk += 8) {
-            simdgroup_half8x8 a[FM];
-            simdgroup_half8x8 b[FN];
-            for (uint i = 0; i < FM; i++) {
-                simdgroup_load(a[i], st.x + (sm + 8 * i) * QMM_LD + kk, QMM_LD);
-            }
-            for (uint j = 0; j < FN; j++) {
-                simdgroup_load(b[j], st.w + (sn + 8 * j) * QMM_LD + kk, QMM_LD, ulong2(0, 0), true);
-            }
-            for (uint i = 0; i < FM; i++) {
+            for (uint kk = 0; kk < QMM_BK; kk += 8) {
+                simdgroup_half8x8 a[FM];
+                simdgroup_half8x8 b[FN];
+                for (uint i = 0; i < FM; i++) {
+                    simdgroup_load(a[i], st.x + (sm + 8 * i) * QMM_LD + kk, QMM_LD);
+                }
                 for (uint j = 0; j < FN; j++) {
-                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                    simdgroup_load(b[j], st.w + (sn + 8 * j) * QMM_LD + kk, QMM_LD, ulong2(0, 0), true);
+                }
+                for (uint i = 0; i < FM; i++) {
+                    for (uint j = 0; j < FN; j++) {
+                        simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                    }
                 }
             }
         }
@@ -189,6 +195,9 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    if (!active) {
+        return;
+    }
     device float *y0 = y + ulong(first) * s.n + n0;
     if (count == BM && n0 + BN <= s.n) {
         for (uint i = 0; i < FM; i++) {
@@ -222,6 +231,11 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
 
 #define QMM2(name, bits, bm, bn, tm, tn, db) \
     template [[host_name(name)]] kernel decltype(qmm2<bits, bm, bn, tm, tn, db>) qmm2<bits, bm, bn, tm, tn, db>;
+#define QMM2_SUB(name, bits, sub) \
+    template [[host_name(name)]] kernel decltype(qmm2<bits, 32, 128, 32, 32, false, sub>) \
+        qmm2<bits, 32, 128, 32, 32, false, sub>;
+QMM2_SUB("qmm2_32x2_5bit", 5, 2)
+QMM2_SUB("qmm2_32x2_8bit", 8, 2)
 QMM2("qmm2_5bit", 5, 64, 64, 32, 32, false)
 QMM2("qmm2_8bit", 8, 64, 64, 32, 32, false)
 QMM2("qmm2_db_5bit", 5, 64, 64, 32, 32, true)

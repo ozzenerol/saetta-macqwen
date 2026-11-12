@@ -132,8 +132,15 @@ def bench_contexts(args, url, model, progress):
         for r in range(args.runs):
             progress.set(f"context {name} run {r + 1}/{args.runs}")
             head = f"Run {stamp}-{name}-{r}. "
-            row = one_run(url, model, [{"role": "user", "content": head + filler + "\n" + STORY}],
-                          args.tokens)
+            try:
+                row = one_run(url, model, [{"role": "user", "content": head + filler + "\n" + STORY}],
+                              args.tokens)
+            except Exception as e:
+                # MLX runs out of GPU memory near 150k tokens; keep what came
+                # before and skip the longer contexts.
+                print(f"  {name} run {r + 1}: failed: {e}", flush=True)
+                out.append({"context": name, "error": str(e)[:200]})
+                return out
             row.pop("answer")
             runs.append(row)
             print(f"  {name} run {r + 1}: prompt {row['prompt_tokens']}, "
@@ -200,7 +207,9 @@ def report(paths):
     print("| context | prompt tokens | " + " | ".join(
         f"{l} TTFT s | {l} prefill tok/s | {l} decode tok/s" for l in labels) + " |")
     print("|---|---|" + "---|---|---|" * len(labels))
-    names = [c["context"] for c in results[0].get("contexts", [])]
+    names = []
+    for r in results:
+        names += [c["context"] for c in r.get("contexts", []) if c["context"] not in names]
     for name in names:
         cells = []
         prompt = None
@@ -208,6 +217,9 @@ def report(paths):
             c = next((c for c in r.get("contexts", []) if c["context"] == name), None)
             if c is None:
                 cells += ["-", "-", "-"]
+                continue
+            if "error" in c:
+                cells += ["failed", "-", "-"]
                 continue
             prompt = prompt or c["prompt_tokens"]
             cells += [fmt(c["ttft"], ".2f"), fmt(c["prefill"], ".0f"), fmt(c["decode"], ".1f")]

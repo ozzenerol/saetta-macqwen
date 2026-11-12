@@ -33,8 +33,8 @@ pub use mac::*;
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use crate::attention_prefill::{encode_rows2, spread, FlashParams};
-    use crate::gpu::{contents, Gpu};
+    use crate::attention_prefill::{FlashParams, encode_rows2, spread};
+    use crate::gpu::{Gpu, contents};
     use crate::kv_quant::{KvBits, QuantRows};
     use crate::qmv::View;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
@@ -86,7 +86,11 @@ mod mac {
             out: &View,
             f: FlashParams,
         ) {
-            assert_eq!(f.heads, f.kv_heads * GROUP as u32, "needs 8 q heads per kv head");
+            assert_eq!(
+                f.heads,
+                f.kv_heads * GROUP as u32,
+                "needs 8 q heads per kv head"
+            );
             let rows = f.tokens as usize * GROUP;
             assert!(rows <= self.rows_pad);
             let kv = f.kv_heads as u64;
@@ -98,7 +102,11 @@ mod mac {
                 }
             };
             let bytes = |index: u64, p: &Params| {
-                enc.set_bytes(index, size_of::<Params>() as u64, (p as *const Params).cast());
+                enc.set_bytes(
+                    index,
+                    size_of::<Params>() as u64,
+                    (p as *const Params).cast(),
+                );
             };
             let whole = |b: &Buffer| View {
                 buffer: b.clone(),
@@ -265,7 +273,10 @@ mod mac {
             // Both outputs are now of the last chunk (time ran it last).
             time(false, last);
             time(true, last);
-            let (w, o) = (contents::<f32>(&want.buffer, len), contents::<f32>(&got.buffer, len));
+            let (w, o) = (
+                contents::<f32>(&want.buffer, len),
+                contents::<f32>(&got.buffer, len),
+            );
             let (mut worst, mut sum, mut norm) = (0.0f32, 0.0f64, 0.0f64);
             for (a, b) in w.iter().zip(o) {
                 worst = worst.max((a - b).abs());

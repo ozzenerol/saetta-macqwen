@@ -32,9 +32,11 @@ For each request:
 
 Snapshots live in GPU buffers. A limit of 16 (about 1 GB) is the default; the least recently used goes first, except the one at the end of the last prompt and up to two at the end of a first message (the first `<|im_end|>`, the system prompt), which a new conversation in qh shares. With qh, each turn adds the model's answer and a tool result to the end of the prompt, so rule 1 or 2 almost always gives a hit, and only the new tokens are read.
 
+Such a conversation leaves a line of snapshots, each inside the next. Of the plain snapshots inside the newest one, at most 5 stay (`CHAIN_KEEP` in `src/cache.rs`): the two longest, for an undo of a turn or two, and three of the older ones, spread out: the one whose neighbours are closest goes first, since going back there instead costs the fewest tokens. Other conversations keep their places in the LRU order.
+
 ## Cost on the GPU
 
-A snapshot is one 65.9 MB buffer from a pool of 17, made when the server starts (`src/gpu_cache.rs`). Saving and restoring are one blit each, committed between tokens without waiting: 0.03 ms on the CPU, and the copy itself takes about 0.55 ms on the GPU (M3 Max, 20 runs, quiet GPU). The CPU waits for the last copy only before it writes the states itself, as `reset` does.
+A snapshot is one 65.9 MB buffer, made when it is saved and freed when the cache drops it (`src/gpu_cache.rs`), so the memory follows the snapshots held. Before 2026-11-11 the server kept a pool of 17 buffers, and every buffer it had once written stayed resident. Saving and restoring are one blit each, committed between tokens without waiting: 0.03 ms on the CPU, and the copy itself takes about 0.55 ms on the GPU (M3 Max, 20 runs, quiet GPU). The CPU waits for the last copy only before it writes the states itself, as `reset` does.
 
 ## Checks
 
@@ -43,7 +45,7 @@ A snapshot is one 65.9 MB buffer from a pool of 17, made when the server starts 
 
 ## KV cache formats
 
-The KV cache of each attention layer is allocated once for the whole context (`serve --context N`, default 262144). A page of it takes memory only when a token is written there, and it is not given back while the server runs.
+The KV cache of each attention layer starts at 32768 tokens, doubles as a conversation needs more, up to `serve --context N` (default 262144), and shrinks again once the prompt cache no longer needs the rows; [MEMORY.md](MEMORY.md) has the details.
 
 Bytes per token over the 10 attention layers, keys and values of 2 heads of 256:
 
