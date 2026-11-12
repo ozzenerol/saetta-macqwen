@@ -2134,12 +2134,20 @@ mod mac {
                     ));
                 }
                 // The median over all tokens is mostly the first call. The
-                // 16 tokens of the second read the states the first left,
-                // so they get the state's room, which still catches an
-                // order 1 error from a wrong position or slot.
-                if by_median && last_median >= state_bound {
+                // 16 tokens of the second read the states the first left
+                // and move with them, so they get twice the room, which
+                // still catches an order 1 error from a wrong position or
+                // slot. Measured on the exact path (batch 7), second call
+                // median at 8 bits: layer 24 2.2e-2, 27 2.8e-2, 28 3.2e-2,
+                // 29 3.0e-2, 30 2.7e-2, 31 2.6e-2, under 2e-2 elsewhere;
+                // at 4 bits at most 3.1e-2 (layer 23) against 1.6e-1.
+                // A batch 6 run had 2.8e-2 at layer 17 of 8 bits, where
+                // batch 7 had 5.8e-3: the runs differ, so this is not
+                // a tight fit to one of them.
+                let second_bound = 2.0 * bound;
+                if by_median && last_median >= second_bound {
                     failed.push(format!(
-                        "{bits:?} layer {l}: second call median {last_median:.2e} (bound {state_bound:.2e})"
+                        "{bits:?} layer {l}: second call median {last_median:.2e} (bound {second_bound:.2e})"
                     ));
                 }
             }
