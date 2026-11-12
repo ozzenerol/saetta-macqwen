@@ -378,22 +378,42 @@ impl DraftLength {
 
     /// The draft length for the next round at `context` tokens.
     pub fn next(&mut self, context: usize) -> usize {
+        let (k, _) = self.pick(context, 0, self.max);
+        self.take(k);
+        k
+    }
+
+    /// The length among `lo..=hi` to run next at `context` tokens, with its
+    /// tokens per second. The rate is `None` when the length is picked to be
+    /// measured (unmeasured, or the explore round). Every call counts as a
+    /// round for the explore schedule, so a length that is asked often but
+    /// rarely run is still tried now and then.
+    pub fn pick(&mut self, context: usize, lo: usize, hi: usize) -> (usize, Option<f64>) {
         self.rounds += 1;
-        let max = self.max;
         let time = self.times(context).clone();
         let unmeasured = |k: usize| time[k] == 0.0 || self.runs[k] < 2;
-        let k = if let Some(k) = (0..=max).rev().find(|&k| unmeasured(k)) {
-            k
+        if let Some(k) = (lo..=hi).rev().find(|&k| unmeasured(k)) {
+            (k, None)
         } else if self.rounds.is_multiple_of(EXPLORE) {
-            (0..=max).min_by_key(|&k| self.tried[k]).unwrap()
+            ((lo..=hi).min_by_key(|&k| self.tried[k]).unwrap(), None)
         } else {
             let rate = |k: usize| self.expected(k) / time[k];
-            (0..=max)
+            let k = (lo..=hi)
                 .max_by(|&a, &b| rate(a).total_cmp(&rate(b)))
-                .unwrap()
-        };
+                .unwrap();
+            (k, Some(rate(k)))
+        }
+    }
+
+    /// The measured time of a round with `k` drafts at `context`, 0 when
+    /// unmeasured.
+    pub fn time(&mut self, context: usize, k: usize) -> f64 {
+        self.times(context)[k]
+    }
+
+    /// The length `pick` gave is the one that runs.
+    pub fn take(&mut self, k: usize) {
         self.tried[k] = self.rounds;
-        k
     }
 
     /// The round times in ms per length at `context`, for the log.
@@ -423,6 +443,111 @@ impl DraftLength {
             let kept = if i < accepted { 1.0 } else { 0.0 };
             self.accept[i] += (kept - self.accept[i]) * ACCEPT_WEIGHT;
         }
+    }
+}
+
+/// Shortest and longest n-gram `lookup` matches.
+pub const LOOKUP_MIN: usize = 2;
+pub const LOOKUP_MAX: usize = 8;
+/// A history slot whose token is not known (before a restore point whose
+/// tokens were not passed in). It matches no real token.
+pub const UNKNOWN: u32 = u32::MAX;
+
+/// Drafts from the context, as prompt lookup decoding does: finds the
+/// earlier place where the longest suffix of `context` (`LOOKUP_MIN` to
+/// `LOOKUP_MAX` tokens) also occurs, the latest one on a tie, and returns
+/// the match length with up to `max` tokens that followed it there. Tool
+/// calls and code edits copy paths and lines from the prompt, which the MTP
+/// layer drafts poorly.
+pub fn lookup(context: &[u32], max: usize) -> Option<(usize, Vec<u32>)> {
+    let n = context.len();
+    let &last = context.last()?;
+    if last == UNKNOWN || max == 0 {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for j in (0..n - 1).rev() {
+        if context[j] != last {
+            continue;
+        }
+        let len = (1..LOOKUP_MAX.min(j + 1))
+            .take_while(|&i| context[j - i] == context[n - 1 - i] && context[j - i] != UNKNOWN)
+            .count()
+            + 1;
+        if len >= LOOKUP_MIN && best.is_none_or(|(l, _)| len > l) {
+            best = Some((len, j));
+            if len == LOOKUP_MAX {
+                break;
+            }
+        }
+    }
+    let (len, j) = best?;
+    let after: Vec<u32> = context[j + 1..]
+        .iter()
+        .take(max)
+        .take_while(|&&t| t != UNKNOWN)
+        .copied()
+        .collect();
+    (!after.is_empty()).then_some((len, after))
+}
+
+/// The lookup draft statistics by match length: 2, 3, and 4 or more tokens.
+fn lookup_bucket(len: usize) -> usize {
+    len.min(4) - LOOKUP_MIN
+}
+
+/// How often `lookup` drafts are kept, by match length. It learns on every
+/// round that had a match, also the ones the MTP layer drafted: the lookup
+/// drafts are checked against the tokens that round produced. So a lookup
+/// round runs only once the context has earned it, never to explore.
+pub struct LookupAccept {
+    /// `accept[bucket][i]`: the chance draft `i` is kept when the drafts
+    /// before it were.
+    accept: Vec<Vec<f64>>,
+}
+
+/// Starting chance a lookup draft is kept: below what the MTP layer gets
+/// on code (0.7 to 0.8), so lookup has to show it does better first.
+const LOOKUP_PRIOR: f64 = 0.4;
+/// Weight of a new round in the lookup acceptance. Higher than the MTP
+/// one: copying starts and stops quickly.
+const LOOKUP_WEIGHT: f64 = 0.15;
+
+impl LookupAccept {
+    pub fn new(max: usize) -> LookupAccept {
+        LookupAccept {
+            accept: vec![vec![LOOKUP_PRIOR; max]; 3],
+        }
+    }
+
+    /// Tokens a round with `k` lookup drafts of match length `len` yields.
+    pub fn expected(&self, len: usize, k: usize) -> f64 {
+        let mut chance = 1.0;
+        let mut tokens = 1.0;
+        for a in &self.accept[lookup_bucket(len)][..k] {
+            chance *= a;
+            tokens += chance;
+        }
+        tokens
+    }
+
+    /// The lookup offered `drafts` (match length `len`), and the round
+    /// produced `truth` after the pending token: its kept drafts and next
+    /// token. Draft `i` counts as kept or not only where `truth` tells.
+    pub fn score(&mut self, len: usize, drafts: &[u32], truth: &[u32]) {
+        let accept = &mut self.accept[lookup_bucket(len)];
+        for (i, (&d, a)) in drafts.iter().zip(accept.iter_mut()).enumerate() {
+            let Some(&t) = truth.get(i) else { break };
+            let kept = if d == t { 1.0 } else { 0.0 };
+            *a += (kept - *a) * LOOKUP_WEIGHT;
+            if d != t {
+                break;
+            }
+        }
+    }
+
+    pub fn accept(&self) -> &[Vec<f64>] {
+        &self.accept
     }
 }
 
@@ -468,7 +593,7 @@ mod gpu {
     //! The same rounds as `generate`, on the GPU model with the GPU MTP
     //! layer.
 
-    use super::{Decider, DraftLength, Stats};
+    use super::{Decider, DraftLength, LookupAccept, Stats, UNKNOWN, lookup};
     use crate::config::Config;
     use crate::gpu::Gpu;
     use crate::gpu_model::GpuModel;
@@ -491,8 +616,20 @@ mod gpu {
         /// For each MTP cache entry, the model position of its hidden state.
         mtp_positions: Vec<usize>,
         length: DraftLength,
+        /// How well drafts from `lookup` do.
+        lookup: LookupAccept,
+        /// False with SAETTA_LOOKUP=0: MTP drafts only.
+        use_lookup: bool,
+        /// Most drafts a lookup round takes; the verify needs
+        /// `max(k, lookup_max) + 1` rows.
+        lookup_max: usize,
+        /// The tokens the model ran, one per position: 4 bytes a token.
+        history: Vec<u32>,
         /// Rounds per draft length since the last report.
         lengths: Vec<usize>,
+        /// Rounds that drafted from the context, and the drafts they kept.
+        lookup_rounds: usize,
+        lookup_accepted: usize,
         pub stats: Stats,
     }
 
@@ -506,7 +643,13 @@ mod gpu {
                 last: View::new(gpu.buffer(hidden * 4)),
                 mtp_positions: Vec::new(),
                 length: DraftLength::new(k),
+                lookup: LookupAccept::new(k),
+                use_lookup: std::env::var("SAETTA_LOOKUP").map_or(true, |v| v != "0"),
+                lookup_max: k,
+                history: Vec::new(),
                 lengths: vec![0; k + 1],
+                lookup_rounds: 0,
+                lookup_accepted: 0,
                 stats: Stats {
                     accepted_at: vec![0; k],
                     ..Stats::default()
@@ -517,6 +660,16 @@ mod gpu {
                 hidden,
                 vocab: cfg.vocab_size,
             }
+        }
+
+        /// Lookup rounds take up to `max` drafts instead of `k`; 0 turns
+        /// them off.
+        pub fn with_lookup(mut self, max: usize) -> GpuSpec<'a> {
+            self.lookup_max = max;
+            self.use_lookup &= max > 0;
+            self.lookup = LookupAccept::new(max);
+            self.stats.accepted_at = vec![0; self.k.max(max)];
+            self
         }
 
         /// One MTP step from `h`, the normed hidden state at `position`,
@@ -532,12 +685,26 @@ mod gpu {
             self.mtp.record(h, token);
         }
 
+        /// `tokens` ran at positions `pos ..`; the history after them is
+        /// dropped.
+        pub fn ran(&mut self, pos: usize, tokens: &[u32]) {
+            self.history.resize(pos, UNKNOWN);
+            self.history.extend_from_slice(tokens);
+        }
+
+        /// The model went back to `tokens`, after a restore.
+        pub fn restored(&mut self, tokens: &[u32]) {
+            self.history.clear();
+            self.history.extend_from_slice(tokens);
+        }
+
         /// Records the prompt's last tokens in the MTP cache. `rows` holds
         /// the normed hidden states of `tokens`, which ran at positions
         /// `pos ..`; `last` must hold the state at `pos - 1` when `pos > 0`.
         /// Only the last `window` tokens get an entry: an entry costs about
         /// as much as a decode step, and older ones matter less.
         pub fn after_prefill(&mut self, tokens: &[u32], rows: &[f32], pos: usize, window: usize) {
+            self.ran(pos, tokens);
             let n = tokens.len();
             let h = self.hidden;
             let start = n.saturating_sub(window).max(usize::from(pos == 0));
@@ -573,6 +740,7 @@ mod gpu {
             );
             self.mtp.truncate(keep);
             self.mtp_positions.truncate(keep);
+            self.history.resize(len, UNKNOWN);
             write(&self.last, last);
         }
 
@@ -594,10 +762,18 @@ mod gpu {
                     s.accepted_at,
                     self.lengths
                 );
+                eprintln!(
+                    "lookup drafts: {} rounds, {} accepted, accept by match length {:?}",
+                    self.lookup_rounds,
+                    self.lookup_accepted,
+                    self.lookup.accept()
+                );
             }
             self.lengths.fill(0);
+            self.lookup_rounds = 0;
+            self.lookup_accepted = 0;
             self.stats = Stats {
-                accepted_at: vec![0; self.k],
+                accepted_at: vec![0; self.k.max(self.lookup_max)],
                 ..Stats::default()
             };
         }
@@ -607,6 +783,7 @@ mod gpu {
         /// prompt cache runs a prompt's last token this way).
         pub fn step(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
             let pos = model.position();
+            self.ran(pos, &[token]);
             if pos > 0 {
                 let last = self.last.clone();
                 self.mtp_record(&last, pos - 1, token);
@@ -644,6 +821,7 @@ mod gpu {
         /// `step` without the MTP entry, for prompt tokens before the MTP
         /// window: the drafts only look back that far.
         pub fn step_plain(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
+            self.ran(model.position(), &[token]);
             let logits = model.forward(token);
             copy(model.final_hidden(), &self.last, self.hidden);
             logits
@@ -656,11 +834,14 @@ mod gpu {
         pub fn reset(&mut self) {
             self.mtp.reset();
             self.mtp_positions.clear();
+            self.history.clear();
         }
 
         /// One round: runs `pending` and the drafts, keeps the accepted
         /// drafts and returns them with the next token, which is not run.
-        /// The number of drafts is chosen per round.
+        /// The number of drafts, and whether they come from the MTP layer
+        /// or from the context (`lookup`), is chosen per round for the most
+        /// tokens per second.
         pub fn speculate(
             &mut self,
             model: &mut GpuModel<'a>,
@@ -668,16 +849,52 @@ mod gpu {
             decide: &mut dyn Decider,
         ) -> (Vec<u32>, u32) {
             let context = model.position();
-            let k = self.length.next(context);
+            self.ran(context, &[pending]);
+            let found = if self.use_lookup {
+                lookup(&self.history, self.lookup_max)
+            } else {
+                None
+            };
+            let (km, mtp_rate) = self.length.pick(context, 0, self.k);
+            // A lookup round when its expected tokens over the time of an
+            // MTP round of the same length (which also pays for the draft
+            // steps, so this is on the safe side) beat the best MTP round.
+            // Never while the MTP lengths are still being measured.
+            let from_context = match (&found, mtp_rate) {
+                (Some((len, drafts)), Some(best)) => (1..=drafts.len())
+                    .map(|kl| {
+                        let t = lookup_time(&mut self.length, context, self.k, kl);
+                        (kl, self.lookup.expected(*len, kl) / t)
+                    })
+                    .filter(|&(_, rate)| rate > best)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(kl, _)| drafts[..kl].to_vec()),
+                _ => None,
+            };
+            let k = from_context.as_ref().map_or(km, |d| d.len());
+            let from_lookup = from_context.is_some();
+            if !from_lookup {
+                self.length.take(km);
+            }
             let start = Instant::now();
             let (drafts, next) = if k == 0 {
                 self.plain(model, pending, decide)
             } else {
-                self.round(model, pending, decide, k)
+                self.round(model, pending, decide, k, from_context)
             };
             let seconds = start.elapsed().as_secs_f64();
-            self.length.record(context, k, drafts.len(), seconds);
-            self.lengths[k] += 1;
+            if let Some((len, offered)) = &found {
+                let mut truth = drafts.clone();
+                truth.push(next);
+                self.lookup.score(*len, offered, &truth);
+            }
+            if from_lookup {
+                self.lookup_rounds += 1;
+                self.lookup_accepted += drafts.len();
+            } else {
+                self.length.record(context, k, drafts.len(), seconds);
+                self.lengths[k] += 1;
+            }
             (drafts, next)
         }
 
@@ -707,17 +924,28 @@ mod gpu {
             pending: u32,
             decide: &mut dyn Decider,
             k: usize,
+            from_context: Option<Vec<u32>>,
         ) -> (Vec<u32>, u32) {
             let base = model.position();
             let mark = self.mtp.len();
 
             let last = self.last.clone();
-            let mut drafts = vec![self.mtp_step(&last, base - 1, pending)];
-            for i in 1..k {
-                let own = self.mtp.output().clone();
-                let d = self.mtp_step(&own, base + i - 1, drafts[i - 1]);
-                drafts.push(d);
-            }
+            let mut drafts = match from_context {
+                // Only the entry for `pending`, without lm_head.
+                Some(drafts) => {
+                    self.mtp_record(&last, base - 1, pending);
+                    drafts
+                }
+                None => {
+                    let mut drafts = vec![self.mtp_step(&last, base - 1, pending)];
+                    for i in 1..k {
+                        let own = self.mtp.output().clone();
+                        let d = self.mtp_step(&own, base + i - 1, drafts[i - 1]);
+                        drafts.push(d);
+                    }
+                    drafts
+                }
+            };
 
             // One pass over `pending` and the drafts, keeping each row.
             let tokens: Vec<u32> = std::iter::once(pending)
@@ -780,6 +1008,9 @@ mod gpu {
                 (accepted, next)
             };
             model.accept(accepted + 1);
+            let mut ran = vec![pending];
+            ran.extend(&drafts[..accepted]);
+            self.ran(base, &ran);
 
             self.mtp.truncate(mark + 1);
             self.mtp_positions.truncate(mark + 1);
@@ -797,6 +1028,18 @@ mod gpu {
             drafts.truncate(accepted);
             (drafts, next)
         }
+    }
+
+    /// The price of a lookup round with `kl` drafts: the time of an MTP
+    /// round with as many, and past the longest MTP length `k`, that time
+    /// plus the last measured step per extra draft.
+    fn lookup_time(length: &mut DraftLength, context: usize, k: usize, kl: usize) -> f64 {
+        let top = length.time(context, kl.min(k));
+        if kl <= k {
+            return top;
+        }
+        let step = (top - length.time(context, k - 1)).max(0.0);
+        top + (kl - k) as f64 * step
     }
 
     fn ptr(v: &View) -> *mut f32 {
@@ -1300,6 +1543,82 @@ mod tests {
         // In between, a short draft.
         let k = settle(0.010, 0.003, 0.6);
         assert!((1..=3).contains(&k), "{k}");
+    }
+
+    #[test]
+    fn lookup_takes_the_longest_then_latest_match() {
+        // "1 2 3 4 5 ... 9 2 3 7 ... 1 2 3": the suffix 1 2 3 also comes
+        // first, the shorter 2 3 later.
+        let c = [1, 2, 3, 4, 5, 6, 9, 2, 3, 7, 8, 1, 2, 3];
+        assert_eq!(lookup(&c, 3), Some((3, vec![4, 5, 6])));
+        // Of two equal matches the latest one.
+        let c = [5, 6, 1, 5, 6, 2, 5, 6];
+        assert_eq!(lookup(&c, 2), Some((2, vec![2, 5])));
+        // The drafts stop at the end of the context.
+        let c = [7, 8, 9, 7, 8];
+        assert_eq!(lookup(&c, 5), Some((2, vec![9, 7, 8])));
+        // One token in common is not enough.
+        assert_eq!(lookup(&[1, 2, 3, 1], 3), None);
+        assert_eq!(lookup(&[], 3), None);
+        assert_eq!(lookup(&[4], 3), None);
+        assert_eq!(lookup(&[1, 2, 1, 2], 0), None);
+        // The match is at most LOOKUP_MAX long and stops at that length.
+        let run: Vec<u32> = (0..20).collect();
+        let mut c = run.clone();
+        c.push(99);
+        c.extend(&run);
+        assert_eq!(lookup(&c, 2), Some((LOOKUP_MAX, vec![99, 0])));
+    }
+
+    #[test]
+    fn lookup_skips_unknown_tokens() {
+        // Unknown slots match nothing and end the drafts.
+        let c = [1, 2, UNKNOWN, 1, 2];
+        assert_eq!(lookup(&c, 3), None);
+        let c = [UNKNOWN, 2, 3, UNKNOWN, 4, 2, 3];
+        assert_eq!(lookup(&c, 3), None);
+        let c = [9, 2, 3, 5, UNKNOWN, 9, 2, 3];
+        assert_eq!(lookup(&c, 3), Some((3, vec![5])));
+    }
+
+    #[test]
+    fn lookup_accept_learns_only_what_the_round_tells() {
+        let mut a = LookupAccept::new(3);
+        let prior = a.expected(4, 3);
+        // All three drafts were right: up.
+        for _ in 0..20 {
+            a.score(5, &[1, 2, 3], &[1, 2, 3, 4]);
+        }
+        assert!(a.expected(4, 3) > 3.5);
+        // Other buckets did not move.
+        assert_eq!(a.expected(2, 3), prior);
+        // The first draft wrong: only draft 0 learns it.
+        let before = a.accept()[2].clone();
+        a.score(4, &[9, 2, 3], &[1, 2, 3, 4]);
+        assert!(a.accept()[2][0] < before[0]);
+        assert_eq!(a.accept()[2][1..], before[1..]);
+        // A plain round tells only about draft 0.
+        a.score(4, &[1, 2, 3], &[1]);
+        assert_eq!(a.accept()[2][1..], before[1..]);
+    }
+
+    #[test]
+    fn pick_stays_in_its_range_and_explores_when_not_taken() {
+        let mut d = DraftLength::new(3);
+        // Unmeasured lengths in the range come first, longest first.
+        assert_eq!(d.pick(100, 1, 2), (2, None));
+        for k in [2, 2, 1, 1] {
+            d.take(k);
+            d.record(100, k, k, 0.02);
+        }
+        let (k, rate) = d.pick(100, 1, 2);
+        assert!((1..=2).contains(&k));
+        assert!(rate.is_some());
+        // Asked often but never taken, it still explores now and then.
+        let explored = (0..2 * EXPLORE)
+            .filter(|_| d.pick(100, 1, 2).1.is_none())
+            .count();
+        assert!(explored >= 1);
     }
 
     #[test]
