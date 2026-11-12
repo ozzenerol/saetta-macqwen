@@ -252,15 +252,16 @@ mod mac {
             out
         }
 
-        /// Moves to new buffers with room for at least `capacity` tokens and
-        /// copies every old row over: the prompt cache may still use rows
-        /// past the position (another branch, or a backup put back). Plans
-        /// recorded with the old buffers must be recorded again. Both sets
-        /// of buffers are held during the copy.
-        pub fn grow(&mut self, gpu: &Gpu, capacity: usize) {
+        /// Moves to new buffers with room for `capacity` tokens and copies
+        /// every old row that fits over: the prompt cache may still use rows
+        /// past the position (another branch, or a backup put back), so a
+        /// smaller capacity must leave room for those. Plans recorded with
+        /// the old buffers must be recorded again. Both sets of buffers are
+        /// held during the copy.
+        pub fn resize(&mut self, gpu: &Gpu, capacity: usize) {
             let capacity = capacity.next_multiple_of(KV_ALIGN);
-            assert!(capacity >= self.capacity);
             let old = self.capacity as u64;
+            let rows = old.min(capacity as u64);
             let moved: Vec<Buffer> = self
                 .buffers()
                 .iter()
@@ -268,7 +269,7 @@ mod mac {
                 .collect();
             gpu.blit(|blit| {
                 for (from, to) in self.buffers().iter().zip(&moved) {
-                    blit.copy_from_buffer(from, 0, to, 0, from.length());
+                    blit.copy_from_buffer(from, 0, to, 0, from.length() / old * rows);
                 }
             })
             .wait_until_completed();

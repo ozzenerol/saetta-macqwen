@@ -26,11 +26,18 @@ Measured with `mlx_lm.server` on that Mac (one run each):
 - decode ceiling from those numbers: about 190 tokens/s
 - MLX decode today: 76 tokens/s at short context, 66 at about 12k tokens
 
-`tools/bench.py` measures any OpenAI-compatible server the same way. MLX with it, 3 runs each: 71.4 tokens/s and 0.14 s to the first token on a 39-token prompt; 62.5 tokens/s and 13.4 s to the first token on a 15,429-token prompt.
+Against `mlx_lm.server` on the same weights, measured with `tools/final_bench.sh` on 2026-11-12 (3 runs each, median; full table in [docs/BENCHMARK.md](docs/BENCHMARK.md)):
 
-saetta GPU decode, same tool, 3 runs: 90.5 tokens/s on the 39-token prompt (MLX 71.4). Time to first token there is 0.39 s (MLX 0.14 s); the 15k-token prompt took over 14 minutes and was stopped, so batched prefill is the next target.
+| prompt tokens | saetta decode tok/s | MLX decode tok/s | saetta TTFT s | MLX TTFT s |
+|---|---|---|---|---|
+| 49 | 110.5 | 73.8 | 0.28 | 0.15 |
+| 4,111 | 108.5 | 70.5 | 3.23 | 2.72 |
+| 35,958 | 89.3 | 58.5 | 37.8 | 33.3 |
+| 150,597 | 50.4 | out of memory | 362 | - |
 
-The gap comes from per-token overhead, not memory speed. The plan is fused kernels, one prebuilt command buffer per token, speculative decoding with the model's MTP layer, and saved recurrent state so a chat never reads its prompt twice. See [docs/PLAN.md](docs/PLAN.md).
+saetta decodes about 1.5 times faster and runs the full context; MLX still gets to the first token sooner, so prefill is the current target.
+
+The plan was fused kernels, one prebuilt command buffer per token, speculative decoding with the model's MTP layer, and saved recurrent state so a chat never reads its prompt twice. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Build
 
@@ -41,7 +48,7 @@ cargo build --release
 ./target/release/saetta gpu-check
 ```
 
-`saetta serve <model dir> --gpu` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default, `--port N` to change it). Without `--gpu` it runs the CPU model, at about 375 ms per token. With `--gpu` the MTP layer drafts up to 3 tokens per step by default; `--draft K` sets the most it drafts, and `--draft 0` turns drafting off. `--context N` (default 262144, the model's full context) caps the context. The KV caches start at 32768 tokens and double as a conversation needs more, so a short chat takes about 2 GB besides the weights. `--cache-mb N` (default 1024) bounds the prompt cache. [docs/MEMORY.md](docs/MEMORY.md) has the numbers.
+`saetta serve <model dir> --gpu` runs the OpenAI-compatible server on 127.0.0.1 (port 8090 by default, `--port N` to change it). Without `--gpu` it runs the CPU model, at about 375 ms per token. With `--gpu` the MTP layer drafts up to 3 tokens per step by default; `--draft K` sets the most it drafts, and `--draft 0` turns drafting off. Greedy output with drafting can differ from run to run, and from `--draft 0`, at near ties: the number of drafts per round follows measured timings, and verify passes of different widths round slightly differently, so a top-2 gap of about 1e-4 or less can go either way (two spec_bench runs of the same build differed at character 8 of the code reply). The draft steps score only the first 65536 token ids and the special tokens (`SAETTA_MTP_VOCAB=N` changes the count, 0 scores all 248320), which takes a 3-draft round from 22.2 to about 20 ms; a draft outside them is rejected by the verify, so the output does not change. `--context N` (default 262144, the model's full context) caps the context. The KV caches start at 32768 tokens and double as a conversation needs more, so a short chat takes about 2 GB besides the weights. `--cache-mb N` (default 1024) bounds the prompt cache, and `--cache-idle-min M` (default 15, 0 off) drops a long conversation's snapshots after M idle minutes so its KV memory can go. [docs/MEMORY.md](docs/MEMORY.md) has the numbers.
 
 ## License
 

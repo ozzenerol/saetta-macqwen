@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -242,6 +242,9 @@ struct Memory {
     cache_bytes: usize,
     /// How the KV caches store keys and values.
     kv_bits: KvBits,
+    /// Snapshots unused for this long go when they keep the KV caches more
+    /// than twice as long as a request needs; None keeps them.
+    cache_idle: Option<std::time::Duration>,
 }
 
 impl Default for Memory {
@@ -251,11 +254,12 @@ impl Default for Memory {
             context: 262144,
             cache_bytes: 1 << 30,
             kv_bits: KvBits::Half,
+            cache_idle: Some(std::time::Duration::from_secs(15 * 60)),
         }
     }
 }
 
-/// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--kv-bits 16|8|4] [--port N]
+/// `[--gpu] [--draft K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N]
 /// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut draft = None;
@@ -300,6 +304,16 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                     .parse()
                     .map_err(|_| format!("bad cache size {value}"))?;
                 f.memory.cache_bytes = mb << 20;
+            }
+            "--cache-idle-min" => {
+                let value = it.next().ok_or("--cache-idle-min needs minutes")?;
+                let min: f64 = value
+                    .parse()
+                    .ok()
+                    .filter(|m: &f64| *m >= 0.0 && m.is_finite())
+                    .ok_or(format!("bad --cache-idle-min {value}"))?;
+                f.memory.cache_idle =
+                    (min > 0.0).then(|| std::time::Duration::from_secs_f64(min * 60.0));
             }
             "--port" => {
                 let value = it.next().ok_or("--port needs a number")?;
@@ -398,10 +412,13 @@ fn serve_gpu(
     let ServeFlags { draft, memory, .. } = flags;
     let served = load_gpu(config, weights, draft, memory)?;
     let snapshots = served.snapshots;
-    let model = anchored(
-        Cached::new(served, snapshots, SNAPSHOT_EVERY),
+    let mut model = anchored(
+        Cached::new(served, snapshots, SNAPSHOT_EVERY).min_piece(PREFILL_CHUNK),
         &tokenizer,
     );
+    if let Some(idle) = memory.cache_idle {
+        model = model.expire_after(idle);
+    }
     let server = Arc::new(Server::new(model, tokenizer, settings)?);
     let drafts = if draft > 0 {
         format!(", MTP drafts {draft} per round")
@@ -558,6 +575,13 @@ fn kv_caches<'m>(
 #[cfg(target_os = "macos")]
 const SHORT_PREFILL: usize = 8;
 
+/// SAETTA_TAIL_STEPS=1: with drafting, a prompt shorter than SHORT_PREFILL
+/// runs as decode steps, as before GpuSpec::run_rows.
+#[cfg(target_os = "macos")]
+fn tail_steps() -> bool {
+    std::env::var("SAETTA_TAIL_STEPS").is_ok_and(|v| v == "1")
+}
+
 /// The MTP drafter, with the final norm to turn prefill rows into the
 /// normed hidden states it reads.
 #[cfg(target_os = "macos")]
@@ -581,6 +605,9 @@ const PREFILL_CHUNK: usize = 2048;
 /// prefill, and each piece between two is one prefill call. Pieces of
 /// cache::DEFAULT_EVERY (1024) would run half chunks and pay the fixed cost
 /// of a call four times as often.
+/// A follow-up turn of 3k tokens that crosses a multiple of it runs in one
+/// call, not two: `Cached::min_piece` skips a snapshot that leaves a piece
+/// under PREFILL_CHUNK, which costs about as much as a full chunk.
 #[cfg(target_os = "macos")]
 const SNAPSHOT_EVERY: usize = 2 * PREFILL_CHUNK;
 
@@ -627,6 +654,9 @@ impl server::Model for GpuServed {
                     rest.iter().for_each(|&t| m.run(t));
                     m.forward(last)
                 }
+                // The multi-row verify, k + 1 tokens a pass, unless
+                // SAETTA_TAIL_STEPS=1 (to compare).
+                Some(d) if !tail_steps() => d.spec.run_rows(m, tokens),
                 Some(d) => {
                     // Only the last MTP_WINDOW tokens get an MTP entry, as
                     // after a prefill.
@@ -773,6 +803,16 @@ impl Restore for GpuServed {
 
     fn discard_rows(&mut self) {
         self.rows.clear();
+    }
+
+    /// Shrinks the KV caches after a long conversation, once no snapshot
+    /// needs its rows.
+    fn release_rows(&mut self, need: usize) -> usize {
+        let held = self.model.shrink(need);
+        if let Some(d) = &mut self.drafting {
+            d.spec.mtp.shrink(held);
+        }
+        held
     }
 }
 

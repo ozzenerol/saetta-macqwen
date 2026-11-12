@@ -1,0 +1,142 @@
+# Memory of a running saetta server over a qh-like session, on the Mac:
+#   python3 tools/memory_bench.py --pid $(pgrep -f 'saetta serve') \
+#       --turns 20 --long 45k --idle 90 --others 4
+# After each request it prints the footprint at once and --settle seconds
+# later, with the cached tokens of the request. Steps:
+# 1. a growing conversation of --turns turns (the last prompt, its answer
+#    and a tool result each time), as qh sends them
+# 2. one prompt of --long tokens
+# 3. with --idle S: a wait of S seconds, then a short new conversation. With
+#    the server started with --cache-idle-min below S / 60, the long
+#    conversation's snapshots go and the KV caches shrink: the line
+#    "after idle" shows the footprint before the wait and after the request
+# 4. --others short conversations with different system prompts, which push
+#    the long one's snapshots out, so the KV caches can shrink
+# Thinking is off and temperature 0, so runs repeat.
+import argparse
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.request
+
+FILLER = "Here is some text number {}. "
+
+
+def tokens_of(text):
+    text = text.strip().lower()
+    return int(float(text[:-1]) * 1024) if text.endswith("k") else int(text)
+
+
+def footprint_mb(pid):
+    """phys_footprint from footprint(1), and the RSS from ps, in MB."""
+    out = subprocess.run(["footprint", str(pid)], capture_output=True, text=True).stdout
+    m = re.search(r"[Ff]ootprint:\s*([\d.]+)\s*([KMG])B", out)
+    foot = None
+    if m:
+        foot = float(m.group(1)) * {"K": 1 / 1024, "M": 1, "G": 1024}[m.group(2)]
+    rss = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return foot, int(rss.strip() or 0) / 1024
+
+
+def detail(args, name):
+    """With --detail DIR: footprint(1) and vmmap -summary of the server."""
+    if not args.detail or args.detail_left <= 0:
+        return
+    os.makedirs(args.detail, exist_ok=True)
+    for cmd, suffix in ((["footprint", str(args.pid)], "footprint"),
+                        (["vmmap", "-summary", str(args.pid)], "vmmap")):
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        with open(os.path.join(args.detail, f"{name}.{suffix}.txt"), "w") as f:
+            f.write(out.stdout + out.stderr)
+
+
+def chat(url, messages, max_tokens):
+    body = json.dumps({
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode()
+    req = urllib.request.Request(url + "/v1/chat/completions", body,
+                                 {"Content-Type": "application/json"})
+    start = time.time()
+    r = json.load(urllib.request.urlopen(req))
+    usage = r["usage"]
+    cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    return r["choices"][0]["message"], usage["prompt_tokens"], cached, time.time() - start
+
+
+def measure(args, label, messages):
+    message, prompt, cached, secs = chat(args.url, messages, args.tokens)
+    now = footprint_mb(args.pid)
+    name = label.replace(" ", "-")
+    detail(args, f"{name}.now")
+    time.sleep(args.settle)
+    later = footprint_mb(args.pid)
+    detail(args, f"{name}.later")
+    args.detail_left -= 1
+    fmt = lambda f: "?" if f[0] is None else f"{f[0]:.0f}"
+    print(f"{label}: prompt {prompt}, cached {cached}, {secs:.1f} s, footprint {fmt(now)} MB "
+          f"then {fmt(later)} MB after {args.settle} s, rss {now[1]:.0f} then {later[1]:.0f} MB",
+          flush=True)
+    return message
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://127.0.0.1:8090")
+    ap.add_argument("--pid", type=int, required=True)
+    ap.add_argument("--tokens", type=int, default=128, help="answer tokens per request")
+    ap.add_argument("--turns", type=int, default=20)
+    ap.add_argument("--long", default="45k")
+    ap.add_argument("--idle", type=float, default=0, help="seconds to wait after the long prompt; 0 skips it")
+    ap.add_argument("--others", type=int, default=4)
+    ap.add_argument("--settle", type=float, default=6)
+    ap.add_argument("--detail", help="directory for footprint and vmmap -summary output, "
+                    "right after and --settle seconds after the first --detail-turns requests")
+    ap.add_argument("--detail-turns", type=int, default=3)
+    args = ap.parse_args()
+    args.detail_left = args.detail_turns
+
+    f = footprint_mb(args.pid)
+    print(f"idle: footprint {f[0]} MB, rss {f[1]:.0f} MB", flush=True)
+
+    messages = [{"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Read the files and summarize them."}]
+    for turn in range(args.turns):
+        answer = measure(args, f"turn {turn + 1}", messages)
+        messages.append({"role": "assistant", "content": answer.get("content") or ""})
+        result = " ".join(FILLER.format(turn * 100 + i) for i in range(60))
+        messages.append({"role": "user", "content": f"Tool result {turn + 1}: {result}"})
+
+    words = tokens_of(args.long) // 7
+    long = " ".join(FILLER.format(i) for i in range(words))
+    measure(args, f"long {args.long}", [{"role": "user", "content": long + "\nSummarize."}])
+
+    if args.idle > 0:
+        before = footprint_mb(args.pid)
+        time.sleep(args.idle)
+        convo = [{"role": "system", "content": "You are back after a break."},
+                 {"role": "user", "content": "Say hello."}]
+        chat(args.url, convo, args.tokens)
+        time.sleep(args.settle)
+        after = footprint_mb(args.pid)
+        fmt = lambda f: "?" if f[0] is None else f"{f[0]:.0f}"
+        print(f"after idle {args.idle:.0f} s: footprint {fmt(before)} MB before the wait, "
+              f"{fmt(after)} MB after a short new request (rss {before[1]:.0f} then {after[1]:.0f} MB); "
+              f"the server log says \"prompt cache: dropped\" when the idle snapshots went",
+              flush=True)
+
+    for i in range(args.others):
+        convo = [{"role": "system", "content": f"You are helper number {i}."},
+                 {"role": "user", "content": "Say hello."}]
+        for turn in range(4):
+            answer = measure(args, f"other {i + 1} turn {turn + 1}", convo)
+            convo.append({"role": "assistant", "content": answer.get("content") or ""})
+            convo.append({"role": "user", "content": f"And again, {turn}."})
+
+
+if __name__ == "__main__":
+    main()
