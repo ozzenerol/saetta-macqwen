@@ -761,11 +761,12 @@ struct Drafting {
 #[cfg(target_os = "macos")]
 const MTP_WINDOW: usize = 32;
 
-/// Tokens per prefill dispatch. Measured with bench-prefill: 2048 is about
-/// 5% faster than 1024 at 4k and 15k tokens (more rows per expert tile),
-/// and 4096 no better at 15k.
+/// Tokens per prefill dispatch. With the 64-row expert tiles, 4096 gives
+/// each expert about 128 rows a chunk: a 16k prompt is 4.7% faster than at
+/// 2048 in bench-prefill and its server TTFT 12.9 s instead of 13.5 s, for
+/// about 400 MB more GPU scratch.
 #[cfg(target_os = "macos")]
-const PREFILL_CHUNK: usize = 2048;
+const PREFILL_CHUNK: usize = 4096;
 
 /// The GPU prompt cache takes a snapshot every this many tokens of a long
 /// prefill, and each piece between two is one prefill call. Pieces of
@@ -773,9 +774,9 @@ const PREFILL_CHUNK: usize = 2048;
 /// of a call four times as often.
 /// A follow-up turn of 3k tokens that crosses a multiple of it runs in one
 /// call, not two: `Cached::min_piece` skips a snapshot that leaves a piece
-/// under PREFILL_CHUNK, which costs about as much as a full chunk.
+/// under the chunk, which costs about as much as a full chunk.
 #[cfg(target_os = "macos")]
-const SNAPSHOT_EVERY: usize = 2 * PREFILL_CHUNK;
+const SNAPSHOT_EVERY: usize = 4096;
 
 /// PREFILL_CHUNK, or SAETTA_PREFILL_CHUNK to compare the memory of the
 /// prefill scratch (about 0.25 MB a row) with its speed. Snapshots stay
