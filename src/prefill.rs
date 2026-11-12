@@ -507,6 +507,21 @@ mod mac {
         std::env::var("SAETTA_DELTA2").is_ok_and(|v| v == "1")
     }
 
+    /// The delta rule runs on delta_prep plus delta_rows3 with this many
+    /// simdgroups (8 state rows each) per threadgroup: 8 (24% faster than
+    /// delta_rows in batch 10), or SAETTA_DELTA3=<n>, 2 to 16; 0 runs
+    /// delta_rows.
+    fn delta3() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_DELTA3")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n == 0 || (2..=16).contains(&n))
+                .unwrap_or(8)
+        })
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -1394,7 +1409,9 @@ mod mac {
                 eps: c.eps,
                 snapshots: snaps.is_some() as u32,
             };
-            if !delta2() {
+            // SAETTA_DELTA2=1 wins over delta_rows3.
+            let d3 = if delta2() { 0 } else { delta3() };
+            if !delta2() && d3 == 0 {
                 enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows"));
                 set_views(
                     enc,
@@ -1421,13 +1438,25 @@ mod mac {
                 params(enc, 5, &p);
                 groups(enc, (t, 2 * c.k_heads + 1), 32);
 
-                enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows2"));
+                let kernel = if d3 > 0 { "delta_rows3" } else { "delta_rows2" };
+                let pipeline = gpu.pipeline(kernel);
+                assert!(
+                    pipeline.max_total_threads_per_threadgroup() as usize >= 32 * d3,
+                    "delta_rows3 takes at most {} threads per threadgroup",
+                    pipeline.max_total_threads_per_threadgroup()
+                );
+                enc.set_compute_pipeline_state(&pipeline);
                 set_views(enc, 0, &[&mixed, &a, &b]);
                 set_views(enc, 5, &[&whole(&state.recurrent), &y]);
                 params(enc, 7, &p);
                 set_views(enc, 8, &[&whole(delta_snaps)]);
-                // 2 simdgroups of 4 rows each per threadgroup.
-                groups(enc, (c.v_dim.div_ceil(8), c.v_heads), 64);
+                if d3 > 0 {
+                    // d3 simdgroups of 8 rows each per threadgroup.
+                    groups(enc, (c.v_dim.div_ceil(8 * d3), c.v_heads), 32 * d3);
+                } else {
+                    // 2 simdgroups of 4 rows each per threadgroup.
+                    groups(enc, (c.v_dim.div_ceil(8), c.v_heads), 64);
+                }
             }
             self.encode_deltanet_out(gpu, enc, w, &y, &z, out, t);
         }
