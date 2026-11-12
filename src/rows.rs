@@ -333,10 +333,13 @@ mod mac {
         wanted.min(capacity.div_ceil(CHUNK)).max(1)
     }
 
-    /// Decode attention for `m` rows (`attention_partial_rows`, then
-    /// `attention_reduce_rows`), with the per-row partial results of up to
-    /// `rows` rows: `rows * splits * heads` KB, 8 MB for 4 rows and 128
-    /// splits. Layers that run one after the other share it.
+    /// Decode attention for `m` rows, with the per-row partial results of
+    /// up to `rows` rows. A half cache runs main's kernels, one result per
+    /// chunk (`attention_partial_rows_chunks`, `attention_reduce_rows_chunks`);
+    /// a quantized one the fixed splits (`attention_partial_rows_q8`/`_q4`,
+    /// `attention_reduce_rows`). The scratch is sized for the chunks,
+    /// `rows * chunks * heads` KB, as on main. Layers that run one after the
+    /// other share it.
     pub struct AttentionRows {
         heads: usize,
         kv_heads: usize,
@@ -356,14 +359,15 @@ mod mac {
             rows: usize,
         ) -> AttentionRows {
             let splits = splits(capacity);
+            let chunks = capacity.div_ceil(CHUNK);
             AttentionRows {
                 heads,
                 kv_heads,
                 capacity,
                 rows,
                 splits,
-                part_o: View::new(gpu.buffer(rows * splits * heads * DIM * 4)),
-                part_ml: View::new(gpu.buffer(rows * splits * heads * 2 * 4)),
+                part_o: View::new(gpu.buffer(rows * chunks * heads * DIM * 4)),
+                part_ml: View::new(gpu.buffer(rows * chunks * heads * 2 * 4)),
             }
         }
 
@@ -382,17 +386,27 @@ mod mac {
             out: &View,
             params: &[View],
         ) {
-            // The half kernel does not read the scales and biases.
-            let cache = [keys, values, keys, keys, keys, keys];
-            self.record_with(
-                plan,
-                "attention_partial_rows",
-                m,
-                q,
-                cache,
-                q_and_gate,
-                out,
-                params,
+            assert!(m <= self.rows && params.len() >= m);
+            let chunks = self.capacity.div_ceil(CHUNK);
+            let p = plan.constant(&[RowsAttentionParams {
+                heads: self.heads as u32,
+                kv_heads: self.kv_heads as u32,
+                capacity: self.capacity as u32,
+                scale: 1.0 / (DIM as f32).sqrt(),
+                rows: m as u32,
+                splits: chunks as u32,
+            }]);
+            plan.op(
+                "attention_partial_rows_chunks",
+                &[q, keys, values, &self.part_o, &self.part_ml, &p, &params[0]],
+                MTLSize::new(chunks as u64, self.kv_heads as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            plan.op(
+                "attention_reduce_rows_chunks",
+                &[&self.part_o, &self.part_ml, q_and_gate, out, &p, &params[0]],
+                MTLSize::new(self.heads as u64, m as u64, 1),
+                MTLSize::new(1024, 1, 1),
             );
         }
 
