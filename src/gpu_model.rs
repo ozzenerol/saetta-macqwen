@@ -386,12 +386,19 @@ mod mac {
 
     /// Tokens the attention caches start with: Metal makes a whole buffer
     /// resident once a kernel uses it, so a short chat must not pay for the
-    /// full context.
-    pub const KV_START: usize = 32768;
+    /// full context. 8192 tokens are 160 MB; each doubling copies the rows
+    /// held (a blit of at most a few hundred MB) and records the plans again.
+    pub const KV_START: usize = 8192;
 
-    /// The first capacity for a context of `limit` tokens.
+    /// The first capacity for a context of `limit` tokens: KV_START, or
+    /// SAETTA_KV_START to compare.
     pub fn kv_start(limit: usize) -> usize {
-        KV_START.min(limit)
+        let start = std::env::var("SAETTA_KV_START")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n >= 1024)
+            .unwrap_or(KV_START);
+        start.min(limit)
     }
 
     /// The capacity to grow to from `capacity` for `need` tokens: doubled
@@ -613,6 +620,7 @@ mod mac {
         }
 
         fn resize(&mut self, allocated: usize) {
+            let start = std::time::Instant::now();
             let before = self.kv_bytes();
             for layer in &mut self.layers {
                 layer.resize(self.gpu, allocated);
@@ -630,6 +638,10 @@ mod mac {
             if let Some(rows) = self.verify.as_ref().map(|v| v.rows) {
                 self.enable_verify(rows);
             }
+            eprintln!(
+                "KV move and plans took {:.0} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
         }
 
         /// Tokens the attention caches hold now; `capacity` is the most.
