@@ -453,7 +453,7 @@ fn serve_gpu(
     let served = load_gpu(config, weights, draft, lookup, memory)?;
     let snapshots = served.snapshots;
     let mut model = anchored(
-        Cached::new(served, snapshots, SNAPSHOT_EVERY).min_piece(PREFILL_CHUNK),
+        Cached::new(served, snapshots, SNAPSHOT_EVERY).min_piece(serve_chunk()),
         &tokenizer,
     );
     if let Some(idle) = memory.cache_idle {
@@ -485,6 +485,7 @@ fn load_gpu(
 ) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
     let context = memory.context;
+    let mut parts = BufferParts::new(gpu);
     let mut model = saetta::gpu_model::GpuModel::load_with_bits(
         gpu,
         config,
@@ -493,6 +494,7 @@ fn load_gpu(
         context,
         memory.kv_bits,
     )?;
+    parts.add("model");
     let layers = model.deltanet_states();
     let snapshot: usize = layers
         .iter()
@@ -501,10 +503,12 @@ fn load_gpu(
     // The cache adds a snapshot before it evicts one, so the pool has one more.
     let snapshots = (memory.cache_bytes / snapshot).max(2) - 1;
     let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, snapshots + 1);
-    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, PREFILL_CHUNK)?;
+    let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, serve_chunk())?;
     prefill.exact = exact_prefill();
+    parts.add("prefill");
     if draft > 0 {
         model.enable_verify(draft.max(lookup) + 1);
+        parts.add("verify");
     }
     let spec = if draft > 0 {
         let mtp = saetta::gpu_mtp::GpuMtp::load(gpu, config, weights, context)?;
@@ -517,6 +521,10 @@ fn load_gpu(
     } else {
         None
     };
+    if spec.is_some() {
+        parts.add("MTP");
+    }
+    parts.report();
     report_memory(&model, memory, draft > 0, snapshots, snapshot);
     Ok(GpuServed {
         model,
@@ -526,7 +534,52 @@ fn load_gpu(
         last_blit: RefCell::new(None),
         drafting: spec,
         rows: saetta::gpu_cache::RowBackup::new(),
+        decoded: 0,
     })
+}
+
+/// The GPU buffers each part of the served model allocates at load, besides
+/// the weights (which are no-copy views of the model files). Metal charges a
+/// buffer to the process while it is resident, so these, not the settled
+/// footprint, are the memory the server holds.
+#[cfg(target_os = "macos")]
+struct BufferParts<'a> {
+    gpu: &'a saetta::gpu::Gpu,
+    last: u64,
+    parts: Vec<(&'static str, u64)>,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> BufferParts<'a> {
+    fn new(gpu: &'a saetta::gpu::Gpu) -> Self {
+        let mut p = BufferParts { gpu, last: 0, parts: Vec::new() };
+        p.last = p.own();
+        p
+    }
+
+    fn own(&self) -> u64 {
+        self.gpu.device.current_allocated_size().saturating_sub(self.gpu.no_copy_bytes())
+    }
+
+    fn add(&mut self, name: &'static str) {
+        let now = self.own();
+        self.parts.push((name, now.saturating_sub(self.last)));
+        self.last = now;
+    }
+
+    fn report(&self) {
+        let mb = |b: u64| b as f64 / (1 << 20) as f64;
+        let list: Vec<String> = self
+            .parts
+            .iter()
+            .map(|(name, b)| format!("{name} {:.0}", mb(*b)))
+            .collect();
+        eprintln!(
+            "GPU buffers besides the weights ({:.0} MB of no-copy views): {} MB",
+            mb(self.gpu.no_copy_bytes()),
+            list.join(", ")
+        );
+    }
 }
 
 /// Prints what the server allocates besides the weights, at most: the
@@ -593,6 +646,19 @@ struct GpuServed {
     drafting: Option<Drafting>,
     /// KV rows kept aside during a detour (cache::Restore::backup_rows).
     rows: saetta::gpu_cache::RowBackup,
+    /// Decode calls since the last prefill, for SAETTA_MEM_TRACE.
+    decoded: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl GpuServed {
+    /// SAETTA_MEM_TRACE: marks decode calls 1, 2, 4, 8, ... after a prefill.
+    fn trace_decode(&mut self) {
+        self.decoded += 1;
+        if self.decoded.is_power_of_two() {
+            saetta::memtrace::mark(&format!("decode call {}", self.decoded));
+        }
+    }
 }
 
 /// The KV cache of each attention layer.
@@ -652,6 +718,18 @@ const PREFILL_CHUNK: usize = 2048;
 #[cfg(target_os = "macos")]
 const SNAPSHOT_EVERY: usize = 2 * PREFILL_CHUNK;
 
+/// PREFILL_CHUNK, or SAETTA_PREFILL_CHUNK to compare the memory of the
+/// prefill scratch (about 0.25 MB a row) with its speed. Snapshots stay
+/// SNAPSHOT_EVERY tokens apart.
+#[cfg(target_os = "macos")]
+fn serve_chunk() -> usize {
+    std::env::var("SAETTA_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c: &usize| c >= 64)
+        .unwrap_or(PREFILL_CHUNK)
+}
+
 #[cfg(target_os = "macos")]
 /// Fast prefill unless SAETTA_EXACT=1: track F's eval found it within
 /// 0.04% of the f32 perplexity, closer than MLX in bf16.
@@ -678,6 +756,8 @@ impl server::Model for GpuServed {
         if tokens.is_empty() {
             return Vec::new();
         }
+        self.decoded = 0;
+        saetta::memtrace::mark(&format!("prefill {} tokens at {}", tokens.len(), m.position()));
         // The prefill writes the KV rows of all the tokens, and the MTP cache
         // never holds more entries than the model has tokens.
         let need = m.position() + tokens.len();
@@ -744,10 +824,12 @@ impl server::Model for GpuServed {
             secs * 1e3 / tokens.len() as f64,
             m.gpu().device.current_allocated_size() >> 20
         );
+        saetta::memtrace::mark("prefill done");
         logits
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
+        self.trace_decode();
         match &mut self.drafting {
             Some(d) => d.spec.step(&mut self.model, token),
             None => self.model.forward(token),
@@ -759,6 +841,7 @@ impl server::Model for GpuServed {
         pending: u32,
         decide: &mut dyn saetta::speculative::Decider,
     ) -> (Vec<u32>, u32) {
+        self.trace_decode();
         match &mut self.drafting {
             Some(d) => d.spec.speculate(&mut self.model, pending, decide),
             None => match decide.sampling() {
@@ -805,6 +888,7 @@ impl Restore for GpuServed {
         let m = &self.model;
         let (snapshot, blit) = saetta::gpu_cache::save(m.gpu(), &self.pool, &m.deltanet_states());
         *self.last_blit.borrow_mut() = Some(blit);
+        saetta::memtrace::mark("snapshot saved");
         let last = self
             .drafting
             .as_ref()

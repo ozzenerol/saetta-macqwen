@@ -507,6 +507,21 @@ mod mac {
         std::env::var("SAETTA_DELTA2").is_ok_and(|v| v == "1")
     }
 
+    /// The delta rule runs on delta_prep plus delta_rows3 with this many
+    /// simdgroups (8 state rows each) per threadgroup: 8 (24% faster than
+    /// delta_rows in batch 10), or SAETTA_DELTA3=<n>, 2 to 16; 0 runs
+    /// delta_rows.
+    fn delta3() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_DELTA3")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n == 0 || (2..=16).contains(&n))
+                .unwrap_or(8)
+        })
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -619,16 +634,44 @@ mod mac {
             let pairs = chunk * cfg.num_experts_per_tok;
             let size = cfg.moe_intermediate_size;
             let max_tiles = pairs.div_ceil(TILE.min(crate::qmm::tile_rows())) + cfg.num_experts;
+            // The mixer's buffers and the routed experts' are never live at
+            // once (a layer's mixer is done before its MoE, and the serial
+            // encoder runs them in order), so they share memory: about 210
+            // MB at chunk 2048. For this model the pieces line up, f32 over
+            // f32 and half over half (wide + mixed = expert_out, z =
+            // expert_g, y = expert_u, q_half = expert_half), so a padding
+            // row read as the other kind is never a NaN made of half a
+            // float. SAETTA_ALIAS=0 gives each its own buffer.
+            let floats = |n: usize| n.max(1) * 4;
+            let mixer = [
+                chunk * wide,
+                chunk * wide,
+                chunk * narrow,
+                chunk * narrow,
+                chunk * narrow / 2,
+            ];
+            let experts = [pairs * h, pairs * size, pairs * size, pairs * size / 2];
+            let (mixer, experts) =
+                match gpu.aliased(&[&mixer.map(floats)[..], &experts.map(floats)[..]]) {
+                    Some(mut g) => (g.remove(0), g.remove(0)),
+                    None => (
+                        mixer.iter().map(|&n| f(n)).collect(),
+                        experts.iter().map(|&n| f(n)).collect(),
+                    ),
+                };
+            let [wide, mixed, z, y, q_half]: [Buffer; 5] = mixer.try_into().unwrap();
+            let [expert_out, expert_g, expert_u, expert_half]: [Buffer; 4] =
+                experts.try_into().unwrap();
             Scratch {
                 normed: f(chunk * h),
-                wide: f(chunk * wide),
-                mixed: f(chunk * wide),
-                z: f(chunk * narrow),
-                y: f(chunk * narrow),
+                wide,
+                mixed,
+                z,
+                y,
                 a: f(chunk * d.v_heads),
                 b: f(chunk * d.v_heads),
                 mixer_out: f(chunk * h),
-                q_half: f(chunk * narrow / 2),
+                q_half,
                 router: f(chunk * cfg.num_experts),
                 shared_gate: f(chunk),
                 shared_g: f(chunk * cfg.shared_expert_intermediate_size),
@@ -640,12 +683,12 @@ mod mac {
                 rows: f(pairs),
                 tiles: f(4 * max_tiles),
                 tile_count: f(1),
-                expert_g: f(pairs * size),
-                expert_u: f(pairs * size),
-                expert_out: f(pairs * h),
+                expert_g,
+                expert_u,
+                expert_out,
                 normed_half: f(chunk * h / 2),
                 x_half: f(chunk * h.max(narrow) / 2),
-                expert_half: f(pairs * size / 2),
+                expert_half,
                 few_list: f(1 + FEW_MOE_ROWS * cfg.num_experts_per_tok),
                 few_slots: f(FEW_MOE_ROWS * FEW_MOE_ROWS * cfg.num_experts_per_tok),
                 max_tiles,
@@ -1394,7 +1437,9 @@ mod mac {
                 eps: c.eps,
                 snapshots: snaps.is_some() as u32,
             };
-            if !delta2() {
+            // SAETTA_DELTA2=1 wins over delta_rows3.
+            let d3 = if delta2() { 0 } else { delta3() };
+            if !delta2() && d3 == 0 {
                 enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows"));
                 set_views(
                     enc,
@@ -1421,13 +1466,25 @@ mod mac {
                 params(enc, 5, &p);
                 groups(enc, (t, 2 * c.k_heads + 1), 32);
 
-                enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows2"));
+                let kernel = if d3 > 0 { "delta_rows3" } else { "delta_rows2" };
+                let pipeline = gpu.pipeline(kernel);
+                assert!(
+                    pipeline.max_total_threads_per_threadgroup() as usize >= 32 * d3,
+                    "delta_rows3 takes at most {} threads per threadgroup",
+                    pipeline.max_total_threads_per_threadgroup()
+                );
+                enc.set_compute_pipeline_state(&pipeline);
                 set_views(enc, 0, &[&mixed, &a, &b]);
                 set_views(enc, 5, &[&whole(&state.recurrent), &y]);
                 params(enc, 7, &p);
                 set_views(enc, 8, &[&whole(delta_snaps)]);
-                // 2 simdgroups of 4 rows each per threadgroup.
-                groups(enc, (c.v_dim.div_ceil(8), c.v_heads), 64);
+                if d3 > 0 {
+                    // d3 simdgroups of 8 rows each per threadgroup.
+                    groups(enc, (c.v_dim.div_ceil(8 * d3), c.v_heads), 32 * d3);
+                } else {
+                    // 2 simdgroups of 4 rows each per threadgroup.
+                    groups(enc, (c.v_dim.div_ceil(8), c.v_heads), 64);
+                }
             }
             self.encode_deltanet_out(gpu, enc, w, &y, &z, out, t);
         }

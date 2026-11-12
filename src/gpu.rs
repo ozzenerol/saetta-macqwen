@@ -208,6 +208,56 @@ mod mac {
             self.device.new_buffer(len as u64, OPTIONS)
         }
 
+        /// Buffers that share memory: group `g` gets one buffer per length
+        /// in `groups[g]`, laid out one after another from the start of one
+        /// placement heap, so buffer `i` of each group overlaps buffer `i` of
+        /// the others when the lengths match. The heap is as big as the
+        /// largest group. Only for scratch whose groups are never live at
+        /// the same time; the contents are not zeroed. None if the device
+        /// cannot make the heap or `SAETTA_ALIAS=0`.
+        pub fn aliased(&self, groups: &[&[usize]]) -> Option<Vec<Vec<Buffer>>> {
+            if std::env::var("SAETTA_ALIAS").is_ok_and(|v| v == "0") {
+                return None;
+            }
+            let layout = |lengths: &[usize]| -> Vec<(u64, u64)> {
+                let mut at = 0u64;
+                lengths
+                    .iter()
+                    .map(|&n| {
+                        let n = n.max(4) as u64;
+                        let sa = self.device.heap_buffer_size_and_align(n, OPTIONS);
+                        at = at.next_multiple_of(sa.align);
+                        let place = (at, n);
+                        at += sa.size;
+                        place
+                    })
+                    .collect()
+            };
+            let layouts: Vec<_> = groups.iter().map(|g| layout(g)).collect();
+            let size = layouts
+                .iter()
+                .filter_map(|l| l.last().map(|&(at, n)| at + n))
+                .max()?
+                .next_multiple_of(PAGE as u64);
+            let desc = metal::HeapDescriptor::new();
+            desc.set_heap_type(metal::MTLHeapType::Placement);
+            desc.set_storage_mode(metal::MTLStorageMode::Shared);
+            desc.set_hazard_tracking_mode(metal::MTLHazardTrackingMode::Untracked);
+            desc.set_size(size);
+            let heap = self.device.new_heap(&desc);
+            if metal::foreign_types::ForeignType::as_ptr(&heap).is_null() {
+                return None;
+            }
+            layouts
+                .iter()
+                .map(|l| {
+                    l.iter()
+                        .map(|&(at, n)| heap.new_buffer_with_offset(n, OPTIONS, at))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect()
+        }
+
         /// A buffer holding a copy of `data`.
         pub fn buffer_from<T: Copy>(&self, data: &[T]) -> Buffer {
             self.device.new_buffer_with_data(
@@ -249,6 +299,12 @@ mod mac {
                 })
                 .clone();
             (buffer, (start - page_start) as u64)
+        }
+
+        /// Bytes of all the no-copy buffers, which `current_allocated_size`
+        /// counts too.
+        pub fn no_copy_bytes(&self) -> u64 {
+            self.no_copy.borrow().values().map(|b| b.length()).sum()
         }
 
         /// Maps a file read-only and wraps it as a buffer. Kernels must not
