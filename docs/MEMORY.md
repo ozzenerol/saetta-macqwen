@@ -3,7 +3,7 @@
 The weights (about 25 GB) are mmapped from the model files. They are clean file pages, so macOS can drop them and read them again, and several saetta processes share them. Everything else `saetta serve --gpu` allocates is fixed when it starts, except the KV caches, which grow with the context, and the prompt cache snapshots. At start it prints the buffers of each part and the range:
 
 ```
-GPU buffers besides the weights (23309 MB of no-copy views): model 244, prefill 520, verify 276, MTP 20 MB
+GPU buffers besides the weights (23309 MB of no-copy views): model 244, prefill 407, verify 276, MTP 20 MB
 memory besides the weights: KV 160 MB for the first 8192 tokens, growing to 5120 MB at 262144 (20 KB a token), prompt cache 1005 MB (16 snapshots of 62 MB) plus 320 MB of KV rows, 1485 to 6445 MB in all
 ```
 
