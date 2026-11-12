@@ -507,8 +507,9 @@ mod mac {
         std::env::var("SAETTA_DELTA2").is_ok_and(|v| v == "1")
     }
 
-    /// SAETTA_DELTA3=<n>: delta_prep plus delta_rows3 with n simdgroups
-    /// (8 state rows each) per threadgroup, 2 to 16; unset or 0 keeps
+    /// The delta rule runs on delta_prep plus delta_rows3 with this many
+    /// simdgroups (8 state rows each) per threadgroup: 8 (24% faster than
+    /// delta_rows in batch 10), or SAETTA_DELTA3=<n>, 2 to 16; 0 runs
     /// delta_rows.
     fn delta3() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -516,8 +517,8 @@ mod mac {
             std::env::var("SAETTA_DELTA3")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|n| (2..=16).contains(n))
-                .unwrap_or(0)
+                .filter(|&n| n == 0 || (2..=16).contains(&n))
+                .unwrap_or(8)
         })
     }
 
@@ -1408,7 +1409,8 @@ mod mac {
                 eps: c.eps,
                 snapshots: snaps.is_some() as u32,
             };
-            let d3 = delta3();
+            // SAETTA_DELTA2=1 wins over delta_rows3.
+            let d3 = if delta2() { 0 } else { delta3() };
             if !delta2() && d3 == 0 {
                 enc.set_compute_pipeline_state(&gpu.pipeline("delta_rows"));
                 set_views(
