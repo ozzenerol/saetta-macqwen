@@ -231,11 +231,13 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
 
 #define QMM2(name, bits, bm, bn, tm, tn, db) \
     template [[host_name(name)]] kernel decltype(qmm2<bits, bm, bn, tm, tn, db>) qmm2<bits, bm, bn, tm, tn, db>;
-#define QMM2_SUB(name, bits, sub) \
-    template [[host_name(name)]] kernel decltype(qmm2<bits, 32, 128, 32, 32, false, sub>) \
-        qmm2<bits, 32, 128, 32, 32, false, sub>;
-QMM2_SUB("qmm2_32x2_5bit", 5, 2)
-QMM2_SUB("qmm2_32x2_8bit", 8, 2)
+#define QMM2_SUB(name, bits, db, sub) \
+    template [[host_name(name)]] kernel decltype(qmm2<bits, 32, 128, 32, 32, db, sub>) \
+        qmm2<bits, 32, 128, 32, 32, db, sub>;
+QMM2_SUB("qmm2_32x2_5bit", 5, false, 2)
+QMM2_SUB("qmm2_32x2_8bit", 8, false, 2)
+QMM2_SUB("qmm2_32x2_db_5bit", 5, true, 2)
+QMM2_SUB("qmm2_32x2_db_8bit", 8, true, 2)
 QMM2("qmm2_5bit", 5, 64, 64, 32, 32, false)
 QMM2("qmm2_8bit", 8, 64, 64, 32, 32, false)
 QMM2("qmm2_db_5bit", 5, 64, 64, 32, 32, true)
