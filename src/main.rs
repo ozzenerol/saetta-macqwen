@@ -276,7 +276,7 @@ impl Default for Memory {
             context: 262144,
             // 15 f16 snapshots.
             cache_bytes: 512 << 20,
-            kv_bits: KvBits::Eight,
+            kv_bits: KvBits::Half,
             cache_idle: Some(std::time::Duration::from_secs(15 * 60)),
             half_snapshots: true,
         }

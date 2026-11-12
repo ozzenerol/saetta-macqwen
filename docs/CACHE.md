@@ -49,8 +49,8 @@ The KV cache of each attention layer starts at 32768 tokens, doubles as a conver
 
 Bytes per token over the 10 attention layers, keys and values of 2 heads of 256:
 
-- half (`--kv-bits 16`): 20 KB, 5.2 GB at 262144 tokens
-- 8 bits (`--kv-bits 8`, the default): 10.9 KB, 2.8 GB
+- half (`--kv-bits 16`, the default): 20 KB, 5.2 GB at 262144 tokens
+- 8 bits (`--kv-bits 8`): 10.9 KB, 2.8 GB
 - 4 bits (`--kv-bits 4`): 5.8 KB, 1.5 GB
 
 The 8- and 4-bit formats are MLX's: groups of 64 values with a half scale and bias, x = s * q + z (`src/kv_quant.rs`, `kernels/kv_quant.metal`). The rounding error is about step / sqrt(12) of a group: 5.5e-3 of the values' RMS at 8 bits, 9e-2 at 4 bits, against 2.4e-4 for half. Prefill and decode read the codes in place: prefill stages each block of keys and values as half in threadgroup memory (`kernels/attention_rows_q.metal`), decode dequantizes in registers (`attention_partial_mma_q8` and `_q4`); `saetta bench-decode <dir> <context> 8` times it.
