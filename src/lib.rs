@@ -14,6 +14,7 @@ pub mod gpu_model;
 pub mod gpu_mtp;
 pub mod gpu_verify;
 pub mod kv_quant;
+pub mod memtrace;
 pub mod moe;
 pub mod mtp;
 pub mod plan;

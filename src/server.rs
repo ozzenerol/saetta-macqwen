@@ -324,6 +324,7 @@ impl<M: Model + 'static> Server<M> {
         mut emit: impl FnMut(Event) -> bool,
     ) -> Done {
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let _trace = crate::memtrace::Span::new("request");
         let held = engine.tokens.clone();
         let spliced = match engine.last.take() {
             Some(last) if !self.settings.exact_history => self.splice(&last, &held, r),
