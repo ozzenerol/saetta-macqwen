@@ -901,6 +901,192 @@ kernel void delta_rows2(device const float *mixed [[buffer(0)]],
     }
 }
 
+// delta_rows on the output of delta_prep, with the q and k of each block of
+// DR3_TB tokens loaded once per threadgroup into threadgroup memory instead
+// of by every simdgroup: the rows of a value head all read the same q and k.
+// Lanes as in delta_rows (four per state row, 32 values each, 8 rows per
+// simdgroup); the next block is loaded into registers while this one runs.
+// Needs k_dim 128 and at least 2 simdgroups per threadgroup.
+constant uint DR3_TB = 8;
+
+kernel void delta_rows3(device const float *mixed [[buffer(0)]],
+                        device const float *g [[buffer(1)]],
+                        device const float *beta [[buffer(2)]],
+                        device float *state [[buffer(5)]],
+                        device float *y [[buffer(6)]],
+                        constant DeltaRowsParams &p [[buffer(7)]],
+                        device float *snaps [[buffer(8)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint simd [[simdgroup_index_in_threadgroup]],
+                        uint simds [[simdgroups_per_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint K_DIM = 128;
+    constexpr uint PER = 32;
+    constexpr uint F4 = 2 * K_DIM / 4;  // float4s of q and k per token
+    constexpr uint MAX_PER_THREAD = DR3_TB * F4 / 64;
+    threadgroup float4 qk[2][DR3_TB][F4];
+    threadgroup float gb[2][DR3_TB][2];
+
+    uint h = tg.y;
+    uint row = (tg.x * simds + simd) * 8 + lane / 4;
+    uint part = lane % 4;
+    bool live = row < p.v_dim;
+    uint kh = h / (p.v_heads / p.k_heads);
+    uint key_size = p.k_heads * K_DIM;
+    uint value_size = p.v_heads * p.v_dim;
+    uint threads = simds * 32;
+
+    device float *sp = state + (ulong(h) * p.v_dim + (live ? row : 0)) * K_DIM + part * PER;
+    float st[PER];
+    for (uint i = 0; i < PER; i++) {
+        st[i] = live ? sp[i] : 0;
+    }
+
+    // Thread tid loads float4s tid, tid + threads, ... of the block: token
+    // e / F4, q for e % F4 < 32, else k.
+    float4 nqk[MAX_PER_THREAD];
+    float ngb[2] = {0, 0};
+    float nv[DR3_TB];
+    device const float *vp = mixed + 2 * key_size + h * p.v_dim + (live ? row : 0);
+    uint t0 = 0;
+    {
+#pragma clang loop unroll(full)
+        for (uint j = 0; j < MAX_PER_THREAD; j++) {
+            uint e = tid + j * threads;
+            uint t = t0 + e / F4, f = e % F4;
+            nqk[j] = float4(0);
+            if (e < DR3_TB * F4 && t < p.tokens) {
+                uint off = f < F4 / 2 ? kh * K_DIM + 4 * f : key_size + kh * K_DIM + 4 * (f - F4 / 2);
+                nqk[j] = *(device const float4 *)(mixed + ulong(t) * p.channels + off);
+            }
+        }
+        if (tid < DR3_TB && t0 + tid < p.tokens) {
+            ngb[0] = g[(t0 + tid) * p.v_heads + h];
+            ngb[1] = beta[(t0 + tid) * p.v_heads + h];
+        }
+#pragma clang loop unroll(full)
+        for (uint i = 0; i < DR3_TB; i++) {
+            nv[i] = live && t0 + i < p.tokens ? vp[ulong(t0 + i) * p.channels] : 0;
+        }
+    }
+
+    uint cur = 0;
+    // Store the loaded block into buffer `cur`.
+#pragma clang loop unroll(full)
+    for (uint j = 0; j < MAX_PER_THREAD; j++) {
+        uint e = tid + j * threads;
+        if (e < DR3_TB * F4) {
+            qk[cur][e / F4][e % F4] = nqk[j];
+        }
+    }
+    if (tid < DR3_TB) {
+        gb[cur][tid][0] = ngb[0];
+        gb[cur][tid][1] = ngb[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (t0 = 0; t0 < p.tokens; t0 += DR3_TB) {
+        float v[DR3_TB];
+        for (uint i = 0; i < DR3_TB; i++) {
+            v[i] = nv[i];
+        }
+        uint next = t0 + DR3_TB;
+        bool more = next < p.tokens;
+        if (more) {
+#pragma clang loop unroll(full)
+            for (uint j = 0; j < MAX_PER_THREAD; j++) {
+                uint e = tid + j * threads;
+                uint t = next + e / F4, f = e % F4;
+                nqk[j] = float4(0);
+                if (e < DR3_TB * F4 && t < p.tokens) {
+                    uint off = f < F4 / 2 ? kh * K_DIM + 4 * f : key_size + kh * K_DIM + 4 * (f - F4 / 2);
+                    nqk[j] = *(device const float4 *)(mixed + ulong(t) * p.channels + off);
+                }
+            }
+            if (tid < DR3_TB && next + tid < p.tokens) {
+                ngb[0] = g[(next + tid) * p.v_heads + h];
+                ngb[1] = beta[(next + tid) * p.v_heads + h];
+            }
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < DR3_TB; i++) {
+                nv[i] = live && next + i < p.tokens ? vp[ulong(next + i) * p.channels] : 0;
+            }
+        }
+
+        if (live) {
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < DR3_TB; i++) {
+                uint t = t0 + i;
+                if (t >= p.tokens) {
+                    continue;
+                }
+                threadgroup const float4 *qv = qk[cur][i] + part * (PER / 4);
+                threadgroup const float4 *kv = qk[cur][i] + F4 / 2 + part * (PER / 4);
+                float gt = gb[cur][i][0], bt = gb[cur][i][1];
+                float mem = 0;
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < PER / 4; j++) {
+                    float4 k4 = kv[j];
+                    float4 s4 = float4(st[4 * j], st[4 * j + 1], st[4 * j + 2], st[4 * j + 3]) * gt;
+                    st[4 * j] = s4.x;
+                    st[4 * j + 1] = s4.y;
+                    st[4 * j + 2] = s4.z;
+                    st[4 * j + 3] = s4.w;
+                    mem += dot(s4, k4);
+                }
+                mem += simd_shuffle_xor(mem, 1);
+                mem += simd_shuffle_xor(mem, 2);
+                float delta = (v[i] - mem) * bt;
+                float out = 0;
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < PER / 4; j++) {
+                    float4 s4 = float4(st[4 * j], st[4 * j + 1], st[4 * j + 2], st[4 * j + 3]) +
+                                kv[j] * delta;
+                    st[4 * j] = s4.x;
+                    st[4 * j + 1] = s4.y;
+                    st[4 * j + 2] = s4.z;
+                    st[4 * j + 3] = s4.w;
+                    out += dot(s4, qv[j]);
+                }
+                out += simd_shuffle_xor(out, 1);
+                out += simd_shuffle_xor(out, 2);
+                if (part == 0) {
+                    y[ulong(t) * value_size + h * p.v_dim + row] = out;
+                }
+                if (p.snapshots) {
+                    device float *snap = snaps + ulong(t) * p.v_heads * p.v_dim * K_DIM +
+                                         (ulong(h) * p.v_dim + row) * K_DIM + part * PER;
+                    for (uint j = 0; j < PER; j++) {
+                        snap[j] = st[j];
+                    }
+                }
+            }
+        }
+
+        if (more) {
+#pragma clang loop unroll(full)
+            for (uint j = 0; j < MAX_PER_THREAD; j++) {
+                uint e = tid + j * threads;
+                if (e < DR3_TB * F4) {
+                    qk[cur ^ 1][e / F4][e % F4] = nqk[j];
+                }
+            }
+            if (tid < DR3_TB) {
+                gb[cur ^ 1][tid][0] = ngb[0];
+                gb[cur ^ 1][tid][1] = ngb[1];
+            }
+        }
+        cur ^= 1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (live) {
+        for (uint i = 0; i < PER; i++) {
+            sp[i] = st[i];
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Causal attention of T new tokens over the KV cache, which already holds
 // them at positions pos .. pos + T - 1. A simdgroup takes 8 query tokens of
