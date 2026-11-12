@@ -1,6 +1,6 @@
 """Times MLX's prefill blocks one at a time on real hidden states, so
 saetta's profile-prefill lines can be compared block by block: the MoE
-(and its router alone), a Gated DeltaNet mixer, a full attention mixer and
+(and its router alone), each linear of the mixers alone, a Gated DeltaNet mixer, a full attention mixer and
 whole layers, for chunks of T tokens at position 0.
 
 The hidden states come from running the first T tokens of
@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from mlx_lm import load
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
@@ -37,6 +38,29 @@ def timed(f):
         mx.synchronize()
         out.append(time.perf_counter() - start)
     return statistics.median(out) * 1e3
+
+
+def in_features(m):
+    if isinstance(m, nn.QuantizedLinear):
+        return m.weight.shape[1] * 32 // m.bits
+    return m.weight.shape[1]
+
+
+def linears(mixer, xn):
+    """Times each linear of a mixer alone: the ones that take the normed
+    input on xn, the others on random rows of their input width."""
+    out = {}
+    for name, m in mixer.children().items():
+        if not isinstance(m, (nn.Linear, nn.QuantizedLinear)):
+            continue
+        width = in_features(m)
+        if width == xn.shape[-1]:
+            x = xn
+        else:
+            x = (mx.random.normal((1, xn.shape[1], width)) * 0.05).astype(xn.dtype)
+            mx.eval(x)
+        out[name] = timed(lambda m=m, x=x: m(x))
+    return out
 
 
 def mask_for(layer, h, cache):
@@ -75,6 +99,8 @@ def blocks(model, text, tokens):
             return layer(h, mask=mask_for(layer, h, cache), cache=cache)
 
         res[f"{name} mixer (layer {i})"] = timed(run_mixer)
+        for part, ms in linears(mixer, xn).items():
+            res[f"  {name} {part}"] = ms
         res[f"moe (layer {i})"] = timed(lambda: layer.mlp(mn))
         gate = getattr(layer.mlp, "gate", None)
         if gate is not None:
