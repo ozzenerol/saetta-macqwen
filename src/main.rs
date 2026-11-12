@@ -534,6 +534,7 @@ fn load_gpu(
         last_blit: RefCell::new(None),
         drafting: spec,
         rows: saetta::gpu_cache::RowBackup::new(),
+        decoded: 0,
     })
 }
 
@@ -645,6 +646,19 @@ struct GpuServed {
     drafting: Option<Drafting>,
     /// KV rows kept aside during a detour (cache::Restore::backup_rows).
     rows: saetta::gpu_cache::RowBackup,
+    /// Decode calls since the last prefill, for SAETTA_MEM_TRACE.
+    decoded: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl GpuServed {
+    /// SAETTA_MEM_TRACE: marks decode calls 1, 2, 4, 8, ... after a prefill.
+    fn trace_decode(&mut self) {
+        self.decoded += 1;
+        if self.decoded.is_power_of_two() {
+            saetta::memtrace::mark(&format!("decode call {}", self.decoded));
+        }
+    }
 }
 
 /// The KV cache of each attention layer.
@@ -742,6 +756,8 @@ impl server::Model for GpuServed {
         if tokens.is_empty() {
             return Vec::new();
         }
+        self.decoded = 0;
+        saetta::memtrace::mark(&format!("prefill {} tokens at {}", tokens.len(), m.position()));
         // The prefill writes the KV rows of all the tokens, and the MTP cache
         // never holds more entries than the model has tokens.
         let need = m.position() + tokens.len();
@@ -808,10 +824,12 @@ impl server::Model for GpuServed {
             secs * 1e3 / tokens.len() as f64,
             m.gpu().device.current_allocated_size() >> 20
         );
+        saetta::memtrace::mark("prefill done");
         logits
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
+        self.trace_decode();
         match &mut self.drafting {
             Some(d) => d.spec.step(&mut self.model, token),
             None => self.model.forward(token),
@@ -823,6 +841,7 @@ impl server::Model for GpuServed {
         pending: u32,
         decide: &mut dyn saetta::speculative::Decider,
     ) -> (Vec<u32>, u32) {
+        self.trace_decode();
         match &mut self.drafting {
             Some(d) => d.spec.speculate(&mut self.model, pending, decide),
             None => match decide.sampling() {
@@ -869,6 +888,7 @@ impl Restore for GpuServed {
         let m = &self.model;
         let (snapshot, blit) = saetta::gpu_cache::save(m.gpu(), &self.pool, &m.deltanet_states());
         *self.last_blit.borrow_mut() = Some(blit);
+        saetta::memtrace::mark("snapshot saved");
         let last = self
             .drafting
             .as_ref()
