@@ -4,6 +4,9 @@
 //! saved and freed when it is dropped. The KV caches are not copied: going
 //! back only sets the model position.
 //!
+//! With `SnapshotPool::half`, a snapshot holds the states in f16, half the
+//! memory, written and read with a conversion kernel instead of a blit.
+//!
 //! The copies are committed without waiting. Work committed after them on
 //! the same queue runs after them, so the next token sees the copied state.
 
@@ -12,7 +15,7 @@ pub use mac::*;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use crate::gpu::Gpu;
+    use crate::gpu::{Gpu, dispatch_1d};
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache};
     use metal::{Buffer, CommandBuffer, Device, MTLResourceOptions};
     use std::sync::Arc;
@@ -27,11 +30,14 @@ mod mac {
         size: u64,
         limit: usize,
         live: Arc<AtomicUsize>,
+        /// States are stored in f16.
+        half: bool,
     }
 
     pub struct GpuSnapshot {
         buffer: Buffer,
         live: Arc<AtomicUsize>,
+        half: bool,
     }
 
     impl Drop for GpuSnapshot {
@@ -60,7 +66,18 @@ mod mac {
                     .sum(),
                 limit: count,
                 live: Arc::new(AtomicUsize::new(0)),
+                half: false,
             }
+        }
+
+        /// Stores the states in f16: half the bytes per snapshot. The states
+        /// are f32, so a restore starts from rounded states.
+        pub fn half(mut self, half: bool) -> SnapshotPool {
+            if half != self.half {
+                self.size = if half { self.size / 2 } else { self.size * 2 };
+                self.half = half;
+            }
+            self
         }
 
         /// Bytes per snapshot.
@@ -90,18 +107,24 @@ mod mac {
                     .device
                     .new_buffer(self.size, MTLResourceOptions::StorageModePrivate),
                 live: Arc::clone(&self.live),
+                half: self.half,
             }
         }
     }
 
-    /// Each state buffer with its offset in a snapshot.
-    fn layout<'a>(layers: &[&'a GpuDeltaNetState]) -> Vec<(&'a Buffer, u64)> {
+    /// Each state buffer with its offset in a snapshot, in bytes of the
+    /// snapshot (half of the state's bytes with `half`).
+    fn layout<'a>(layers: &[&'a GpuDeltaNetState], half: bool) -> Vec<(&'a Buffer, u64)> {
         let mut offset = 0;
         let mut out = Vec::new();
         for state in layers {
             for buffer in [&state.conv, &state.recurrent] {
                 out.push((buffer, offset));
-                offset += buffer.length();
+                offset += if half {
+                    buffer.length() / 2
+                } else {
+                    buffer.length()
+                };
             }
         }
         out
@@ -115,11 +138,26 @@ mod mac {
         layers: &[&GpuDeltaNetState],
     ) -> (GpuSnapshot, CommandBuffer) {
         let snapshot = pool.take();
-        let commands = gpu.blit(|blit| {
-            for (buffer, offset) in layout(layers) {
-                blit.copy_from_buffer(buffer, 0, snapshot.buffer(), offset, buffer.length());
-            }
-        });
+        let commands = if snapshot.half {
+            gpu.commit(|enc| {
+                let pipeline = gpu.pipeline("to_half");
+                for (buffer, offset) in layout(layers, true) {
+                    let floats = buffer.length() as usize / 4;
+                    dispatch_1d(
+                        enc,
+                        &pipeline,
+                        &[(buffer, 0), (snapshot.buffer(), offset)],
+                        floats,
+                    );
+                }
+            })
+        } else {
+            gpu.blit(|blit| {
+                for (buffer, offset) in layout(layers, false) {
+                    blit.copy_from_buffer(buffer, 0, snapshot.buffer(), offset, buffer.length());
+                }
+            })
+        };
         (snapshot, commands)
     }
 
@@ -130,8 +168,22 @@ mod mac {
         snapshot: &GpuSnapshot,
         layers: &[&GpuDeltaNetState],
     ) -> CommandBuffer {
+        if snapshot.half {
+            return gpu.commit(|enc| {
+                let pipeline = gpu.pipeline("from_half");
+                for (buffer, offset) in layout(layers, true) {
+                    let floats = buffer.length() as usize / 4;
+                    dispatch_1d(
+                        enc,
+                        &pipeline,
+                        &[(snapshot.buffer(), offset), (buffer, 0)],
+                        floats,
+                    );
+                }
+            });
+        }
         gpu.blit(|blit| {
-            for (buffer, offset) in layout(layers) {
+            for (buffer, offset) in layout(layers, false) {
                 blit.copy_from_buffer(snapshot.buffer(), offset, buffer, 0, buffer.length());
             }
         })
@@ -361,6 +413,149 @@ mod mac {
             assert!(same_bits(&got, &want), "logits differ after the detour");
         }
 
+        fn log_softmax(x: &[f32]) -> Vec<f64> {
+            let max = x.iter().copied().fold(f32::MIN, f32::max) as f64;
+            let sum: f64 = x.iter().map(|&v| (v as f64 - max).exp()).sum();
+            x.iter().map(|&v| v as f64 - max - sum.ln()).collect()
+        }
+
+        /// KL(p || q) of the distributions of two logit vectors.
+        fn kl(p: &[f32], q: &[f32]) -> f64 {
+            let (lp, lq) = (log_softmax(p), log_softmax(q));
+            lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
+        }
+
+        fn argmax(x: &[f32]) -> usize {
+            (0..x.len()).max_by(|&a, &b| x[a].total_cmp(&x[b])).unwrap()
+        }
+
+        /// This repo's docs and sources, as real text for the model.
+        fn repo_text() -> String {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let mut paths = Vec::new();
+            for dir in ["docs", "src"] {
+                for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.extension().is_some_and(|e| e == "md" || e == "rs") {
+                        paths.push(path);
+                    }
+                }
+            }
+            paths.sort();
+            paths
+                .iter()
+                .map(|p| std::fs::read_to_string(p).unwrap())
+                .collect()
+        }
+
+        /// f16 snapshots (`--half-snapshots`): the logits after restoring
+        /// f16 states against a run without restores, over the whole model,
+        /// at 4k and 32k of context (SAETTA_HALF_CTX=4096,32768) of this
+        /// repo's docs and sources. Each of 4 rounds saves, runs a detour,
+        /// restores and reads 16 more tokens of the text, so the rounding
+        /// compounds as over the turns of a qh session. It compares f16
+        /// against f32 snapshots on the same path, and both against the
+        /// straight run, and passes when all three meet the quality gate:
+        /// median KL < 1e-3, top-1 >= 90%.
+        #[test]
+        #[ignore = "needs the whole model on the GPU"]
+        fn half_snapshot_error() {
+            use crate::prefill::{Prefill, exact_from_env};
+            const ROUNDS: usize = 4;
+            const PER_ROUND: usize = 16;
+            const DETOUR: [u32; 4] = [12345, 678, 9012, 3456];
+            let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+            let (cfg, weights) = open();
+            let tokenizer = crate::tokenizer::Tokenizer::load(&dir).unwrap();
+            let text = tokenizer.encode(&repo_text());
+            let contexts: Vec<usize> = std::env::var("SAETTA_HALF_CTX")
+                .unwrap_or_else(|_| "4096,32768".into())
+                .split(',')
+                .map(|c| c.trim().parse().unwrap())
+                .collect();
+            let gpu = Gpu::new().unwrap();
+            let mut prefill = Prefill::new(&gpu, &cfg, &weights, 2048).unwrap();
+            prefill.exact = exact_from_env();
+            let mut failed = Vec::new();
+            for &ctx in &contexts {
+                let n = ctx + ROUNDS * PER_ROUND;
+                let tokens: Vec<u32> = text.iter().copied().cycle().take(n).collect();
+                let (prompt, forced) = tokens.split_at(ctx);
+                let mut m = GpuModel::load(&gpu, &cfg, &weights, cfg.num_layers(), n + 64).unwrap();
+                let fill = |m: &mut GpuModel| {
+                    m.reset();
+                    m.reserve(n + DETOUR.len());
+                    let states: Vec<_> = m.states().collect();
+                    prefill.run(&gpu, prompt, 0, &states);
+                    m.set_position(ctx);
+                };
+                fill(&mut m);
+                let want: Vec<Vec<f32>> = forced.iter().map(|&t| m.forward(t)).collect();
+                // Whether a straight run repeats bit for bit, to tell apart
+                // differences of the restores from those of the runs.
+                fill(&mut m);
+                let again = forced
+                    .iter()
+                    .all(|&t| same_bits(&m.forward(t), &want[m.position() - ctx - 1]));
+                println!("{ctx}: a second straight run matches bit for bit: {again}");
+                let mut runs = Vec::new();
+                for half in [false, true] {
+                    fill(&mut m);
+                    let pool = SnapshotPool::new(&gpu, &m.deltanet_states(), 2).half(half);
+                    let mut got = Vec::new();
+                    for round in forced.chunks(PER_ROUND) {
+                        let (snapshot, copy) = save(&gpu, &pool, &m.deltanet_states());
+                        copy.wait_until_completed();
+                        let pos = m.position();
+                        for &t in &DETOUR {
+                            m.run(t);
+                        }
+                        restore(&gpu, &snapshot, &m.deltanet_states()).wait_until_completed();
+                        m.set_position(pos);
+                        got.extend(round.iter().map(|&t| m.forward(t)));
+                    }
+                    runs.push(got);
+                }
+                let (f32s, f16s) = (&runs[0], &runs[1]);
+                let exact = f32s.iter().zip(&want).all(|(g, w)| same_bits(g, w));
+                println!("{ctx}: f32 snapshots match the straight run bit for bit: {exact}");
+                // f32 against the straight run checks restores themselves;
+                // f16 against f32 is the same path, so only the rounding of
+                // the states differs.
+                for (name, got, base) in [
+                    ("f32 snapshots vs the straight run", f32s, &want),
+                    ("f16 vs f32 snapshots", f16s, f32s),
+                    ("f16 snapshots vs the straight run", f16s, &want),
+                ] {
+                    let mut kls: Vec<f64> = got.iter().zip(base).map(|(g, w)| kl(w, g)).collect();
+                    let top1 = got
+                        .iter()
+                        .zip(base)
+                        .filter(|(g, w)| argmax(g) == argmax(w))
+                        .count() as f64
+                        / got.len() as f64;
+                    let rounds: Vec<String> = kls
+                        .chunks(PER_ROUND)
+                        .map(|k| format!("{:.2e}", k.iter().copied().fold(0.0, f64::max)))
+                        .collect();
+                    kls.sort_by(f64::total_cmp);
+                    let (median, max) = (kls[kls.len() / 2], kls[kls.len() - 1]);
+                    println!(
+                        "{ctx} tokens, {name}: median KL {median:.2e}, max {max:.2e}, top-1 {:.1}% over {} tokens, max KL by round {}",
+                        top1 * 100.0,
+                        kls.len(),
+                        rounds.join(" ")
+                    );
+                    if median >= 1e-3 || top1 < 0.9 {
+                        failed.push(format!(
+                            "{ctx}, {name}: median KL {median:.2e}, top-1 {top1:.2}"
+                        ));
+                    }
+                }
+            }
+            assert!(failed.is_empty(), "{failed:?}");
+        }
+
         /// Times save and restore of the 30 DeltaNet states of the 35B model,
         /// on stand-in buffers of the real sizes.
         #[test]
@@ -373,44 +568,49 @@ mod mac {
                 .map(|_| GpuDeltaNetState::new(&gpu, &dcfg))
                 .collect();
             let layers: Vec<&GpuDeltaNetState> = states.iter().collect();
-            let pool = SnapshotPool::new(&gpu, &layers, 17);
-            println!("snapshot size {:.1} MB", pool.size() as f64 / 1e6);
+            for half in [false, true] {
+                let pool = SnapshotPool::new(&gpu, &layers, 17).half(half);
+                println!(
+                    "half {half}: snapshot size {:.1} MB",
+                    pool.size() as f64 / 1e6
+                );
 
-            // Every save makes a new buffer, so the times include mapping
-            // its memory on first use, as in the server.
-            let runs = 20;
-            let (mut save_cpu, mut save_all, mut restore_cpu, mut restore_all) =
-                (0.0, 0.0, 0.0, 0.0);
-            let mut kept = Vec::new();
-            for _ in 0..runs {
-                let start = Instant::now();
-                let (snapshot, commands) = save(&gpu, &pool, &layers);
-                save_cpu += start.elapsed().as_secs_f64();
-                commands.wait_until_completed();
-                save_all += start.elapsed().as_secs_f64();
+                // Every save makes a new buffer, so the times include mapping
+                // its memory on first use, as in the server.
+                let runs = 20;
+                let (mut save_cpu, mut save_all, mut restore_cpu, mut restore_all) =
+                    (0.0, 0.0, 0.0, 0.0);
+                let mut kept = Vec::new();
+                for _ in 0..runs {
+                    let start = Instant::now();
+                    let (snapshot, commands) = save(&gpu, &pool, &layers);
+                    save_cpu += start.elapsed().as_secs_f64();
+                    commands.wait_until_completed();
+                    save_all += start.elapsed().as_secs_f64();
 
-                let start = Instant::now();
-                let commands = restore(&gpu, &snapshot, &layers);
-                restore_cpu += start.elapsed().as_secs_f64();
-                commands.wait_until_completed();
-                restore_all += start.elapsed().as_secs_f64();
-                kept.push(snapshot);
-                if kept.len() > 16 {
-                    kept.remove(0);
+                    let start = Instant::now();
+                    let commands = restore(&gpu, &snapshot, &layers);
+                    restore_cpu += start.elapsed().as_secs_f64();
+                    commands.wait_until_completed();
+                    restore_all += start.elapsed().as_secs_f64();
+                    kept.push(snapshot);
+                    if kept.len() > 16 {
+                        kept.remove(0);
+                    }
                 }
+                let ms = |s: f64| s * 1e3 / runs as f64;
+                println!(
+                    "save: {:.3} ms to encode and commit, {:.3} ms until done ({runs} runs)",
+                    ms(save_cpu),
+                    ms(save_all)
+                );
+                println!(
+                    "restore: {:.3} ms to encode and commit, {:.3} ms until done ({runs} runs)",
+                    ms(restore_cpu),
+                    ms(restore_all)
+                );
+                assert_eq!(kept.len() + pool.free_count(), 17);
             }
-            let ms = |s: f64| s * 1e3 / runs as f64;
-            println!(
-                "save: {:.3} ms to encode and commit, {:.3} ms until done ({runs} runs)",
-                ms(save_cpu),
-                ms(save_all)
-            );
-            println!(
-                "restore: {:.3} ms to encode and commit, {:.3} ms until done ({runs} runs)",
-                ms(restore_cpu),
-                ms(restore_all)
-            );
-            assert_eq!(kept.len() + pool.free_count(), 17);
         }
     }
 }
