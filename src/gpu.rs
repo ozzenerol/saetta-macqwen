@@ -68,6 +68,86 @@ mod mac {
         /// range, switching between them does not make Metal change which
         /// 20 GB is resident, which took about 250 ms each way.
         no_copy: RefCell<HashMap<(usize, usize), Buffer>>,
+        /// Keeps the weights resident between requests (see `Residency`).
+        residency: Option<Residency>,
+    }
+
+    /// An MTLResidencySet (macOS 15) with every no-copy weight buffer,
+    /// attached to the queue. Without it the driver drops the residency of
+    /// the 20 GB of weights a few seconds after the GPU goes idle, and the
+    /// next prefill pays 10 to 17 ms a layer to make them resident again
+    /// (about 0.55 s for a qh turn). `SAETTA_RESIDENCY=0` turns it off.
+    struct Residency {
+        set: *mut metal::objc::runtime::Object,
+        /// Allocations were added since the last commit.
+        dirty: std::cell::Cell<bool>,
+    }
+
+    // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+    #[allow(unexpected_cfgs)]
+    impl Residency {
+        fn new(device: &Device, queue: &CommandQueue) -> Option<Residency> {
+            use metal::foreign_types::ForeignType;
+            use metal::objc::runtime::{Class, Object, BOOL, NO};
+            use metal::objc::{class, msg_send, sel, sel_impl};
+            if std::env::var("SAETTA_RESIDENCY").is_ok_and(|v| v == "0") {
+                return None;
+            }
+            unsafe {
+                let device = device.as_ptr() as *mut Object;
+                let queue = queue.as_ptr() as *mut Object;
+                let ok: BOOL = msg_send![device, respondsToSelector: sel!(newResidencySetWithDescriptor:error:)];
+                if ok == NO || Class::get("MTLResidencySetDescriptor").is_none() {
+                    eprintln!("no residency sets before macOS 15; weights may go cold between requests");
+                    return None;
+                }
+                let desc: *mut Object = msg_send![class!(MTLResidencySetDescriptor), new];
+                let mut error: *mut Object = std::ptr::null_mut();
+                let set: *mut Object =
+                    msg_send![device, newResidencySetWithDescriptor: desc error: &mut error];
+                let _: () = msg_send![desc, release];
+                if set.is_null() {
+                    eprintln!("could not make a residency set");
+                    return None;
+                }
+                let _: () = msg_send![queue, addResidencySet: set];
+                Some(Residency { set, dirty: std::cell::Cell::new(false) })
+            }
+        }
+
+        fn add(&self, buffer: &Buffer) {
+            use metal::foreign_types::ForeignType;
+            use metal::objc::runtime::Object;
+            use metal::objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let _: () = msg_send![self.set, addAllocation: buffer.as_ptr() as *mut Object];
+            }
+            self.dirty.set(true);
+        }
+
+        /// Commits added allocations and asks for them to stay resident.
+        fn commit(&self) {
+            use metal::objc::{msg_send, sel, sel_impl};
+            if !self.dirty.replace(false) {
+                return;
+            }
+            unsafe {
+                let _: () = msg_send![self.set, commit];
+                let _: () = msg_send![self.set, requestResidency];
+            }
+        }
+    }
+
+    // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+    #[allow(unexpected_cfgs)]
+    impl Drop for Residency {
+        fn drop(&mut self) {
+            use metal::objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let _: () = msg_send![self.set, endResidency];
+                let _: () = msg_send![self.set, release];
+            }
+        }
     }
 
     /// A file mapped into memory and wrapped as a GPU buffer without a copy.
@@ -90,12 +170,14 @@ mod mac {
                 .new_library_with_source(KERNELS, &CompileOptions::new())
                 .map_err(|e| format!("kernel compile failed: {e}"))?;
             let queue = device.new_command_queue();
+            let residency = Residency::new(&device, &queue);
             Ok(Gpu {
                 device,
                 queue,
                 library,
                 pipelines: RefCell::new(HashMap::new()),
                 no_copy: RefCell::new(HashMap::new()),
+                residency,
             })
         }
 
@@ -154,12 +236,16 @@ mod mac {
                 .borrow_mut()
                 .entry((page_start, page_end))
                 .or_insert_with(|| {
-                    self.device.new_buffer_with_bytes_no_copy(
+                    let buffer = self.device.new_buffer_with_bytes_no_copy(
                         page_start as *const std::ffi::c_void,
                         (page_end - page_start) as u64,
                         OPTIONS,
                         None,
-                    )
+                    );
+                    if let Some(r) = &self.residency {
+                        r.add(&buffer);
+                    }
+                    buffer
                 })
                 .clone();
             (buffer, (start - page_start) as u64)
@@ -213,6 +299,7 @@ mod mac {
             encode: impl FnOnce(&ComputeCommandEncoderRef),
         ) -> (Duration, f64) {
             use metal::objc::{msg_send, sel, sel_impl};
+            self.commit_residency();
             let commands = self.queue.new_command_buffer();
             let encoder = commands.compute_command_encoder_with_dispatch_type(dispatch);
             encode(encoder);
@@ -257,11 +344,20 @@ mod mac {
     }
 
     impl Gpu {
+        /// Commits weight buffers added since the last command buffer to
+        /// the residency set.
+        fn commit_residency(&self) {
+            if let Some(r) = &self.residency {
+                r.commit();
+            }
+        }
+
         /// Encodes buffer copies and commits them without waiting. Work
         /// committed later on the queue runs after the copies, so callers
         /// only wait (on the returned command buffer) to time them.
         pub fn blit(&self, encode: impl FnOnce(&BlitCommandEncoderRef)) -> CommandBuffer {
             metal::objc::rc::autoreleasepool(|| {
+                self.commit_residency();
                 let commands = self.queue.new_command_buffer().to_owned();
                 let encoder = commands.new_blit_command_encoder();
                 encode(encoder);
