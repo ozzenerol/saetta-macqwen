@@ -294,25 +294,17 @@ mod mac {
         u: &View,
         g_half: &View,
         g: &Grouped,
+        rows64: bool,
     ) {
-        let name = match gate.bits {
-            5 => "prefill_gate_up_5bit",
-            8 => "prefill_gate_up_8bit",
-            b => panic!("no prefill_gate_up kernel for {b} bits"),
-        };
-        enc.set_compute_pipeline_state(&gpu.pipeline(name));
-        set_quant(enc, 0, gate);
-        set_quant(enc, 3, up);
-        set_views(enc, 6, &[x_half, g_out, g_half]);
         let shape = MmShape {
             m: 0,
             n: gate.rows as u32,
             k: gate.cols as u32,
             gather: 1,
         };
-        params(enc, 9, &shape);
+        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, rows64);
         set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
-        groups(enc, (gate.rows.div_ceil(64), g.max_tiles), 128);
+        groups(enc, (gate.rows.div_ceil(64), g.max_tiles), threads);
 
         few_grouped(gpu, enc, gate, x, g_out, g, true);
         few_grouped(gpu, enc, up, x, u, g, true);
@@ -321,6 +313,64 @@ mod mac {
         params(enc, 3, &(gate.rows as u32));
         set_views(enc, 4, &[g.tiles, g.tile_count]);
         groups(enc, (g.max_tiles, 1), 256);
+    }
+
+    /// Binds prefill_gate_up (32-row tiles) or, with `rows64`,
+    /// prefill_gate_up64 and their buffers up to the shape; returns the
+    /// threads per threadgroup.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_gate_up(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x_half: &View,
+        g_out: &View,
+        g_half: &View,
+        shape: &MmShape,
+        rows64: bool,
+    ) -> usize {
+        assert!(
+            matches!(gate.bits, 5 | 8),
+            "no prefill_gate_up kernel for {} bits",
+            gate.bits
+        );
+        let (name, threads) = if rows64 {
+            ("prefill_gate_up64", 256)
+        } else {
+            ("prefill_gate_up", 128)
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("{name}_{}bit", gate.bits)));
+        set_quant(enc, 0, gate);
+        set_quant(enc, 3, up);
+        set_views(enc, 6, &[x_half, g_out, g_half]);
+        params(enc, 9, shape);
+        threads
+    }
+
+    /// g = silu(x gate^T) * (x up^T) for `m` rows of half x, in f32 and in
+    /// half, with prefill_gate_up64 in plain mode.
+    #[allow(clippy::too_many_arguments)]
+    fn gate_up_plain(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x_half: &View,
+        g_out: &View,
+        g_half: &View,
+        m: usize,
+    ) {
+        let shape = MmShape {
+            m: m as u32,
+            n: gate.rows as u32,
+            k: gate.cols as u32,
+            gather: 0,
+        };
+        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, true);
+        // Unused in plain mode, but bound so the kernel sees valid buffers.
+        set_views(enc, 10, &[x_half, x_half, x_half]);
+        groups(enc, (gate.rows.div_ceil(64), m.div_ceil(64)), threads);
     }
 
     /// qmm_few on the tiles of FEW rows or fewer of a grouped product.
@@ -356,7 +406,20 @@ mod mac {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&i| i < 4)
-            .map_or(crate::qmm::DEFAULT, |i| crate::qmm::VARIANTS[i])
+            .map_or(
+                if gate_up64() {
+                    // SAETTA_DOWN64=1: down on qmm2 64 x 64 instead (slower
+                    // in batch 6: 201 against 174 ms per 2k chunk).
+                    if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
+                        crate::qmm::VARIANTS[0]
+                    } else {
+                        crate::qmm::HALVES
+                    }
+                } else {
+                    crate::qmm::DEFAULT
+                },
+                |i| crate::qmm::VARIANTS[i],
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -393,9 +456,25 @@ mod mac {
         std::env::var("SAETTA_QMM2").is_ok_and(|v| v == "1")
     }
 
-    /// SAETTA_ROUTER_FAST=1 runs the router on the fast kernels too.
+    /// Expert tiles of up to 64 rows, gate and up in prefill_gate_up64,
+    /// down on qmm2 32 x 128 over each half of a tile (3-4% faster at 1k
+    /// to 15k tokens than 32-row tiles, batch 6), unless SAETTA_GATE_UP64=0
+    /// or SAETTA_EXPERT_VARIANT picks a variant.
+    fn gate_up64() -> bool {
+        std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
+            && std::env::var("SAETTA_EXPERT_VARIANT").is_err()
+    }
+
+    /// The shared expert's gate, up and silu in one prefill_gate_up64 pass
+    /// on normed in half, unless SAETTA_SHARED_GU=0.
+    fn shared_gate_up() -> bool {
+        std::env::var("SAETTA_SHARED_GU").map_or(true, |v| v != "0")
+    }
+
+    /// The fast path runs the router on the fast kernels too (about 70 ms
+    /// less per 2k chunk than qmm_split), unless SAETTA_ROUTER_FAST=0.
     fn fast_router() -> bool {
-        std::env::var("SAETTA_ROUTER_FAST").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_ROUTER_FAST").map_or(true, |v| v != "0")
     }
 
     /// SAETTA_CONV=1 runs the DeltaNet conv on conv_rows, one thread per
@@ -1579,10 +1658,11 @@ mod mac {
                 &s.shared_out,
             ]
             .map(whole);
+            let fast = !self.exact_now();
             if self.on("router") {
-                // Routing stays close to f32 so it picks the experts decode
-                // would, unless SAETTA_ROUTER_FAST=1 (to evaluate).
-                if !self.exact_now() && fast_router() {
+                // In half like the other matrices: the quality gate held. With
+                // SAETTA_ROUTER_FAST=0 it stays close to f32, as decode.
+                if fast && fast_router() {
                     self.mm(gpu, enc, &layer.router, normed, &router, t);
                 } else {
                     qmm(gpu, enc, &layer.router, normed, &router, t, true);
@@ -1590,15 +1670,27 @@ mod mac {
                 self.mm(gpu, enc, &layer.shared_gate, normed, &shared_gate, t);
             }
             let silu_mul = gpu.pipeline("silu_mul_rows");
+            let normed_half = whole(&s.normed_half);
+            // normed in half, for the fused shared expert and the experts.
+            let half_early = fast && shared_gate_up();
+            if half_early && self.on("router") {
+                to_half(gpu, enc, normed, &normed_half, t * h);
+            }
             if self.on("shared expert") {
-                self.mm(gpu, enc, &layer.shared[0], normed, &sg, t);
-                self.mm(gpu, enc, &layer.shared[1], normed, &su, t);
-                dispatch_1d(
-                    enc,
-                    &silu_mul,
-                    &[(&s.shared_g, 0), (&s.shared_u, 0)],
-                    t * layer.shared[0].rows,
-                );
+                if half_early && t > FEW_MAX {
+                    let [gate, up, _] = &layer.shared;
+                    let shared_half = whole(&s.expert_half);
+                    gate_up_plain(gpu, enc, gate, up, &normed_half, &sg, &shared_half, t);
+                } else {
+                    self.mm(gpu, enc, &layer.shared[0], normed, &sg, t);
+                    self.mm(gpu, enc, &layer.shared[1], normed, &su, t);
+                    dispatch_1d(
+                        enc,
+                        &silu_mul,
+                        &[(&s.shared_g, 0), (&s.shared_u, 0)],
+                        t * layer.shared[0].rows,
+                    );
+                }
                 self.record(gpu, enc, 3, &sg, t * layer.shared[0].rows);
                 self.mm(gpu, enc, &layer.shared[2], &sg, &sd, t);
             }
@@ -1649,14 +1741,17 @@ mod mac {
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
-            let (normed_half, expert_half) = (whole(&s.normed_half), whole(&s.expert_half));
-            let fused = !self.exact_now() && fused_gate_up();
+            let expert_half = whole(&s.expert_half);
+            let fused64 = fast && gate_up64();
+            let fused = fast && (fused64 || fused_gate_up());
             if self.on("experts gate, up") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
                     qmm_grouped(gpu, enc, &e.up, normed, &eu, &g, true, true);
                 } else if fused {
-                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    if !half_early {
+                        to_half(gpu, enc, normed, &normed_half, t * h);
+                    }
                     gate_up_grouped(
                         gpu,
                         enc,
@@ -1668,9 +1763,12 @@ mod mac {
                         &eu,
                         &expert_half,
                         &g,
+                        fused64,
                     );
                 } else {
-                    to_half(gpu, enc, normed, &normed_half, t * h);
+                    if !half_early {
+                        to_half(gpu, enc, normed, &normed_half, t * h);
+                    }
                     qmm2_grouped(gpu, enc, &e.gate, normed, &normed_half, &eg, &g, true);
                     qmm2_grouped(gpu, enc, &e.up, normed, &normed_half, &eu, &g, true);
                 }
