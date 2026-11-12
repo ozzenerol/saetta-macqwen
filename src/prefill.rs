@@ -258,6 +258,8 @@ mod mac {
         rows: &'v View,
         tile_count: &'v View,
         max_tiles: usize,
+        /// Tokens of the chunk, which pick the tile size.
+        tokens: usize,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -292,8 +294,8 @@ mod mac {
 
     /// Fast-mode experts run gate, up and silu in prefill_gate_up unless
     /// SAETTA_GATE_UP=0 or SAETTA_EXPERT_VARIANT picks other tile rows.
-    fn fused_gate_up() -> bool {
-        std::env::var("SAETTA_GATE_UP").map_or(true, |v| v != "0") && expert_variant().rows == 32
+    fn fused_gate_up(t: usize) -> bool {
+        std::env::var("SAETTA_GATE_UP").map_or(true, |v| v != "0") && expert_variant(t).rows == 32
     }
 
     /// Experts' silu(gate) * up into `g` (f32) and `g_half`: prefill_gate_up
@@ -418,14 +420,15 @@ mod mac {
     /// qmm_grouped on qmm2 (src/qmm.rs), which takes `x_half`, the half of
     /// `x`; the tiles of FEW rows or fewer still go to qmm_few on `x`.
     /// The qmm2 variant for the experts: SAETTA_EXPERT_VARIANT=<index into
-    /// qmm::VARIANTS> (0 to 3) to compare, else DEFAULT.
-    fn expert_variant() -> crate::qmm::Variant {
+    /// qmm::VARIANTS> (0 to 3) to compare, else HALVES for the 64-row tiles
+    /// of a chunk of `t` tokens or DEFAULT.
+    fn expert_variant(t: usize) -> crate::qmm::Variant {
         std::env::var("SAETTA_EXPERT_VARIANT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&i| i < 4)
             .map_or(
-                if gate_up64() {
+                if gate_up64(t) {
                     // SAETTA_DOWN64=1: down on qmm2 64 x 64 instead (slower
                     // in batch 6: 201 against 174 ms per 2k chunk).
                     if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
@@ -455,7 +458,7 @@ mod mac {
         crate::qmm::encode_gather(
             enc,
             gpu,
-            expert_variant(),
+            expert_variant(g.tokens),
             w,
             x_half,
             y,
@@ -477,10 +480,24 @@ mod mac {
     /// Expert tiles of up to 64 rows, gate and up in prefill_gate_up64,
     /// down on qmm2 32 x 128 over each half of a tile (3-4% faster at 1k
     /// to 15k tokens than 32-row tiles, batch 6), unless SAETTA_GATE_UP64=0
-    /// or SAETTA_EXPERT_VARIANT picks a variant.
-    fn gate_up64() -> bool {
+    /// or SAETTA_EXPERT_VARIANT picks a variant. Chunks of fewer than
+    /// gate_up64_min() tokens keep the 32-row tiles.
+    fn gate_up64(t: usize) -> bool {
         std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
             && std::env::var("SAETTA_EXPERT_VARIANT").is_err()
+            && t >= gate_up64_min()
+    }
+
+    /// Fewest tokens of a chunk for the 64-row expert tiles: 0, or
+    /// SAETTA_GU64_MIN=<n>.
+    fn gate_up64_min() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_GU64_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
     }
 
     /// The shared expert's gate, up and silu in one prefill_gate_up64 pass
@@ -1812,7 +1829,7 @@ mod mac {
             let tile_rows = if self.exact_now() {
                 TILE
             } else {
-                expert_variant().rows
+                expert_variant(t).rows
             };
             let [ids, weights, order, rows, tiles, tile_count] = [
                 &s.ids,
@@ -1868,13 +1885,14 @@ mod mac {
                 tile_count: &tile_count,
                 // Every tile has a row: no more tiles than pairs.
                 max_tiles: ((t * top_k).div_ceil(tile_rows) + cfg.num_experts).min(t * top_k),
+                tokens: t,
             };
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
             let (eg, eu, eo) = (whole(&s.expert_g), whole(&s.expert_u), whole(&s.expert_out));
             let expert_half = whole(&s.expert_half);
-            let fused64 = fast && gate_up64();
-            let fused = fast && (fused64 || fused_gate_up());
+            let fused64 = fast && gate_up64(t);
+            let fused = fast && (fused64 || fused_gate_up(t));
             if self.on("experts gate, up") {
                 if self.exact_now() {
                     qmm_grouped(gpu, enc, &e.gate, normed, &eg, &g, true, true);
