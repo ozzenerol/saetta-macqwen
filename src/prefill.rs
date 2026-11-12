@@ -619,16 +619,44 @@ mod mac {
             let pairs = chunk * cfg.num_experts_per_tok;
             let size = cfg.moe_intermediate_size;
             let max_tiles = pairs.div_ceil(TILE.min(crate::qmm::tile_rows())) + cfg.num_experts;
+            // The mixer's buffers and the routed experts' are never live at
+            // once (a layer's mixer is done before its MoE, and the serial
+            // encoder runs them in order), so they share memory: about 210
+            // MB at chunk 2048. For this model the pieces line up, f32 over
+            // f32 and half over half (wide + mixed = expert_out, z =
+            // expert_g, y = expert_u, q_half = expert_half), so a padding
+            // row read as the other kind is never a NaN made of half a
+            // float. SAETTA_ALIAS=0 gives each its own buffer.
+            let floats = |n: usize| n.max(1) * 4;
+            let mixer = [
+                chunk * wide,
+                chunk * wide,
+                chunk * narrow,
+                chunk * narrow,
+                chunk * narrow / 2,
+            ];
+            let experts = [pairs * h, pairs * size, pairs * size, pairs * size / 2];
+            let (mixer, experts) =
+                match gpu.aliased(&[&mixer.map(floats)[..], &experts.map(floats)[..]]) {
+                    Some(mut g) => (g.remove(0), g.remove(0)),
+                    None => (
+                        mixer.iter().map(|&n| f(n)).collect(),
+                        experts.iter().map(|&n| f(n)).collect(),
+                    ),
+                };
+            let [wide, mixed, z, y, q_half]: [Buffer; 5] = mixer.try_into().unwrap();
+            let [expert_out, expert_g, expert_u, expert_half]: [Buffer; 4] =
+                experts.try_into().unwrap();
             Scratch {
                 normed: f(chunk * h),
-                wide: f(chunk * wide),
-                mixed: f(chunk * wide),
-                z: f(chunk * narrow),
-                y: f(chunk * narrow),
+                wide,
+                mixed,
+                z,
+                y,
                 a: f(chunk * d.v_heads),
                 b: f(chunk * d.v_heads),
                 mixer_out: f(chunk * h),
-                q_half: f(chunk * narrow / 2),
+                q_half,
                 router: f(chunk * cfg.num_experts),
                 shared_gate: f(chunk),
                 shared_g: f(chunk * cfg.shared_expert_intermediate_size),
@@ -640,12 +668,12 @@ mod mac {
                 rows: f(pairs),
                 tiles: f(4 * max_tiles),
                 tile_count: f(1),
-                expert_g: f(pairs * size),
-                expert_u: f(pairs * size),
-                expert_out: f(pairs * h),
+                expert_g,
+                expert_u,
+                expert_out,
                 normed_half: f(chunk * h / 2),
                 x_half: f(chunk * h.max(narrow) / 2),
-                expert_half: f(pairs * size / 2),
+                expert_half,
                 few_list: f(1 + FEW_MOE_ROWS * cfg.num_experts_per_tok),
                 few_slots: f(FEW_MOE_ROWS * FEW_MOE_ROWS * cfg.num_experts_per_tok),
                 max_tiles,
