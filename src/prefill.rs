@@ -358,7 +358,8 @@ mod mac {
         } else {
             ("prefill_gate_up", 128)
         };
-        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("{name}_{}bit", gate.bits)));
+        let pf = if rows64 && gu_prefetch() { "_pf" } else { "" };
+        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("{name}_{}bit{pf}", gate.bits)));
         set_quant(enc, 0, gate);
         set_quant(enc, 3, up);
         set_views(enc, 6, &[x_half, g_out, g_half]);
@@ -478,6 +479,12 @@ mod mac {
     /// down on qmm2 32 x 128 over each half of a tile (3-4% faster at 1k
     /// to 15k tokens than 32-row tiles, batch 6), unless SAETTA_GATE_UP64=0
     /// or SAETTA_EXPERT_VARIANT picks a variant.
+    /// prefill_gate_up64 loads the next step during this one's MMAs unless
+    /// SAETTA_GU_PF=0.
+    fn gu_prefetch() -> bool {
+        std::env::var("SAETTA_GU_PF").map_or(true, |v| v != "0")
+    }
+
     fn gate_up64() -> bool {
         std::env::var("SAETTA_GATE_UP64").map_or(true, |v| v != "0")
             && std::env::var("SAETTA_EXPERT_VARIANT").is_err()

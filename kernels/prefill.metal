@@ -1796,7 +1796,7 @@ inline void dequant16(thread const uint *packed, float scale, float bias,
     }
 }
 
-template <uint BITS>
+template <uint BITS, bool PF>
 kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                               device const ushort *gate_scales [[buffer(1)]],
                               device const ushort *gate_biases [[buffer(2)]],
@@ -1869,23 +1869,35 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
 
     threadgroup half4 *xd = (threadgroup half4 *)(xt + xr * PREFILL_GU_LD + xc);
     threadgroup half4 *wd = (threadgroup half4 *)(wt + wr * PREFILL_GU_LD + (low ? 0 : 16));
-    for (uint k0 = 0; k0 < s.k; k0 += PREFILL_GU_BK) {
+    // The global loads of a step go to registers first; with PF, the next
+    // step's loads are issued before this step's MMAs so their latency
+    // hides behind them.
+    half4 xr0 = half4(0), xr1 = half4(0);
+    uint packed[BITS];
+    float scale = 0, bias = 0;
+    auto fetch = [&](uint k0) {
         if (x_ok) {
             device const half4 *p = (device const half4 *)(xrow + k0 + xc);
-            xd[0] = p[0];
-            xd[1] = p[1];
-        } else {
-            xd[0] = half4(0);
-            xd[1] = half4(0);
+            xr0 = p[0];
+            xr1 = p[1];
         }
         if (w_ok) {
-            uint packed[BITS];
             device const uint *wk = wp + k0 / 32 * BITS;
             for (uint j = 0; j < BITS; j++) {
                 packed[j] = wk[j];
             }
-            float scale = bf16_to_float(sp[k0 / 64]);
-            float bias = bf16_to_float(bp[k0 / 64]);
+            scale = bf16_to_float(sp[k0 / 64]);
+            bias = bf16_to_float(bp[k0 / 64]);
+        }
+    };
+    fetch(0);
+    for (uint k0 = 0; k0 < s.k; k0 += PREFILL_GU_BK) {
+        if (!PF && k0 > 0) {
+            fetch(k0);
+        }
+        xd[0] = xr0;
+        xd[1] = xr1;
+        if (w_ok) {
             if (low) {
                 dequant16<BITS, 0>(packed, scale, bias, wd);
             } else {
@@ -1897,6 +1909,9 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (PF && k0 + PREFILL_GU_BK < s.k) {
+            fetch(k0 + PREFILL_GU_BK);
+        }
 
         if (active) {
 #pragma clang loop unroll(full)
@@ -1949,8 +1964,10 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
     }
 }
 
-template [[host_name("prefill_gate_up64_5bit")]] kernel decltype(prefill_gate_up64<5>) prefill_gate_up64<5>;
-template [[host_name("prefill_gate_up64_8bit")]] kernel decltype(prefill_gate_up64<8>) prefill_gate_up64<8>;
+template [[host_name("prefill_gate_up64_5bit")]] kernel decltype(prefill_gate_up64<5, false>) prefill_gate_up64<5, false>;
+template [[host_name("prefill_gate_up64_8bit")]] kernel decltype(prefill_gate_up64<8, false>) prefill_gate_up64<8, false>;
+template [[host_name("prefill_gate_up64_5bit_pf")]] kernel decltype(prefill_gate_up64<5, true>) prefill_gate_up64<5, true>;
+template [[host_name("prefill_gate_up64_8bit_pf")]] kernel decltype(prefill_gate_up64<8, true>) prefill_gate_up64<8, true>;
 
 // g = silu(g) * u and g_half = g for the rows of the tiles of PREFILL_FEW
 // rows or fewer, which prefill_gate_up skips. One threadgroup per tile.
