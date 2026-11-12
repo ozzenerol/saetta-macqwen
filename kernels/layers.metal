@@ -226,6 +226,64 @@ kernel void deltanet_conv(device const float *x [[buffer(0)]],
 }
 
 
+// in_proj_qkv and the conv of one token in one op: qmv, then each output
+// row goes through its channel's conv, so the qkv vector is never written.
+template <uint BITS>
+kernel void qmv_conv(device const uint *words [[buffer(0)]],
+                     device const ushort *scales [[buffer(1)]],
+                     device const ushort *biases [[buffer(2)]],
+                     device const float *x [[buffer(3)]],
+                     device const float *w [[buffer(4)]],
+                     device float *state [[buffer(5)]],
+                     device float *out [[buffer(6)]],
+                     constant ConvParams &p [[buffer(7)]],
+                     constant QmvShape &shape [[buffer(8)]],
+                     uint tg [[threadgroup_position_in_grid]],
+                     uint simd [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = (tg * QMV_SIMDS + simd) * QMV_ROWS;
+    uint row_words = shape.cols * BITS / 32;
+    uint groups = shape.cols / 64;
+    float acc[QMV_ROWS] = {0};
+
+    for (uint k = lane * 32; k < shape.cols; k += 32 * 32) {
+        float xv[32];
+        float xsum = load_x32(x + k, xv);
+#pragma clang loop unroll(full)
+        for (uint r = 0; r < QMV_ROWS; r++) {
+            uint row = row0 + r;
+            if (row >= shape.rows) {
+                break;
+            }
+            acc[r] += dot32<BITS>(words + row * row_words + k * BITS / 32, scales, biases,
+                                  row * groups + k / 64, xv, xsum);
+        }
+    }
+
+    for (uint r = 0; r < QMV_ROWS; r++) {
+        float v = simd_sum(acc[r]);
+        uint c = row0 + r;
+        if (lane != 0 || c >= shape.rows) {
+            continue;
+        }
+        uint past = p.kernel_size - 1;
+        device const float *wc = w + c * p.kernel_size;
+        float conv = wc[past] * v;
+        for (uint t = 0; t < past; t++) {
+            conv += wc[t] * state[t * p.channels + c];
+        }
+        for (uint t = 0; t + 1 < past; t++) {
+            state[t * p.channels + c] = state[(t + 1) * p.channels + c];
+        }
+        state[(past - 1) * p.channels + c] = v;
+        out[c] = silu(conv);
+    }
+}
+
+template [[host_name("qmv_conv_5bit")]] kernel decltype(qmv_conv<5>) qmv_conv<5>;
+template [[host_name("qmv_conv_8bit")]] kernel decltype(qmv_conv<8>) qmv_conv<8>;
+
+
 struct StepParams {
     uint k_heads;
     uint v_heads;
