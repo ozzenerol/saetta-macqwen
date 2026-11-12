@@ -36,6 +36,16 @@ inline int prefill_ag_limit(constant AttGemmParams &p, uint r) {
     return int(p.pos + r / PREFILL_AG_GROUP) - int(p.j0);
 }
 
+// The keys of the block the 64-row tile of row r reads, rounded up to
+// PREFILL_AG_BK: up to the last key its last row sees. On the diagonal
+// that is about half the block, so pv does not multiply zeros.
+inline uint prefill_ag_tile_keys(constant AttGemmParams &p, uint r) {
+    uint last_row = min((r / 64) * 64 + 63, p.rows - 1);
+    int limit = prefill_ag_limit(p, last_row);
+    uint seen = limit < 0 ? 0 : min(p.n, uint(limit) + 1);
+    return (seen + PREFILL_AG_BK - 1) / PREFILL_AG_BK * PREFILL_AG_BK;
+}
+
 // Offset of query row r of kv head g in q [tokens][heads][D].
 inline ulong prefill_ag_q_row(constant AttGemmParams &p, uint g, uint r) {
     uint token = r / PREFILL_AG_GROUP, h = r % PREFILL_AG_GROUP;
@@ -130,7 +140,7 @@ kernel void prefill_ag_scores(device const half *q [[buffer(0)]],
 
 // One simdgroup per row r of kv head tg.y: the online softmax step for the
 // block. P gets exp(scale S - m) for the keys the row sees and 0 for the
-// rest up to n rounded to PREFILL_AG_BK, which prefill_ag_pv reads.
+// rest up to prefill_ag_tile_keys, which prefill_ag_pv reads.
 kernel void prefill_ag_softmax(device const float *s [[buffer(0)]],
                                device half *pm [[buffer(1)]],
                                device float *m [[buffer(2)]],
@@ -149,7 +159,7 @@ kernel void prefill_ag_softmax(device const float *s [[buffer(0)]],
     device half *pr = pm + row * PREFILL_AG_KEYS;
     int limit = prefill_ag_limit(p, r);
     uint count = limit < 0 ? 0 : min(p.n, uint(limit) + 1);
-    uint padded = (p.n + PREFILL_AG_BK - 1) / PREFILL_AG_BK * PREFILL_AG_BK;
+    uint padded = prefill_ag_tile_keys(p, r);
     bool first = p.j0 == 0;
     float m_old = first ? -INFINITY : m[row];
     float l_old = first ? 0.0f : l[row];
@@ -207,11 +217,10 @@ kernel void prefill_ag_pv(device const half *pm [[buffer(0)]],
     if (r0 >= p.rows) {
         return;
     }
-    uint last_row = min(r0 + 63, p.rows - 1);
-    if (prefill_ag_limit(p, last_row) < 0) {
+    uint padded = prefill_ag_tile_keys(p, r0);
+    if (padded == 0) {
         return;  // no row sees the block: alpha is 1 and P is 0
     }
-    uint padded = (p.n + PREFILL_AG_BK - 1) / PREFILL_AG_BK * PREFILL_AG_BK;
 
     // Thread t loads 16 values of P row t / 2 and 16 dims of value row t / 4.
     uint pr = tid / 2, pc = (tid % 2) * 16;
