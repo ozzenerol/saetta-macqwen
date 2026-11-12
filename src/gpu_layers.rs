@@ -583,7 +583,6 @@ mod mac {
         a_log: View,
         dt_bias: View,
         norm: View,
-        qkv: Buffer,
         mixed: Buffer,
         z: Buffer,
         a: Buffer,
@@ -620,7 +619,6 @@ mod mac {
                 a_log: v("A_log")?,
                 dt_bias: v("dt_bias")?,
                 norm: v("norm.weight")?,
-                qkv: gpu.buffer(channels * 4),
                 mixed: gpu.buffer(channels * 4),
                 z: gpu.buffer(values * 4),
                 a: gpu.buffer(c.v_heads * 4),
@@ -636,24 +634,21 @@ mod mac {
             let c = &self.cfg;
             let key_size = c.k_heads * c.k_dim;
             let channels = 2 * key_size + c.v_heads * c.v_dim;
-            let [qkv, mixed, z, a, b, y] =
-                [&self.qkv, &self.mixed, &self.z, &self.a, &self.b, &self.y].map(whole);
-
-            self.in_proj_qkv.record(plan, x, &qkv, false);
-            self.in_proj_z.record(plan, x, &z, true);
-            self.in_proj_b.record(plan, x, &b, true);
-            self.in_proj_a.record(plan, x, &a, true);
+            let [mixed, z, a, b, y] = [&self.mixed, &self.z, &self.a, &self.b, &self.y].map(whole);
 
             let p = plan.constant(&[ConvParams {
                 channels: channels as u32,
                 kernel_size: c.kernel as u32,
             }]);
-            plan.op(
-                "deltanet_conv",
-                &[&qkv, &self.conv1d, &whole(&state.conv), &mixed, &p],
-                size(channels.div_ceil(256), 1),
-                size(256, 1),
+            self.in_proj_qkv.record_with(
+                plan,
+                "qmv_conv",
+                x,
+                &[&self.conv1d, &whole(&state.conv), &mixed, &p],
             );
+            self.in_proj_z.record(plan, x, &z, true);
+            self.in_proj_b.record(plan, x, &b, true);
+            self.in_proj_a.record(plan, x, &a, true);
 
             let at = |floats: usize| View {
                 buffer: self.mixed.clone(),

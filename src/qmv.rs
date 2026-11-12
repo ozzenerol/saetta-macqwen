@@ -141,6 +141,19 @@ mod mac {
                 plan.op(kernel, &buffers, grid, threads);
             }
         }
+        /// `record` with extra buffers after `x`, for kernels shaped like
+        /// qmv (`qmv_conv`): words, scales, biases, x, `extra`, shape.
+        pub fn record_with(&self, plan: &mut Plan, kernel: &str, x: &View, extra: &[&View]) {
+            assert_eq!(self.experts, 1, "stacked experts go through moe");
+            let kernel = format!("{kernel}_{}bit", self.bits);
+            let shape = plan.constant(&[self.rows as u32, self.cols as u32]);
+            let mut buffers = vec![&self.words, &self.scales, &self.biases, x];
+            buffers.extend_from_slice(extra);
+            buffers.push(&shape);
+            let grid = MTLSize::new(self.rows.div_ceil(ROWS_PER_SIMD * SIMDS) as u64, 1, 1);
+            let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
+            plan.op(&kernel, &buffers, grid, threads);
+        }
     }
 
     /// Wraps `bytes` without a copy when they start 16-byte aligned, else
