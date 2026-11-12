@@ -470,6 +470,40 @@ mod mac {
 
     /// Fast-mode dense matrices run on qmm_dq (w rounded to half), 6% faster
     /// than qmm2 at 1800 tokens; SAETTA_QMM2=1 picks qmm2 (x in half).
+    /// Dense products of more than fast_few_max rows on prefill_qmm64
+    /// (64 x 128 tiles, half x) over qmm_dq (64 x 64, f32 x), unless
+    /// SAETTA_DENSE64=0.
+    fn dense64(w: &GpuQuant) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("SAETTA_DENSE64").map_or(true, |v| v != "0"));
+        on && w.experts == 1 && matches!(w.bits, 5 | 8) && w.cols.is_multiple_of(64)
+    }
+
+    /// y = x W^T for `m` rows of half x on prefill_qmm64.
+    fn qmm64(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        w: &GpuQuant,
+        x_half: &View,
+        y: &View,
+        m: usize,
+    ) {
+        let shape = MmShape {
+            m: m as u32,
+            n: w.rows as u32,
+            k: w.cols as u32,
+            gather: 0,
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("prefill_qmm64_{}bit", w.bits)));
+        set_quant(enc, 0, w);
+        set_quant(enc, 3, w);
+        // g_half and the gather buffers are unused, but bound.
+        set_views(enc, 6, &[x_half, y, x_half]);
+        params(enc, 9, &shape);
+        set_views(enc, 10, &[x_half, x_half, x_half]);
+        groups(enc, (w.rows.div_ceil(128), m.div_ceil(64)), 256);
+    }
+
     fn dense_qmm2() -> bool {
         std::env::var("SAETTA_QMM2").is_ok_and(|v| v == "1")
     }
@@ -1074,6 +1108,11 @@ mod mac {
             y: &View,
             m: usize,
         ) {
+            if !self.exact_now() && m > fast_few_max() && dense64(w) {
+                let x_half = whole(&self.scratch.x_half);
+                to_half(gpu, enc, x, &x_half, m * w.cols);
+                return qmm64(gpu, enc, w, &x_half, y, m);
+            }
             if self.exact_now() || m <= FEW_MAX || !dense_qmm2() {
                 return qmm(gpu, enc, w, x, y, m, self.exact_now());
             }
