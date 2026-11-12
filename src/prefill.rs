@@ -232,14 +232,15 @@ mod mac {
     const FEW_MOE_SPLIT: usize = 8;
 
     /// Up to this many tokens a chunk's experts run on encode_few_experts:
-    /// 64, or SAETTA_FEW_MOE=<n> (0 turns it off).
+    /// 32 (at 48 the grouped path is faster), or SAETTA_FEW_MOE=<n> (0 turns
+    /// it off).
     fn few_moe_max() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
             std::env::var("SAETTA_FEW_MOE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64)
+                .unwrap_or(32)
         })
     }
 
