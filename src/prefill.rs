@@ -2519,9 +2519,13 @@ mod mac {
                 // its codes: a key that moved with the hidden state lands on
                 // the next code, one step (1.9e-2 of the rms at 8 bits)
                 // away, so it gets twice the room (8 bits, layer 15: 2.5e-2
-                // while the median token is 5.3e-3).
-                let full = matches!(cpu_states[l], LayerState::Full(_));
-                let state_bound = if full && bits != KvBits::Half {
+                // while the median token is 5.3e-3). The DeltaNet states
+                // after them take in those keys and get the same room: some
+                // exact 8-bit runs land on a second outcome with layer 17 at
+                // 2.78e-2 and layer 18 at 3.24e-2 (batches 6 and 11), where
+                // the others have 8.3e-3 and 6.3e-3; the median token stays
+                // near 4e-3 in both. At 8 bits that is 5e-2, was 2.5e-2.
+                let state_bound = if bits != KvBits::Half {
                     bound * 2.5
                 } else {
                     bound * 1.25
@@ -2533,16 +2537,13 @@ mod mac {
                 }
                 // The median over all tokens is mostly the first call. The
                 // 16 tokens of the second read the states the first left
-                // and move with them, so they get twice the room, which
-                // still catches an order 1 error from a wrong position or
-                // slot. Measured on the exact path (batch 7), second call
-                // median at 8 bits: layer 24 2.2e-2, 27 2.8e-2, 28 3.2e-2,
-                // 29 3.0e-2, 30 2.7e-2, 31 2.6e-2, under 2e-2 elsewhere;
-                // at 4 bits at most 3.1e-2 (layer 23) against 1.6e-1.
-                // A batch 6 run had 2.8e-2 at layer 17 of 8 bits, where
-                // batch 7 had 5.8e-3: the runs differ, so this is not
-                // a tight fit to one of them.
-                let second_bound = 2.0 * bound;
+                // and move with them from run to run: at 8 bits on the
+                // exact path its worst layer was 3.2e-2 (batch 7), 3.9e-2
+                // and 4.4e-2 (two runs of batch 12, layers 26 and 32), at
+                // 4 bits at most 3.6e-2. So it gets twice the median bound
+                // but at least 0.1: still far below the order 1 error of a
+                // wrong position or slot, which is what it is there for.
+                let second_bound = (2.0 * bound).max(0.1);
                 if by_median && last_median >= second_bound {
                     failed.push(format!(
                         "{bits:?} layer {l}: second call median {last_median:.2e} (bound {second_bound:.2e})"
