@@ -17,6 +17,8 @@ scripts/mac.sh run --release -- gpu-check
 
 Pure CPU code can also be tested on the PC with plain `cargo test`.
 
+The GPU model is not bit for bit reproducible: two runs of the same prompt (prefill, then token by token) give logits that differ slightly (batch 15, `gpu_cache::half_snapshot_error`: the second run did not match the first at 4k or 32k tokens). The cause has not been found. A GPU test should compare against a reference with a tolerance, such as the KL and top-1 of the quality gate, or against a run on the same path, not demand equal bits across two runs.
+
 ## The Mac
 
 - `mlx_lm.server` is stopped for now (2026-11-11), so 40-layer runs are allowed. The weights are mmapped file pages shared by every saetta process, so several can run at once; each adds about 2 GB. Do not start mlx_lm.server; the MLX reference data is already in ~/saetta/golden, ~/saetta/golden-f32 and ~/saetta/eval.
