@@ -1582,6 +1582,28 @@ inline void dequant16(thread const uint *packed, float scale, float bias,
     }
 }
 
+// prefill_gate_up64's loads for the step at k0: 8 x values and the packed
+// words, scale and bias of 32 weights.
+template <uint BITS>
+inline void gu64_fetch(bool x_ok, bool w_ok, device const half *xrow, device const uint *wp,
+                       device const ushort *sp, device const ushort *bp, uint k0,
+                       thread half4 *xv, thread uint *packed, thread float &scale,
+                       thread float &bias) {
+    if (x_ok) {
+        device const half4 *p = (device const half4 *)(xrow + k0);
+        xv[0] = p[0];
+        xv[1] = p[1];
+    }
+    if (w_ok) {
+        device const uint *wk = wp + k0 / 32 * BITS;
+        for (uint j = 0; j < BITS; j++) {
+            packed[j] = wk[j];
+        }
+        scale = bf16_to_float(sp[k0 / 64]);
+        bias = bf16_to_float(bp[k0 / 64]);
+    }
+}
+
 template <uint BITS>
 kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                               device const ushort *gate_scales [[buffer(1)]],
@@ -1657,23 +1679,16 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
 
     threadgroup half4 *xd = (threadgroup half4 *)(xt + xr * PREFILL_GU_LD + xc);
     threadgroup half4 *wd = (threadgroup half4 *)(wt + wr * PREFILL_GU_LD + (low ? 0 : 16));
+    // The next step's x and weights are loaded into registers before this
+    // step's MACs, so their latency hides behind them.
+    half4 xv[2] = {half4(0), half4(0)};
+    uint packed[BITS];
+    float scale = 0, bias = 0;
+    gu64_fetch<BITS>(x_ok, w_ok, xrow + xc, wp, sp, bp, 0, xv, packed, scale, bias);
     for (uint k0 = 0; k0 < s.k; k0 += PREFILL_GU_BK) {
-        if (x_ok) {
-            device const half4 *p = (device const half4 *)(xrow + k0 + xc);
-            xd[0] = p[0];
-            xd[1] = p[1];
-        } else {
-            xd[0] = half4(0);
-            xd[1] = half4(0);
-        }
+        xd[0] = xv[0];
+        xd[1] = xv[1];
         if (w_ok) {
-            uint packed[BITS];
-            device const uint *wk = wp + k0 / 32 * BITS;
-            for (uint j = 0; j < BITS; j++) {
-                packed[j] = wk[j];
-            }
-            float scale = bf16_to_float(sp[k0 / 64]);
-            float bias = bf16_to_float(bp[k0 / 64]);
             if (low) {
                 dequant16<BITS, 0>(packed, scale, bias, wd);
             } else {
@@ -1685,6 +1700,10 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + PREFILL_GU_BK < s.k) {
+            gu64_fetch<BITS>(x_ok, w_ok, xrow + xc, wp, sp, bp, k0 + PREFILL_GU_BK, xv, packed,
+                             scale, bias);
+        }
 
         if (active) {
 #pragma clang loop unroll(full)
