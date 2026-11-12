@@ -251,6 +251,12 @@ mod mac {
             (buffer, (start - page_start) as u64)
         }
 
+        /// Bytes of all the no-copy buffers, which `current_allocated_size`
+        /// counts too.
+        pub fn no_copy_bytes(&self) -> u64 {
+            self.no_copy.borrow().values().map(|b| b.length()).sum()
+        }
+
         /// Maps a file read-only and wraps it as a buffer. Kernels must not
         /// write to it.
         pub fn map_file(&self, path: &Path) -> std::io::Result<MappedFile> {
