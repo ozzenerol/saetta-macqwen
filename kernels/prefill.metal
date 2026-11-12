@@ -618,6 +618,7 @@ struct DeltaRowsParams {
     uint channels;  // floats per token in `mixed`: q, k and v
     float eps;
     uint snapshots;  // write the state after each token to `snaps`
+    uint half_qk;    // delta_prep also writes q and k in half to `qk_half`
 };
 
 kernel void delta_rows(device const float *mixed [[buffer(0)]],
@@ -776,6 +777,7 @@ kernel void delta_prep(device float *mixed [[buffer(0)]],
                        device const float *a_log [[buffer(3)]],
                        device const float *dt_bias [[buffer(4)]],
                        constant DeltaRowsParams &p [[buffer(5)]],
+                       device half *qk_half [[buffer(6)]],
                        uint2 tg [[threadgroup_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint K_DIM = 128;
@@ -786,7 +788,13 @@ kernel void delta_prep(device float *mixed [[buffer(0)]],
         float4 x = *v;
         float ss = simd_sum(dot(x, x));
         float scale = head < p.k_heads ? 1.0f / sqrt(float(K_DIM)) : 1.0f;
-        *v = x * (scale / sqrt(ss + p.eps));
+        float4 out = x * (scale / sqrt(ss + p.eps));
+        *v = out;
+        if (p.half_qk != 0) {
+            // [tokens, 2 k_heads K_DIM]: q, then k.
+            ((device half4 *)(qk_half + ulong(t) * 2 * p.k_heads * K_DIM + head * K_DIM))[lane] =
+                half4(out);
+        }
     } else {
         uint h = head - 2 * p.k_heads + lane * (p.v_heads / 32);
         for (uint i = 0; i < p.v_heads / 32; i++, h++) {
@@ -912,7 +920,8 @@ constant uint DR3_TB = 8;
 // LANES lanes per state row (4 in delta_rows3), each with 128 / LANES of
 // its values: more lanes give more threads and shorter dot products per
 // token, for a longer simd reduction.
-template <uint LANES>
+// HQK: q and k from delta_prep's half copy (`qk_half`) instead of `mixed`.
+template <uint LANES, bool HQK>
 kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                         device const float *g [[buffer(1)]],
                         device const float *beta [[buffer(2)]],
@@ -920,6 +929,7 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                         device float *y [[buffer(6)]],
                         constant DeltaRowsParams &p [[buffer(7)]],
                         device float *snaps [[buffer(8)]],
+                        device const half *qk_half [[buffer(9)]],
                         uint2 tg [[threadgroup_position_in_grid]],
                         uint tid [[thread_index_in_threadgroup]],
                         uint simd [[simdgroup_index_in_threadgroup]],
@@ -962,7 +972,11 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
             nqk[j] = float4(0);
             if (e < DR3_TB * F4 && t < p.tokens) {
                 uint off = f < F4 / 2 ? kh * K_DIM + 4 * f : key_size + kh * K_DIM + 4 * (f - F4 / 2);
-                nqk[j] = *(device const float4 *)(mixed + ulong(t) * p.channels + off);
+                if (HQK) {
+                    nqk[j] = float4(*(device const half4 *)(qk_half + ulong(t) * 2 * key_size + off));
+                } else {
+                    nqk[j] = *(device const float4 *)(mixed + ulong(t) * p.channels + off);
+                }
             }
         }
         if (tid < DR3_TB && t0 + tid < p.tokens) {
@@ -1005,7 +1019,11 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
                 nqk[j] = float4(0);
                 if (e < DR3_TB * F4 && t < p.tokens) {
                     uint off = f < F4 / 2 ? kh * K_DIM + 4 * f : key_size + kh * K_DIM + 4 * (f - F4 / 2);
-                    nqk[j] = *(device const float4 *)(mixed + ulong(t) * p.channels + off);
+                    if (HQK) {
+                        nqk[j] = float4(*(device const half4 *)(qk_half + ulong(t) * 2 * key_size + off));
+                    } else {
+                        nqk[j] = *(device const float4 *)(mixed + ulong(t) * p.channels + off);
+                    }
                 }
             }
             if (tid < DR3_TB && next + tid < p.tokens) {
@@ -1095,10 +1113,14 @@ kernel void delta_rows3(device const float *mixed [[buffer(0)]],
     }
 }
 
-template [[host_name("delta_rows3")]] kernel decltype(delta_rows3<4>) delta_rows3<4>;
-template [[host_name("delta_rows3_l8")]] kernel decltype(delta_rows3<8>) delta_rows3<8>;
-template [[host_name("delta_rows3_l16")]] kernel decltype(delta_rows3<16>) delta_rows3<16>;
-template [[host_name("delta_rows3_l32")]] kernel decltype(delta_rows3<32>) delta_rows3<32>;
+template [[host_name("delta_rows3")]] kernel decltype(delta_rows3<4, false>) delta_rows3<4, false>;
+template [[host_name("delta_rows3h")]] kernel decltype(delta_rows3<4, true>) delta_rows3<4, true>;
+template [[host_name("delta_rows3_l8")]] kernel decltype(delta_rows3<8, false>) delta_rows3<8, false>;
+template [[host_name("delta_rows3_l8h")]] kernel decltype(delta_rows3<8, true>) delta_rows3<8, true>;
+template [[host_name("delta_rows3_l16")]] kernel decltype(delta_rows3<16, false>) delta_rows3<16, false>;
+template [[host_name("delta_rows3_l16h")]] kernel decltype(delta_rows3<16, true>) delta_rows3<16, true>;
+template [[host_name("delta_rows3_l32")]] kernel decltype(delta_rows3<32, false>) delta_rows3<32, false>;
+template [[host_name("delta_rows3_l32h")]] kernel decltype(delta_rows3<32, true>) delta_rows3<32, true>;
 
 // ---------------------------------------------------------------------------
 // Causal attention of T new tokens over the KV cache, which already holds

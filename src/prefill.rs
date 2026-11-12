@@ -536,6 +536,12 @@ mod mac {
         })
     }
 
+    /// SAETTA_DELTA_HQK=1: delta_rows3 reads q and k from a half copy that
+    /// delta_prep writes, half the bytes of the loads every row repeats.
+    fn delta_half_qk() -> bool {
+        std::env::var("SAETTA_DELTA_HQK").is_ok_and(|v| v == "1")
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -741,6 +747,7 @@ mod mac {
         channels: u32,
         eps: f32,
         snapshots: u32,
+        half_qk: u32,
     }
 
     #[repr(C)]
@@ -1442,6 +1449,7 @@ mod mac {
             if !self.on("deltanet delta") {
                 return self.encode_deltanet_out(gpu, enc, w, &y, &z, out, t);
             }
+            let hqk = !delta2() && delta3() > 0 && delta_half_qk();
             let p = DeltaRowsParams {
                 k_heads: c.k_heads as u32,
                 v_heads: c.v_heads as u32,
@@ -1450,6 +1458,7 @@ mod mac {
                 channels: channels as u32,
                 eps: c.eps,
                 snapshots: snaps.is_some() as u32,
+                half_qk: hqk as u32,
             };
             // SAETTA_DELTA2=1 wins over delta_rows3.
             let d3 = if delta2() { 0 } else { delta3() };
@@ -1478,6 +1487,10 @@ mod mac {
                 enc.set_compute_pipeline_state(&gpu.pipeline("delta_prep"));
                 set_views(enc, 0, &[&mixed, &a, &b, &w.a_log, &w.dt_bias]);
                 params(enc, 5, &p);
+                // q and k in half, [t, 2 k_heads k_dim], fit q_half.
+                let qk_half = whole(&self.scratch.q_half);
+                assert!(self.scratch.q_half.length() as usize >= t * 2 * c.k_heads * c.k_dim * 2);
+                set_views(enc, 6, &[&qk_half]);
                 groups(enc, (t, 2 * c.k_heads + 1), 32);
 
                 let lanes = delta_lanes();
@@ -1485,7 +1498,7 @@ mod mac {
                     (false, _) => "delta_rows2".to_string(),
                     (true, 4) => "delta_rows3".to_string(),
                     (true, l) => format!("delta_rows3_l{l}"),
-                };
+                } + if hqk { "h" } else { "" };
                 let pipeline = gpu.pipeline(&kernel);
                 assert!(
                     pipeline.max_total_threads_per_threadgroup() as usize >= 32 * d3,
@@ -1496,7 +1509,7 @@ mod mac {
                 set_views(enc, 0, &[&mixed, &a, &b]);
                 set_views(enc, 5, &[&whole(&state.recurrent), &y]);
                 params(enc, 7, &p);
-                set_views(enc, 8, &[&whole(delta_snaps)]);
+                set_views(enc, 8, &[&whole(delta_snaps), &qk_half]);
                 if d3 > 0 {
                     // d3 simdgroups of 32 / lanes rows each per threadgroup.
                     groups(enc, (c.v_dim.div_ceil(32 / lanes * d3), c.v_heads), 32 * d3);
