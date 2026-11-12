@@ -672,6 +672,11 @@ mod gpu {
             self
         }
 
+        /// Turns lookup rounds off or back on, keeping what they learned.
+        pub fn set_lookup(&mut self, on: bool) {
+            self.use_lookup = on && self.lookup_max > 0;
+        }
+
         /// One MTP step from `h`, the normed hidden state at `position`,
         /// with the token after it.
         fn mtp_step(&mut self, h: &View, position: usize, token: u32) -> u32 {
