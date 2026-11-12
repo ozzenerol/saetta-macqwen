@@ -489,6 +489,12 @@ fn load_gpu(
     memory: Memory,
 ) -> Result<GpuServed, Box<dyn Error>> {
     let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
+    // Built lazily they cost the first request about 0.45 s (batch 16).
+    if std::env::var("SAETTA_WARM_PIPELINES").map_or(true, |v| v != "0") {
+        let start = std::time::Instant::now();
+        let built = gpu.build_all_pipelines();
+        eprintln!("built {built} pipelines in {:.2} s", start.elapsed().as_secs_f64());
+    }
     let context = memory.context;
     let mut parts = BufferParts::new(gpu);
     let mut model = saetta::gpu_model::GpuModel::load_with_bits(

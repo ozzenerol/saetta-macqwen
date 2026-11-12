@@ -186,6 +186,16 @@ mod mac {
             })
         }
 
+        /// Builds the pipeline of every kernel in the library, so a first
+        /// request does not pay for them. Returns how many were built.
+        pub fn build_all_pipelines(&self) -> usize {
+            let names = self.library.function_names();
+            for name in &names {
+                self.pipeline(name);
+            }
+            names.len()
+        }
+
         /// The compute pipeline for the kernel function `name`, built once.
         pub fn pipeline(&self, name: &str) -> ComputePipelineState {
             if let Some(p) = self.pipelines.borrow().get(name) {
