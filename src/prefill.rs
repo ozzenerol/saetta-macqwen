@@ -2004,7 +2004,8 @@ mod mac {
         /// from 100, so the first call runs a 128-row chunk on the large-m
         /// kernels and a 22-row one on qmm_few: the hidden state after each layer and every layer state
         /// must be within `bound` of the CPU fed one token at a time, the
-        /// logits within `logits_bound`, with the same argmax. Returns what
+        /// logits within `logits_bound`, with the same argmax (over a
+        /// quantized cache, a near tie may pick the other). Returns what
         /// went over instead of stopping, so one run shows every layer.
         fn check_prefill(exact: bool, bound: f32, logits_bound: f32, bits: KvBits) -> Vec<String> {
             let slack = crate::kv_quant::test_slack(bits);
@@ -2170,12 +2171,20 @@ mod mac {
             if err >= logits_bound {
                 failed.push(format!("{bits:?} logits {err:.2e} (bound {logits_bound:.2e})"));
             }
-            if exact && argmax(&got) != argmax(&want) {
-                failed.push(format!(
-                    "{bits:?} argmax {} vs {}",
-                    argmax(&got),
-                    argmax(&want)
-                ));
+            // Over a quantized cache the GPU and CPU round some codes
+            // differently, and at a near tie the top token can flip from run
+            // to run (batch 8, 4 bits: 95726 vs 96022 in one of two runs).
+            // So the GPU's pick must only be within the logits' error of the
+            // CPU's best: its CPU logit at most logits_bound times the rms of
+            // all logits below the best, a few times the logits' error.
+            let (g, w) = (argmax(&got) as usize, argmax(&want) as usize);
+            if exact && g != w {
+                let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
+                let gap = want[w] - want[g];
+                println!("argmax {g} vs {w}: CPU logits {:.3} vs {:.3}, gap {:.2e} of the rms", want[g], want[w], gap / rms);
+                if bits == KvBits::Half || gap > logits_bound * rms {
+                    failed.push(format!("{bits:?} argmax {g} vs {w}, gap {:.2e} of the rms", gap / rms));
+                }
             }
             failed
         }
