@@ -39,9 +39,24 @@ mod mac {
     use crate::qmv::View;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
-    /// The buffers of one block for chunks of up to `chunk` tokens: scores,
-    /// P, the output sums and the per-row softmax state.
+    /// Query slices a chunk's attention runs in, one after the other, unless
+    /// SAETTA_AG_SLICES says otherwise: the scratch is for one slice. Two
+    /// take 113 MB less at chunk 2048 in the same time (32k prefill within
+    /// noise of one slice at 16 and 8 bits, 3k the same).
+    const SLICES: usize = 2;
+
+    fn slices() -> usize {
+        std::env::var("SAETTA_AG_SLICES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(SLICES)
+    }
+
+    /// The buffers of one block for slices of up to `slice` tokens of a
+    /// chunk: scores, P, the output sums and the per-row softmax state.
     pub struct AttGemm {
+        slice: usize,
         rows_pad: usize,
         s: Buffer,
         p: Buffer,
@@ -52,12 +67,15 @@ mod mac {
     }
 
     impl AttGemm {
-        /// About 7 KB per query row: 112 KB per token of chunk with 2 kv
-        /// heads, 230 MB for 2048 tokens.
+        /// About 7 KB per query row of a slice: 112 KB per token with 2 kv
+        /// heads, 230 MB for a chunk of 2048 tokens in one slice, 115 MB in
+        /// two.
         pub fn new(gpu: &Gpu, chunk: usize, kv_heads: usize) -> AttGemm {
-            let rows_pad = (chunk * GROUP).next_multiple_of(64);
+            let slice = chunk.div_ceil(slices());
+            let rows_pad = (slice * GROUP).next_multiple_of(64);
             let rows = kv_heads * rows_pad;
             AttGemm {
+                slice,
                 rows_pad,
                 s: gpu.buffer(rows * KEYS * 4),
                 p: gpu.buffer(rows * KEYS * 2),
@@ -75,6 +93,47 @@ mod mac {
         /// rows instead and `keys` and `values` are not read.
         #[allow(clippy::too_many_arguments)]
         pub fn encode(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            gpu: &Gpu,
+            q: &View,
+            keys: &View,
+            values: &View,
+            quant: Option<&(QuantRows, QuantRows)>,
+            q_and_gate: &View,
+            out: &View,
+            f: FlashParams,
+        ) {
+            // A slice of tokens is a chunk of its own at pos + t0: its rows
+            // of q, q_and_gate and out, the whole cache.
+            let at = |v: &View, bytes: usize| View {
+                buffer: v.buffer.clone(),
+                offset: v.offset + bytes as u64,
+            };
+            let width = f.heads as usize * DIM;
+            for t0 in (0..f.tokens as usize).step_by(self.slice) {
+                let tokens = self.slice.min(f.tokens as usize - t0);
+                let fs = FlashParams {
+                    pos: f.pos + t0 as u32,
+                    tokens: tokens as u32,
+                    ..f
+                };
+                self.encode_slice(
+                    enc,
+                    gpu,
+                    &at(q, t0 * width * 2),
+                    keys,
+                    values,
+                    quant,
+                    &at(q_and_gate, t0 * width * 2 * 4),
+                    &at(out, t0 * width * 4),
+                    fs,
+                );
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_slice(
             &self,
             enc: &ComputeCommandEncoderRef,
             gpu: &Gpu,
