@@ -143,6 +143,8 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
     uint sn = (simd % WN) * TN;
     // Rows past the end of a partial tile: no MACs, nothing to write.
     bool active = sm < count;
+    // 8-row blocks of this simdgroup that hold rows; the rest skip their MACs.
+    uint live = active ? min(FM, (count - sm + 7) / 8) : 0;
     simdgroup_float8x8 acc[FM][FN];
     for (uint i = 0; i < FM; i++) {
         for (uint j = 0; j < FN; j++) {
@@ -171,17 +173,18 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
         if (active) {
 #pragma clang loop unroll(full)
             for (uint kk = 0; kk < QMM_BK; kk += 8) {
-                simdgroup_half8x8 a[FM];
                 simdgroup_half8x8 b[FN];
-                for (uint i = 0; i < FM; i++) {
-                    simdgroup_load(a[i], st.x + (sm + 8 * i) * QMM_LD + kk, QMM_LD);
-                }
                 for (uint j = 0; j < FN; j++) {
                     simdgroup_load(b[j], st.w + (sn + 8 * j) * QMM_LD + kk, QMM_LD, ulong2(0, 0), true);
                 }
                 for (uint i = 0; i < FM; i++) {
+                    if (i >= live) {
+                        break;
+                    }
+                    simdgroup_half8x8 a;
+                    simdgroup_load(a, st.x + (sm + 8 * i) * QMM_LD + kk, QMM_LD);
                     for (uint j = 0; j < FN; j++) {
-                        simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                        simdgroup_multiply_accumulate(acc[i][j], a, b[j], acc[i][j]);
                     }
                 }
             }

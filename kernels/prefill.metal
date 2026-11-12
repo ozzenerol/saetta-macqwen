@@ -1564,7 +1564,7 @@ template [[host_name("prefill_gate_up_8bit")]] kernel decltype(prefill_gate_up<8
 // prefill_gate_up on tiles of up to 64 rows: 8 simdgroups, each 32 rows by
 // 16 columns of gate and the same 16 of up, so silu(gate) * up is taken in
 // registers. Each step dequantizes the weights once for up to 64 rows (32
-// above), and the simdgroups of rows past the tile's end skip their MACs.
+// above), and the 8-row blocks past the tile's end skip their MACs.
 // In plain mode (gather 0, the shared expert) tile y is rows 64 y of x.
 constant uint PREFILL_GU64_BM = 64;
 constant uint PREFILL_GU64_BN = 64;  // columns of each of gate and up
@@ -1645,6 +1645,8 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
     uint sm = (simd / 4) * 32;
     uint sn = (simd % 4) * 16;
     bool active = sm < count;
+    // 8-row blocks of this simdgroup that hold rows; the rest skip their MACs.
+    uint live = active ? min(4u, (count - sm + 7) / 8) : 0;
     simdgroup_float8x8 ag[4][2], au[4][2];
     for (uint i = 0; i < 4; i++) {
         for (uint j = 0; j < 2; j++) {
@@ -1687,11 +1689,7 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
         if (active) {
 #pragma clang loop unroll(full)
             for (uint kk = 0; kk < PREFILL_GU_BK; kk += 8) {
-                simdgroup_half8x8 a[4];
                 simdgroup_half8x8 bg[2], bu[2];
-                for (uint i = 0; i < 4; i++) {
-                    simdgroup_load(a[i], xt + (sm + 8 * i) * PREFILL_GU_LD + kk, PREFILL_GU_LD);
-                }
                 for (uint j = 0; j < 2; j++) {
                     simdgroup_load(bg[j], wt + (sn + 8 * j) * PREFILL_GU_LD + kk, PREFILL_GU_LD,
                                    ulong2(0, 0), true);
@@ -1699,9 +1697,14 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                                    PREFILL_GU_LD, ulong2(0, 0), true);
                 }
                 for (uint i = 0; i < 4; i++) {
+                    if (i >= live) {
+                        break;
+                    }
+                    simdgroup_half8x8 a;
+                    simdgroup_load(a, xt + (sm + 8 * i) * PREFILL_GU_LD + kk, PREFILL_GU_LD);
                     for (uint j = 0; j < 2; j++) {
-                        simdgroup_multiply_accumulate(ag[i][j], a[i], bg[j], ag[i][j]);
-                        simdgroup_multiply_accumulate(au[i][j], a[i], bu[j], au[i][j]);
+                        simdgroup_multiply_accumulate(ag[i][j], a, bg[j], ag[i][j]);
+                        simdgroup_multiply_accumulate(au[i][j], a, bu[j], au[i][j]);
                     }
                 }
             }
