@@ -195,13 +195,6 @@ mod mac {
                 "verify takes 1 to {MAX_ROWS} rows"
             );
             let (gpu, cfg) = (self.gpu, self.cfg);
-            assert!(
-                self.layers.iter().all(|l| match &l.mixer {
-                    Mixer::Full(_, c) => c.quant.is_none(),
-                    Mixer::Linear(..) => true,
-                }),
-                "the multi-row verify reads a half KV cache"
-            );
             let h = cfg.hidden_size;
             let vocab = self.lm_head.rows;
             let s = RowsScratch::new(gpu, cfg, self.allocated, rows);
@@ -368,6 +361,7 @@ mod mac {
         //!   scripts/mac.sh test --release --lib gpu_verify -- --ignored --nocapture
         use super::*;
         use crate::config::Config;
+        use crate::kv_quant::KvBits;
         use crate::plan::TokenParams;
         use crate::weights::Weights;
         use std::path::PathBuf;
@@ -461,7 +455,16 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn verify_matches_decode() {
-            check_verify(512);
+            check_verify(512, KvBits::Half);
+        }
+
+        /// The same over 8-bit and 4-bit KV caches, against decode over the
+        /// same kind of cache.
+        #[test]
+        #[ignore = "needs the model on the Mac"]
+        fn verify_matches_decode_quantized() {
+            check_verify(512, KvBits::Eight);
+            check_verify(302, KvBits::Four);
         }
 
         /// The same with caches that start at 302 tokens: the verify after
@@ -469,11 +472,15 @@ mod mac {
         #[test]
         #[ignore = "needs the model on the Mac"]
         fn verify_grows_the_cache() {
-            check_verify(302);
+            check_verify(302, KvBits::Half);
         }
 
         /// Verify against decode, with caches that start at `start` tokens.
-        fn check_verify(start: usize) {
+        /// A key that the verify and decode round to different codes moves
+        /// the logits more than half rounding does, hence the looser bound
+        /// on quantized caches.
+        fn check_verify(start: usize, bits: KvBits) {
+            let bound = if bits == KvBits::Half { 1e-5 } else { 1e-3 };
             // The first verify runs right after the prompt, so a start below
             // 300 + DRAFT.len() grows the caches inside it.
             let layers: usize = std::env::var("SAETTA_LAYERS")
@@ -482,16 +489,8 @@ mod mac {
             let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
             let (cfg, weights) = (Config::load(&dir).unwrap(), Weights::open(&dir).unwrap());
             let gpu = Gpu::new().unwrap();
-            let mut model = GpuModel::load_from(
-                &gpu,
-                &cfg,
-                &weights,
-                layers,
-                512,
-                start,
-                crate::kv_quant::KvBits::Half,
-            )
-            .unwrap();
+            let mut model =
+                GpuModel::load_from(&gpu, &cfg, &weights, layers, 512, start, bits).unwrap();
             model.enable_verify(DRAFT.len());
 
             // 300 tokens, so the rows' keys cross a chunk boundary.
@@ -505,7 +504,8 @@ mod mac {
                 }
             };
             // The rows decoded one by one, by a model whose caches never grow.
-            let mut decode = GpuModel::load(&gpu, &cfg, &weights, layers, 512).unwrap();
+            let mut decode =
+                GpuModel::load_with_bits(&gpu, &cfg, &weights, layers, 512, bits).unwrap();
             prompt(&mut decode);
             let want: Vec<Vec<f32>> = DRAFT.iter().map(|&t| decode.forward(t)).collect();
             let after: Vec<f32> = decode.forward(13);
@@ -517,10 +517,10 @@ mod mac {
                 for (r, w) in want.iter().enumerate() {
                     let got = model.verify_logits(r);
                     let err = rel_rms(&got, w);
-                    assert!(err < 1e-5, "row {r}: rel rms {err}");
+                    assert!(err < bound, "{bits:?} row {r}: rel rms {err}");
                     assert_eq!(argmax[r], crate::cpu::model::argmax(w), "row {r}");
                     if n == 1 {
-                        println!("row {r}: rel rms {err:.2e}");
+                        println!("{bits:?} row {r}: rel rms {err:.2e}");
                     }
                 }
                 model.accept(n);
@@ -531,8 +531,8 @@ mod mac {
                 }
                 let got = model.forward(13);
                 let err = rel_rms(&got, &after);
-                println!("accept {n}: next token rel rms {err:.2e}");
-                assert!(err < 1e-5, "accept {n}: rel rms {err}");
+                println!("{bits:?} accept {n}: next token rel rms {err:.2e}");
+                assert!(err < bound, "{bits:?} accept {n}: rel rms {err}");
             }
         }
 

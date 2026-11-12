@@ -464,7 +464,6 @@ mod mac {
             rows::record_proj(plan, &self.k_proj, m, x, &k, true);
             rows::record_proj(plan, &self.v_proj, m, x, &v, true);
 
-            let (keys, values) = (whole(&cache.keys), whole(&cache.values));
             let p = plan.constant(&[PrepParams {
                 heads: c.heads as u32,
                 kv_heads: c.kv_heads as u32,
@@ -479,12 +478,18 @@ mod mac {
                 offset: b.offset + (r * floats * 4) as u64,
             };
             // Each row's key and value go in at its own position, so the
-            // rows' preps are independent of each other.
+            // rows' preps are independent of each other. A quantized cache
+            // gets each row's k and v normed in place, then quantized.
             for (r, row_params) in params.iter().enumerate().take(m) {
+                let (kr, vr) = (row(&k, r, kv), row(&v, r, kv));
+                let (keys, values, kernel) = match &cache.quant {
+                    None => (whole(&cache.keys), whole(&cache.values), "attention_prep"),
+                    Some(_) => (kr.clone(), vr.clone(), "attention_prep_float"),
+                };
                 let buffers = [
                     &row(&q_and_gate, r, 2 * qs),
-                    &row(&k, r, kv),
-                    &row(&v, r, kv),
+                    &kr,
+                    &vr,
                     &self.q_norm,
                     &self.k_norm,
                     &row(&q, r, qs),
@@ -495,13 +500,26 @@ mod mac {
                 ];
                 let (grid, group) = (size(c.heads + c.kv_heads, 1), size(d, 1));
                 if r == 0 {
-                    plan.op("attention_prep", &buffers, grid, group);
+                    plan.op(kernel, &buffers, grid, group);
                 } else {
-                    plan.op_parallel("attention_prep", &buffers, grid, group);
+                    plan.op_parallel(kernel, &buffers, grid, group);
                 }
             }
-            s.attention
-                .record(plan, m, &q, &keys, &values, &q_and_gate, &attn, params);
+            match &cache.quant {
+                None => {
+                    let (keys, values) = (whole(&cache.keys), whole(&cache.values));
+                    s.attention
+                        .record(plan, m, &q, &keys, &values, &q_and_gate, &attn, params);
+                }
+                Some((kq, vq)) => {
+                    for (r, row_params) in params.iter().enumerate().take(m) {
+                        kq.record_at(plan, &row(&k, r, kv), row_params, r > 0);
+                        vq.record_at(plan, &row(&v, r, kv), row_params, true);
+                    }
+                    s.attention
+                        .record_quant(plan, m, &q, kq, vq, &q_and_gate, &attn, params);
+                }
+            }
             rows::record_proj(plan, &self.o_proj, m, &attn, out, false);
         }
     }
