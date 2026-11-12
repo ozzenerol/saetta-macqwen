@@ -536,6 +536,18 @@ mod mac {
         })
     }
 
+    /// Tokens per chunk, floats per head and chunk, and state rows per
+    /// threadgroup of delta_wy; must match kernels/delta_wy.metal.
+    const WY_C: usize = 64;
+    const WY_SIZE: usize = 2 * WY_C * 128 + WY_C * WY_C + WY_C;
+    const WY_R: usize = 16;
+
+    /// SAETTA_DELTA_WY=1: the delta rule in chunks of 64 tokens (WY form) on
+    /// delta_wy_prep and delta_wy_state, except where snapshots are kept.
+    fn delta_wy() -> bool {
+        std::env::var("SAETTA_DELTA_WY").is_ok_and(|v| v == "1")
+    }
+
     fn vector(gpu: &Gpu, weights: &Weights, name: &str) -> Result<View, String> {
         Ok(View::new(gpu.buffer_from(&weights.tensor(name)?.to_f32())))
     }
@@ -611,6 +623,8 @@ mod mac {
         mixer_out: Buffer,
         /// q after norm and rope, in half
         q_half: Buffer,
+        /// W, U, P and log gamma of every chunk for delta_wy (SAETTA_DELTA_WY=1).
+        wy: Option<Buffer>,
         router: Buffer,
         shared_gate: Buffer,
         shared_g: Buffer,
@@ -686,6 +700,7 @@ mod mac {
                 b: f(chunk * d.v_heads),
                 mixer_out: f(chunk * h),
                 q_half,
+                wy: delta_wy().then(|| f(chunk.div_ceil(WY_C) * d.v_heads * WY_SIZE)),
                 router: f(chunk * cfg.num_experts),
                 shared_gate: f(chunk),
                 shared_g: f(chunk * cfg.shared_expert_intermediate_size),
@@ -1480,6 +1495,29 @@ mod mac {
                 params(enc, 5, &p);
                 groups(enc, (t, 2 * c.k_heads + 1), 32);
 
+                if let (Some(wy), None, 128, 128) = (&self.scratch.wy, snaps, c.k_dim, c.v_dim) {
+                    let pad = t.next_multiple_of(WY_C);
+                    assert!(self.scratch.mixed.length() as usize >= pad * channels * 4);
+                    if pad > t {
+                        enc.set_compute_pipeline_state(&gpu.pipeline("delta_wy_zero_tail"));
+                        set_views(enc, 0, &[&mixed]);
+                        params(enc, 4, &p);
+                        enc.dispatch_threads(
+                            MTLSize::new(((pad - t) * channels) as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                    let wy = whole(wy);
+                    enc.set_compute_pipeline_state(&gpu.pipeline("delta_wy_prep"));
+                    set_views(enc, 0, &[&mixed, &a, &b, &wy]);
+                    params(enc, 4, &p);
+                    groups(enc, (t.div_ceil(WY_C), c.v_heads), 256);
+                    enc.set_compute_pipeline_state(&gpu.pipeline("delta_wy_state"));
+                    set_views(enc, 0, &[&mixed, &wy, &whole(&state.recurrent), &y]);
+                    params(enc, 4, &p);
+                    groups(enc, (c.v_dim / WY_R, c.v_heads), 128);
+                    return self.encode_deltanet_out(gpu, enc, w, &y, &z, out, t);
+                }
                 let lanes = delta_lanes();
                 let kernel = match (d3 > 0, lanes) {
                     (false, _) => "delta_rows2".to_string(),
