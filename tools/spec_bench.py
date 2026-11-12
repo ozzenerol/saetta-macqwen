@@ -19,12 +19,100 @@ READ_FILE = {"type": "function", "function": {
                    "properties": {"path": {"type": "string", "description": "Path of the file"}},
                    "required": ["path"]}}}
 
+# A file for the "file edit" case: the reply copies most of it, as a qh
+# edit that writes a whole file back does.
+EDIT_FILE = """use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+/// One entry of the inventory: a name, how many are in stock and the price
+/// of one in cents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Item {
+    pub name: String,
+    pub count: u32,
+    pub price_cents: u64,
+}
+
+/// Items by name.
+pub struct Inventory {
+    items: HashMap<String, Item>,
+}
+
+impl Inventory {
+    pub fn new() -> Inventory {
+        Inventory { items: HashMap::new() }
+    }
+
+    /// Reads lines of `name,count,price_cents`; blank lines and lines
+    /// starting with # are skipped.
+    pub fn load(path: &Path) -> Result<Inventory, String> {
+        let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut inventory = Inventory::new();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() != 3 {
+                return Err(format!("line {}: expected 3 fields, got {}", n + 1, parts.len()));
+            }
+            let count = parts[1].trim().parse().map_err(|_| format!("line {}: bad count", n + 1))?;
+            let price_cents = parts[2].trim().parse().map_err(|_| format!("line {}: bad price", n + 1))?;
+            inventory.add(Item { name: parts[0].trim().to_string(), count, price_cents });
+        }
+        Ok(inventory)
+    }
+
+    /// Adds `item`, or adds its count to the item of the same name.
+    pub fn add(&mut self, item: Item) {
+        match self.items.get_mut(&item.name) {
+            Some(existing) => existing.count += item.count,
+            None => {
+                self.items.insert(item.name.clone(), item);
+            }
+        }
+    }
+
+    /// Takes `count` of `name` out of stock.
+    pub fn remove(&mut self, name: &str, count: u32) -> Result<(), String> {
+        let item = self.items.get_mut(name).ok_or(format!("no item {name}"))?;
+        if item.count < count {
+            return Err(format!("only {} of {name} in stock", item.count));
+        }
+        item.count -= count;
+        Ok(())
+    }
+
+    /// The value of everything in stock, in cents.
+    pub fn total_value(&self) -> u64 {
+        self.items.values().map(|i| i.count as u64 * i.price_cents).sum()
+    }
+
+    /// Names of the items with fewer than `limit` in stock, sorted.
+    pub fn low_stock(&self, limit: u32) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .items
+            .values()
+            .filter(|i| i.count < limit)
+            .map(|i| i.name.as_str())
+            .collect();
+        names.sort();
+        names
+    }
+}
+"""
+
 CASES = {
     "code": ("Write a Rust function that parses a version string like 1.2.3 into a "
              "struct with major, minor and patch fields, and returns an error for bad "
              "input. Include tests.", []),
     "tool call": ("Open src/main.rs and tell me what the main function does.", [READ_FILE]),
     "prose": ("Explain in a few paragraphs why the sky is blue and why sunsets are red.", []),
+    "file edit": ("Here is src/inventory.rs:\n\n```rust\n" + EDIT_FILE + "```\n\n"
+                  "Rename the method total_value to stock_value. Reply with the whole "
+                  "updated file in one rust code block and nothing else.", []),
 }
 
 
