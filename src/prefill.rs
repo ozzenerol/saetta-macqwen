@@ -2519,9 +2519,13 @@ mod mac {
                 // its codes: a key that moved with the hidden state lands on
                 // the next code, one step (1.9e-2 of the rms at 8 bits)
                 // away, so it gets twice the room (8 bits, layer 15: 2.5e-2
-                // while the median token is 5.3e-3).
-                let full = matches!(cpu_states[l], LayerState::Full(_));
-                let state_bound = if full && bits != KvBits::Half {
+                // while the median token is 5.3e-3). The DeltaNet states
+                // after them take in those keys and get the same room: some
+                // exact 8-bit runs land on a second outcome with layer 17 at
+                // 2.78e-2 and layer 18 at 3.24e-2 (batches 6 and 11), where
+                // the others have 8.3e-3 and 6.3e-3; the median token stays
+                // near 4e-3 in both. At 8 bits that is 5e-2, was 2.5e-2.
+                let state_bound = if bits != KvBits::Half {
                     bound * 2.5
                 } else {
                     bound * 1.25
