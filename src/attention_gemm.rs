@@ -40,8 +40,10 @@ mod mac {
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
     /// Query slices a chunk's attention runs in, one after the other, unless
-    /// SAETTA_AG_SLICES says otherwise: the scratch is for one slice.
-    const SLICES: usize = 1;
+    /// SAETTA_AG_SLICES says otherwise: the scratch is for one slice. Two
+    /// take 113 MB less at chunk 2048 in the same time (32k prefill within
+    /// noise of one slice at 16 and 8 bits, 3k the same).
+    const SLICES: usize = 2;
 
     fn slices() -> usize {
         std::env::var("SAETTA_AG_SLICES")
