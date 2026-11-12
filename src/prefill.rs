@@ -226,6 +226,23 @@ mod mac {
     /// y columns per qmm_few threadgroup: 2 simdgroups of 4.
     const FEW_OUT: usize = 8;
 
+    /// Rows per pass of encode_few_experts: the rows kernels take 8.
+    const FEW_MOE_ROWS: usize = crate::rows::MAX_ROWS;
+    /// Simdgroups of moe_gate_up_mma3 and moe_down_mma3, as rows::MOE_SPLIT.
+    const FEW_MOE_SPLIT: usize = 8;
+
+    /// Up to this many tokens a chunk's experts run on encode_few_experts:
+    /// 64, or SAETTA_FEW_MOE=<n> (0 turns it off).
+    fn few_moe_max() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_FEW_MOE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+        })
+    }
+
     fn few_pipeline(gpu: &Gpu, w: &GpuQuant) -> metal::ComputePipelineState {
         match w.bits {
             5 => gpu.pipeline("qmm_few_5bit"),
@@ -583,6 +600,9 @@ mod mac {
         expert_half: Buffer,
         /// the x of a dense qmm2 in fast mode
         x_half: Buffer,
+        /// moe_union's distinct experts and slots for encode_few_experts
+        few_list: Buffer,
+        few_slots: Buffer,
         max_tiles: usize,
     }
 
@@ -625,6 +645,8 @@ mod mac {
                 normed_half: f(chunk * h / 2),
                 x_half: f(chunk * h.max(narrow) / 2),
                 expert_half: f(pairs * size / 2),
+                few_list: f(1 + FEW_MOE_ROWS * cfg.num_experts_per_tok),
+                few_slots: f(FEW_MOE_ROWS * FEW_MOE_ROWS * cfg.num_experts_per_tok),
                 max_tiles,
             }
         }
@@ -1636,6 +1658,67 @@ mod mac {
             }
         }
 
+        /// The experts of `t` <= few_moe_max() tokens, 8 rows at a time on
+        /// the verify rows' kernels (moe_union, moe_gate_up_mma3,
+        /// moe_down_mma3), in f32 as decode: each distinct expert of the 8
+        /// rows is read once, where the grouped path launches a tile grid
+        /// for all 256 experts. Leaves sum over k of weight * expert out in
+        /// expert_out `[t, hidden]`.
+        fn encode_few_experts(
+            &self,
+            gpu: &Gpu,
+            enc: &ComputeCommandEncoderRef,
+            e: &Experts,
+            normed: &View,
+            t: usize,
+        ) {
+            let s = &self.scratch;
+            let top_k = self.cfg.num_experts_per_tok;
+            let h = self.cfg.hidden_size;
+            let (g, up, d) = (&e.gate, &e.up, &e.down);
+            assert!(g.bits == 5 && d.bits == 5, "the rows MoE kernels are 5-bit");
+            let (list, slots) = (whole(&s.few_list), whole(&s.few_slots));
+            let eg = whole(&s.expert_g);
+            let split = FEW_MOE_SPLIT;
+            let threads = MTLSize::new(32 * split as u64, 1, 1);
+            for r0 in (0..t).step_by(FEW_MOE_ROWS) {
+                let m = FEW_MOE_ROWS.min(t - r0);
+                let ids = at(&s.ids, r0 * top_k);
+                let weights = at(&s.expert_weights, r0 * top_k);
+                // x reads FEW_MOE_ROWS rows from r0: the chunk scratch has them.
+                let x = View {
+                    buffer: normed.buffer.clone(),
+                    offset: normed.offset + (r0 * h * 4) as u64,
+                };
+                let y = at(&s.expert_out, r0 * h);
+
+                enc.set_compute_pipeline_state(&gpu.pipeline("moe_union"));
+                set_views(enc, 0, &[&ids, &list, &slots]);
+                params(enc, 3, &[m as u32, top_k as u32]);
+                groups(enc, (1, 1), 32);
+
+                enc.set_compute_pipeline_state(&gpu.pipeline(&format!("moe_gate_up_mma3_{split}")));
+                set_quant(enc, 0, g);
+                set_quant(enc, 3, up);
+                set_views(enc, 6, &[&x, &eg]);
+                params(enc, 8, &[g.rows as u32, g.cols as u32, top_k as u32]);
+                set_views(enc, 9, &[&list, &slots]);
+                params(enc, 11, &(m as u32));
+                enc.dispatch_thread_groups(
+                    MTLSize::new((g.rows / 8) as u64, (m * top_k) as u64, 1),
+                    threads,
+                );
+
+                enc.set_compute_pipeline_state(&gpu.pipeline(&format!("moe_down_mma3_{split}")));
+                set_quant(enc, 0, d);
+                set_views(enc, 3, &[&eg, &y]);
+                params(enc, 5, &[d.rows as u32, d.cols as u32, top_k as u32]);
+                set_views(enc, 6, &[&list, &slots, &weights]);
+                params(enc, 9, &(m as u32));
+                enc.dispatch_thread_groups(MTLSize::new((d.rows / 8) as u64, 1, 1), threads);
+            }
+        }
+
         /// x += moe(normed) for `t` tokens.
         fn encode_moe(
             &self,
@@ -1719,7 +1802,24 @@ mod mac {
                 };
                 params(enc, 3, &p);
                 groups(enc, (t, 1), 32);
-
+            }
+            if t <= few_moe_max() {
+                let e = &layer.experts;
+                if self.on("experts gate, up") {
+                    self.encode_few_experts(gpu, enc, e, normed, t);
+                }
+                if self.on("combine") {
+                    enc.set_compute_pipeline_state(&gpu.pipeline("moe_add_rows"));
+                    set_views(enc, 0, &[x, &sd, &shared_gate, &whole(&s.expert_out)]);
+                    params(enc, 4, &(h as u32));
+                    enc.dispatch_threads(
+                        MTLSize::new(h as u64, t as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+                return;
+            }
+            if self.on("route, group") {
                 enc.set_compute_pipeline_state(&gpu.pipeline("moe_group"));
                 set_views(enc, 0, &[&ids, &order, &rows, &tiles, &tile_count]);
                 let p = GroupParams {
@@ -1736,7 +1836,8 @@ mod mac {
                 tiles: &tiles,
                 rows: &rows,
                 tile_count: &tile_count,
-                max_tiles: (t * top_k).div_ceil(tile_rows) + cfg.num_experts,
+                // Every tile has a row: no more tiles than pairs.
+                max_tiles: ((t * top_k).div_ceil(tile_rows) + cfg.num_experts).min(t * top_k),
             };
             assert!(g.max_tiles <= s.max_tiles);
             let e = &layer.experts;
