@@ -43,6 +43,9 @@ mod mac {
         pre_hidden: View,
         norm: View,
         fc: GpuQuant<'a>,
+        /// lm_head, or the parts of it the drafts pick from (`draft_heads`),
+        /// each with its first token id. Their logits sit one after another.
+        heads: Vec<(usize, GpuQuant<'a>)>,
         lm_head: GpuQuant<'a>,
         scratch: Scratch,
         /// fc's input: the normed embedding, then the normed hidden state.
@@ -91,13 +94,15 @@ mod mac {
                 capacity,
             )?;
             let lm_head = matrix(gpu, weights, cfg, "language_model.lm_head")?;
-            let logits = view(gpu, lm_head.rows);
+            let heads = draft_heads(&lm_head, cfg, vocab_from_env());
+            let logits = view(gpu, heads.iter().map(|(_, h)| h.rows).sum());
             let parts = Parts {
                 embed: load_embed(gpu, cfg, weights)?,
                 pre_embedding: v("pre_fc_norm_embedding")?,
                 pre_hidden: v("pre_fc_norm_hidden")?,
                 norm: v("norm")?,
                 fc: matrix(gpu, weights, cfg, &format!("{PREFIX}.fc"))?,
+                heads,
                 lm_head,
                 scratch: Scratch::new(gpu, cfg),
                 cat: view(gpu, 2 * hidden),
@@ -152,6 +157,19 @@ mod mac {
         fn resize(&mut self, capacity: usize) {
             self.layer.resize(self.gpu, capacity);
             self.capacity = capacity;
+            self.rebuild();
+        }
+
+        /// Drafts from the first `vocab` ids and the special tokens only, as
+        /// SAETTA_MTP_VOCAB does; 0 drafts from all of them.
+        pub fn set_draft_vocab(&mut self, vocab: usize) {
+            let p = &mut self.parts;
+            p.heads = draft_heads(&p.lm_head, self.cfg, vocab);
+            p.logits = view(self.gpu, p.heads.iter().map(|(_, h)| h.rows).sum());
+            self.rebuild();
+        }
+
+        fn rebuild(&mut self) {
             let (plan, record_plan) = record_plans(
                 self.gpu,
                 self.cfg,
@@ -178,7 +196,14 @@ mod mac {
         /// token; `output()` then holds the new hidden state.
         pub fn step(&mut self, hidden: &View, token: u32) -> u32 {
             self.run(hidden, token, true);
-            contents::<u32>(&self.token.buffer, 1)[0]
+            let mut i = contents::<u32>(&self.token.buffer, 1)[0] as usize;
+            for (first, head) in &self.parts.heads {
+                if i < head.rows {
+                    return (first + i) as u32;
+                }
+                i -= head.rows;
+            }
+            unreachable!("argmax past the logits")
         }
 
         /// `step` without the draft: adds the cache entry and sets
@@ -232,6 +257,55 @@ mod mac {
         }
     }
 
+    /// Token ids the drafts pick from by default, besides the special
+    /// tokens. Measured with spec_bench (batch 6): 65536 keeps the
+    /// acceptance closer to the full vocabulary than 32768 (0.81, 0.66,
+    /// 0.72 vs 0.84, 0.55, 0.58 by draft) at the same speed, code 163.7 vs
+    /// 152.6 tok/s and prose 132.9 vs 122.0; 16384 gains nothing.
+    pub const DRAFT_VOCAB: usize = 65536;
+
+    /// SAETTA_MTP_VOCAB=N drafts only from the first N token ids and the
+    /// special tokens; 0 drafts from the whole vocabulary. Unset is
+    /// `DRAFT_VOCAB`.
+    fn vocab_from_env() -> usize {
+        std::env::var("SAETTA_MTP_VOCAB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DRAFT_VOCAB)
+    }
+
+    /// The parts of lm_head the drafts pick from. With `vocab` > 0, the
+    /// first `vocab` ids (byte-level BPE gives the earlier merges, the
+    /// common tokens, the lower ids) and the special tokens from the
+    /// lowest end-of-text id on, which tool calls and the chat template
+    /// need. lm_head is most of a draft step, so 64k of 248k ids make a
+    /// step several times cheaper; a draft outside them is a miss, never a
+    /// wrong output.
+    fn draft_heads<'a>(
+        lm_head: &GpuQuant<'a>,
+        cfg: &Config,
+        vocab: usize,
+    ) -> Vec<(usize, GpuQuant<'a>)> {
+        let rows = lm_head.rows;
+        // qmv writes 8 rows per threadgroup; keep both parts whole.
+        let special = cfg
+            .eos_token_ids
+            .iter()
+            .copied()
+            .min()
+            .map_or(rows, |t| t as usize)
+            / 8
+            * 8;
+        let vocab = vocab.next_multiple_of(8);
+        if vocab == 0 || vocab >= special {
+            return vec![(0, lm_head.row_range(0, rows))];
+        }
+        vec![
+            (0, lm_head.row_range(0, vocab)),
+            (special, lm_head.row_range(special, rows - special)),
+        ]
+    }
+
     /// The step plan (with lm_head and the argmax) and the record plan
     /// (without), both up to the output hidden state.
     fn record_plans<'a>(
@@ -259,8 +333,16 @@ mod mac {
             plan
         };
         let mut plan = layer_plan();
-        p.lm_head.record(&mut plan, output, &p.logits, false);
-        record_argmax(&mut plan, &p.logits, p.lm_head.rows, token);
+        let mut n = 0;
+        for (_, head) in &p.heads {
+            let at = View {
+                buffer: p.logits.buffer.clone(),
+                offset: p.logits.offset + (n * 4) as u64,
+            };
+            head.record(&mut plan, output, &at, false);
+            n += head.rows;
+        }
+        record_argmax(&mut plan, &p.logits, n, token);
         (plan, layer_plan())
     }
 
@@ -308,6 +390,47 @@ mod mac {
             }
         }
 
+        /// With a small draft vocabulary the draft is the argmax of the full
+        /// logits over the ids kept: the first ones and the special tokens.
+        #[test]
+        #[ignore = "needs the model and mtp.safetensors on the Mac"]
+        fn small_draft_vocab_takes_the_argmax_of_its_ids() {
+            let dir = PathBuf::from(std::env::var("HOME").unwrap()).join(MODEL_DIR);
+            let cfg = Config::load(&dir).unwrap();
+            let weights = Weights::open(&dir).unwrap();
+            let gpu = Gpu::new().unwrap();
+            let mut g = GpuMtp::load(&gpu, &cfg, &weights, 64).unwrap();
+            let vocab = 4096;
+            let special = *cfg.eos_token_ids.iter().min().unwrap() as usize / 8 * 8;
+            let tokens = [9707u32, 11, 1879, 0, 198, 248046];
+            let (mut hits, mut special_hits) = (0, 0);
+            for (t, &token) in tokens.iter().enumerate() {
+                let h = View::new(gpu.buffer_from(&hidden(t)));
+                g.set_draft_vocab(0);
+                let full = g.step(&h, token);
+                let logits = contents::<f32>(&g.parts.logits.buffer, cfg.vocab_size).to_vec();
+                assert_eq!(full, argmax(&logits));
+                let mut kept = logits.clone();
+                for (i, l) in kept.iter_mut().enumerate() {
+                    if (vocab..special).contains(&i) {
+                        *l = f32::NEG_INFINITY;
+                    }
+                }
+                let want = argmax(&kept) as usize;
+                g.truncate(g.len() - 1);
+                g.set_draft_vocab(vocab);
+                let got = g.step(&h, token) as usize;
+                println!("step {t}: full {full}, small {got}, want {want}");
+                assert_eq!(got, want);
+                hits += usize::from(got as u32 == full);
+                special_hits += usize::from(got >= special);
+            }
+            println!(
+                "{hits} of {} drafts equal, {special_hits} special",
+                tokens.len()
+            );
+        }
+
         /// A made-up normed hidden state, standing in for the main model's.
         fn hidden(t: usize) -> Vec<f32> {
             let x: Vec<f32> = (0..2048)
@@ -344,6 +467,8 @@ mod mac {
             let mtp = Mtp::new(&cfg, &weights, MtpPosition::Hidden).unwrap();
             let gpu = Gpu::new().unwrap();
             let mut g = GpuMtp::load(&gpu, &cfg, &weights, 64).unwrap();
+            // The CPU drafts from the whole vocabulary.
+            g.set_draft_vocab(0);
             let mut state = mtp.new_state();
             // The GPU stores the MTP keys and values as half; so does the CPU.
             if let LayerState::Full(c) = &mut state {

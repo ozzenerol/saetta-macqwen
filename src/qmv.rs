@@ -99,6 +99,31 @@ mod mac {
 
         /// Records y = W x. `x` holds `cols` f32 values, `y` gets `rows`.
         /// `parallel` marks it independent of the op recorded before it.
+        /// Rows `from .. from + n` of a plain matrix, as views of the same
+        /// buffers.
+        pub fn row_range(&self, from: usize, n: usize) -> GpuQuant<'a> {
+            assert_eq!(self.experts, 1, "a plain matrix");
+            assert!(from + n <= self.rows, "rows {from} + {n} of {}", self.rows);
+            let words = (from * self.cols * self.bits as usize / 8) as u64;
+            // One BF16 scale and bias per 64 columns.
+            let groups = (from * self.cols / 64 * 2) as u64;
+            let at = |v: &View, bytes: u64| View {
+                buffer: v.buffer.clone(),
+                offset: v.offset + bytes,
+            };
+            GpuQuant {
+                words: at(&self.words, words),
+                scales: at(&self.scales, groups),
+                biases: at(&self.biases, groups),
+                experts: 1,
+                rows: n,
+                cols: self.cols,
+                bits: self.bits,
+                copies: 0,
+                weights: PhantomData,
+            }
+        }
+
         pub fn record(&self, plan: &mut Plan, x: &View, y: &View, parallel: bool) {
             assert_eq!(self.experts, 1, "stacked experts go through moe");
             let kernel = match self.bits {
