@@ -4,6 +4,16 @@
 //! as qmm does, with an online softmax between them. The scores of one
 //! block of KEYS keys are written out and read back, which costs memory
 //! traffic but lets the products use large tiles at head dim 256.
+//!
+//! Measured with `bench-attention-gemm` (last 2048-token chunk, M3 Max, two
+//! runs each): at 32k scores 44 ms (12 TFLOP/s), softmax 19 ms, pv 50 ms
+//! (10.8 TFLOP/s), about 113 ms in all; at 118k scores 164, softmax 67, pv
+//! 180 ms. pv was 54 ms (9.9 TFLOP/s) with 26 KB of threadgroup memory and
+//! gained from sharing its staging tile with the P and V tiles, so
+//! threadgroup memory limits it. Two changes that were slower: the softmax
+//! inside the scores kernel with a max per 64-key tile (8.5 against 9.1
+//! TFLOP/s in all) and pv's update alpha O + P V in the accumulators (pv
+//! 6.6 TFLOP/s).
 
 /// Keys per block; must match PREFILL_AG_KEYS.
 pub const KEYS: usize = 1024;
