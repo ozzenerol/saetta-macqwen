@@ -39,11 +39,22 @@ mod mac {
     use crate::qmv::View;
     use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 
+    /// SAETTA_AG_FUSED=1: the softmax in the scores kernel
+    /// (prefill_ag_scores_p, prefill_ag_pv_f), with no f32 scores.
+    fn fused() -> bool {
+        std::env::var("SAETTA_AG_FUSED").as_deref() == Ok("1")
+    }
+
     /// The buffers of one block for chunks of up to `chunk` tokens: scores,
     /// P, the output sums and the per-row softmax state.
     pub struct AttGemm {
         rows_pad: usize,
+        fused: bool,
+        /// f32 scores, or with `fused` the per-tile max and sum.
         s: Buffer,
+        /// With `fused`, the m and l the next block reads.
+        m2: Buffer,
+        l2: Buffer,
         p: Buffer,
         o: Buffer,
         m: Buffer,
@@ -53,13 +64,19 @@ mod mac {
 
     impl AttGemm {
         /// About 7 KB per query row: 112 KB per token of chunk with 2 kv
-        /// heads, 230 MB for 2048 tokens.
+        /// heads, 230 MB for 2048 tokens. Fused, the scores take 128 B a
+        /// row instead of 4 KB: 100 MB for 2048 tokens.
         pub fn new(gpu: &Gpu, chunk: usize, kv_heads: usize) -> AttGemm {
             let rows_pad = (chunk * GROUP).next_multiple_of(64);
             let rows = kv_heads * rows_pad;
+            let fused = fused();
+            let tiles = KEYS / 64;
             AttGemm {
                 rows_pad,
-                s: gpu.buffer(rows * KEYS * 4),
+                fused,
+                s: gpu.buffer(if fused { 2 * rows * tiles * 4 } else { rows * KEYS * 4 }),
+                m2: gpu.buffer(rows * 4),
+                l2: gpu.buffer(rows * 4),
                 p: gpu.buffer(rows * KEYS * 2),
                 o: gpu.buffer(rows * DIM * 4),
                 m: gpu.buffer(rows * 4),
@@ -126,10 +143,29 @@ mod mac {
                 Some(KvBits::Four) => "_q4",
                 Some(b) => panic!("no gemm attention for {b:?} rows"),
             };
-            let (scores, pv) = (
-                gpu.pipeline(&format!("prefill_ag_scores{suffix}")),
-                gpu.pipeline(&format!("prefill_ag_pv{suffix}")),
+            let (scores, pv) = if self.fused {
+                (
+                    gpu.pipeline(&format!("prefill_ag_scores_p{suffix}")),
+                    gpu.pipeline(&format!("prefill_ag_pv_f{suffix}")),
+                )
+            } else {
+                (
+                    gpu.pipeline(&format!("prefill_ag_scores{suffix}")),
+                    gpu.pipeline(&format!("prefill_ag_pv{suffix}")),
+                )
+            };
+            // Fused: the per-tile max and sum share the s buffer, and m, l
+            // alternate between two pairs, block by block.
+            let tile_bytes = (self.rows_pad * f.kv_heads as usize * (KEYS / 64) * 4) as u64;
+            let (mt, lt) = (
+                whole(&self.s),
+                View {
+                    buffer: self.s.clone(),
+                    offset: tile_bytes,
+                },
             );
+            let (m2, l2) = (whole(&self.m2), whole(&self.l2));
+            let mut last_l = &l;
             // The codes, scales and biases of keys and values; the half
             // kernels do not read these slots, so they get the half cache.
             let parts = |r: &QuantRows| [whole(&r.data), whole(&r.scales), whole(&r.biases)];
@@ -145,7 +181,12 @@ mod mac {
                     enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
                 }
             };
-            for j0 in (0..end).step_by(KEYS) {
+            let set_from = |first: u64, views: &[&View]| {
+                for (i, v) in views.iter().enumerate() {
+                    enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
+                }
+            };
+            for (b, j0) in (0..end).step_by(KEYS).enumerate() {
                 let n = KEYS.min(end - j0);
                 let params = Params {
                     rows: rows as u32,
@@ -157,6 +198,33 @@ mod mac {
                     n: n as u32,
                     scale: f.scale,
                 };
+                if self.fused {
+                    let ((m_in, l_in), (m_out, l_out)) = if b % 2 == 0 {
+                        ((&m2, &l2), (&m, &l))
+                    } else {
+                        ((&m, &l), (&m2, &l2))
+                    };
+                    enc.set_compute_pipeline_state(&scores);
+                    set(&[q, keys, &p]);
+                    bytes(3, &params);
+                    set_at(4, &kq);
+                    set_from(7, &[&mt, &lt]);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n.div_ceil(64) as u64, row_tiles, kv),
+                        MTLSize::new(128, 1, 1),
+                    );
+                    enc.set_compute_pipeline_state(&pv);
+                    set(&[&p, values, &o, &mt]);
+                    bytes(4, &params);
+                    set_at(5, &vq);
+                    set_from(8, &[&lt, m_in, l_in, m_out, l_out]);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((DIM / 64) as u64, row_tiles, kv),
+                        MTLSize::new(128, 1, 1),
+                    );
+                    last_l = l_out;
+                    continue;
+                }
                 enc.set_compute_pipeline_state(&scores);
                 set(&[q, keys, &s]);
                 bytes(3, &params);
@@ -194,7 +262,7 @@ mod mac {
                 scale: f.scale,
             };
             enc.set_compute_pipeline_state(&gpu.pipeline("prefill_ag_final"));
-            set(&[&o, &l, q_and_gate, out]);
+            set(&[&o, last_l, q_and_gate, out]);
             bytes(4, &params);
             enc.dispatch_threads(
                 MTLSize::new(DIM as u64, rows as u64, kv),
