@@ -1715,9 +1715,12 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                     simdgroup_load(bu[j], wt + (PREFILL_GU64_BN + sn + 8 * j) * PREFILL_GU_LD + kk,
                                    PREFILL_GU_LD, ulong2(0, 0), true);
                 }
+                // Unrolled with a test, not a break, so i stays a constant and
+                // the accumulators stay in registers.
+#pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; i++) {
                     if (i >= live) {
-                        break;
+                        continue;
                     }
                     simdgroup_half8x8 a;
                     simdgroup_load(a, xt + (sm + 8 * i) * PREFILL_GU_LD + kk, PREFILL_GU_LD);

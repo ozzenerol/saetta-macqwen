@@ -177,9 +177,12 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
                 for (uint j = 0; j < FN; j++) {
                     simdgroup_load(b[j], st.w + (sn + 8 * j) * QMM_LD + kk, QMM_LD, ulong2(0, 0), true);
                 }
+                // Unrolled with a test, not a break, so i stays a constant and
+                // the accumulators stay in registers.
+#pragma clang loop unroll(full)
                 for (uint i = 0; i < FM; i++) {
                     if (i >= live) {
-                        break;
+                        continue;
                     }
                     simdgroup_half8x8 a;
                     simdgroup_load(a, st.x + (sm + 8 * i) * QMM_LD + kk, QMM_LD);
