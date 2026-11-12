@@ -49,6 +49,9 @@ mod mac {
         m: Buffer,
         l: Buffer,
         alpha: Buffer,
+        /// For the bench: encode only the first `stages` passes of each
+        /// block (1 scores, 2 softmax, 3 pv) and no final; 0 runs all.
+        pub stages: std::cell::Cell<usize>,
     }
 
     impl AttGemm {
@@ -65,6 +68,7 @@ mod mac {
                 m: gpu.buffer(rows * 4),
                 l: gpu.buffer(rows * 4),
                 alpha: gpu.buffer(rows * 4),
+                stages: std::cell::Cell::new(0),
             }
         }
 
@@ -166,6 +170,10 @@ mod mac {
                     MTLSize::new(128, 1, 1),
                 );
 
+                let stages = self.stages.get();
+                if stages == 1 {
+                    continue;
+                }
                 enc.set_compute_pipeline_state(&gpu.pipeline("prefill_ag_softmax"));
                 set(&[&s, &p, &m, &l, &alpha]);
                 bytes(5, &params);
@@ -174,6 +182,9 @@ mod mac {
                     MTLSize::new(256, 1, 1),
                 );
 
+                if stages == 2 {
+                    continue;
+                }
                 enc.set_compute_pipeline_state(&pv);
                 set(&[&p, values, &o, &alpha]);
                 bytes(4, &params);
@@ -193,6 +204,9 @@ mod mac {
                 n: 0,
                 scale: f.scale,
             };
+            if self.stages.get() != 0 {
+                return;
+            }
             enc.set_compute_pipeline_state(&gpu.pipeline("prefill_ag_final"));
             set(&[&o, &l, q_and_gate, out]);
             bytes(4, &params);
@@ -270,6 +284,25 @@ mod mac {
                     tm * chunks as f64 * layers as f64,
                 );
             }
+            // The gemm passes of the last chunk one by one, as differences
+            // of runs that stop after scores, softmax and pv.
+            let mut prefix = [0.0f64; 4];
+            for (k, t) in prefix.iter_mut().enumerate().skip(1) {
+                gemm.stages.set(k);
+                *t = time(true, last);
+            }
+            gemm.stages.set(0);
+            let all = time(true, last);
+            let half_flops = flops(last) / 2.0;
+            println!(
+                "gemm stages at context {n}, last chunk: scores {:6.1} ms ({:4.1} TFLOP/s), softmax {:6.1} ms, pv {:6.1} ms ({:4.1} TFLOP/s), final {:5.1} ms",
+                prefix[1] * 1e3,
+                half_flops / prefix[1] / 1e12,
+                (prefix[2] - prefix[1]) * 1e3,
+                (prefix[3] - prefix[2]) * 1e3,
+                half_flops / (prefix[3] - prefix[2]) / 1e12,
+                (all - prefix[3]) * 1e3,
+            );
             // Both outputs are now of the last chunk (time ran it last).
             time(false, last);
             time(true, last);
