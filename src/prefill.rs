@@ -995,13 +995,25 @@ mod mac {
             let x = gpu.buffer(n * self.cfg.hidden_size * 4);
             let ids = gpu.buffer_from(tokens);
             let logits = gpu.buffer(self.lm_head.rows * 4);
-            gpu.run(|enc| {
+            let start = std::time::Instant::now();
+            let (after_commit, gpu_s) = gpu.run_timed(metal::MTLDispatchType::Serial, |enc| {
                 self.encode_embed(gpu, enc, &ids, &x, n);
                 for (l, state) in states.iter().enumerate() {
                     self.encode_layer(gpu, enc, l, &x, n, pos, state);
                 }
                 self.encode_logits(gpu, enc, &x, n, &logits);
             });
+            if std::env::var_os("SAETTA_PREFILL_TIMES").is_some() {
+                let total = start.elapsed().as_secs_f64();
+                let wait = after_commit.as_secs_f64();
+                eprintln!(
+                    "prefill {n} tokens: encode {:.2} ms, GPU {:.2} ms, commit to done {:.2} ms, total {:.2} ms",
+                    (total - wait) * 1e3,
+                    gpu_s * 1e3,
+                    wait * 1e3,
+                    total * 1e3
+                );
+            }
             (contents::<f32>(&logits, self.lm_head.rows).to_vec(), x)
         }
 
