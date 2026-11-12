@@ -198,6 +198,20 @@ mod mac {
             dispatch: MTLDispatchType,
             encode: impl FnOnce(&ComputeCommandEncoderRef),
         ) -> (Duration, f64) {
+            // The queue hands out autoreleased command buffers and encoders,
+            // and server threads have no pool of their own, so without this
+            // every command buffer of a request, with the buffers it retains,
+            // stayed alive until its thread ended.
+            metal::objc::rc::autoreleasepool(|| self.run_timed_in_pool(dispatch, encode))
+        }
+
+        // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+        #[allow(unexpected_cfgs)]
+        fn run_timed_in_pool(
+            &self,
+            dispatch: MTLDispatchType,
+            encode: impl FnOnce(&ComputeCommandEncoderRef),
+        ) -> (Duration, f64) {
             use metal::objc::{msg_send, sel, sel_impl};
             let commands = self.queue.new_command_buffer();
             let encoder = commands.compute_command_encoder_with_dispatch_type(dispatch);
@@ -247,12 +261,14 @@ mod mac {
         /// committed later on the queue runs after the copies, so callers
         /// only wait (on the returned command buffer) to time them.
         pub fn blit(&self, encode: impl FnOnce(&BlitCommandEncoderRef)) -> CommandBuffer {
-            let commands = self.queue.new_command_buffer().to_owned();
-            let encoder = commands.new_blit_command_encoder();
-            encode(encoder);
-            encoder.end_encoding();
-            commands.commit();
-            commands
+            metal::objc::rc::autoreleasepool(|| {
+                let commands = self.queue.new_command_buffer().to_owned();
+                let encoder = commands.new_blit_command_encoder();
+                encode(encoder);
+                encoder.end_encoding();
+                commands.commit();
+                commands
+            })
         }
     }
 

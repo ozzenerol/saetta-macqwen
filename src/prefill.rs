@@ -1480,11 +1480,27 @@ mod mac {
                 };
                 let (k, v) = (whole(&cache.keys), whole(&cache.values));
                 match &self.gemm {
-                    Some(gemm) if kernel == "gemm" => {
-                        gemm.encode(enc, gpu, &q_in, &k, &v, cache.quant.as_ref(), &q_and_gate, &y, p)
-                    }
+                    Some(gemm) if kernel == "gemm" => gemm.encode(
+                        enc,
+                        gpu,
+                        &q_in,
+                        &k,
+                        &v,
+                        cache.quant.as_ref(),
+                        &q_and_gate,
+                        &y,
+                        p,
+                    ),
                     _ => crate::attention_prefill::encode(
-                        enc, gpu, kernel, &q_in, &k, &v, &q_and_gate, &y, p,
+                        enc,
+                        gpu,
+                        kernel,
+                        &q_in,
+                        &k,
+                        &v,
+                        &q_and_gate,
+                        &y,
+                        p,
                     ),
                 }
                 self.record(gpu, enc, 2, &y, t * c.heads * d);
@@ -1642,7 +1658,16 @@ mod mac {
                 } else if fused {
                     to_half(gpu, enc, normed, &normed_half, t * h);
                     gate_up_grouped(
-                        gpu, enc, &e.gate, &e.up, normed, &normed_half, &eg, &eu, &expert_half, &g,
+                        gpu,
+                        enc,
+                        &e.gate,
+                        &e.up,
+                        normed,
+                        &normed_half,
+                        &eg,
+                        &eu,
+                        &expert_half,
+                        &g,
                     );
                 } else {
                     to_half(gpu, enc, normed, &normed_half, t * h);

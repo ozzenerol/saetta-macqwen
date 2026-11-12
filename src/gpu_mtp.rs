@@ -136,7 +136,21 @@ mod mac {
                 return;
             }
             let capacity = kv_grow(self.capacity, need, self.limit);
-            self.layer.grow(self.gpu, capacity);
+            self.resize(capacity);
+        }
+
+        /// Shrinks the cache to the smallest step that holds `need` steps,
+        /// when that is at most half of what it holds now, as
+        /// `GpuModel::shrink` does.
+        pub fn shrink(&mut self, need: usize) {
+            let fit = kv_grow(kv_start(self.limit), need.clamp(1, self.limit), self.limit);
+            if fit * 2 <= self.capacity {
+                self.resize(fit);
+            }
+        }
+
+        fn resize(&mut self, capacity: usize) {
+            self.layer.resize(self.gpu, capacity);
             self.capacity = capacity;
             let (plan, record_plan) = record_plans(
                 self.gpu,
