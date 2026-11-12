@@ -6,6 +6,13 @@ kernel void add_one(device float *data [[buffer(0)]],
     data[i] += 1.0f;
 }
 
+// f16 prompt cache snapshots (gpu_cache.rs); to_half (prefill.metal) saves.
+kernel void from_half(device const half *x [[buffer(0)]],
+                      device float *y [[buffer(1)]],
+                      uint i [[thread_position_in_grid]]) {
+    y[i] = float(x[i]);
+}
+
 kernel void copy_u32(device const uint *src [[buffer(0)]],
                      device uint *dst [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) {

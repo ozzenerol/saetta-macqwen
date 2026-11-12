@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta prefill-gap <model dir> <tokens> <gap s> | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
+const USAGE: &str = "usage: saetta gpu-check | saetta info <model dir> | saetta convert <mlx dir> <out dir> | saetta convert-mtp <hf mtp file> <model dir> | saetta serve <model dir> [--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--half-snapshots] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N] [--exact-history] | saetta eval <model dir> <ref dir> [--gpu] [--long N] [--decode] [--no-ppl] [--kv-bits 16|8|4] | saetta bench-qmv <model dir> | saetta bench-moe <model dir> | saetta bench-prefill <model dir> <tokens> [chunk [16|8|4]] | saetta bench-serve-prefill <model dir> <tokens> <every> | saetta profile-prefill <model dir> <tokens> [last] | saetta prefill-gap <model dir> <tokens> <gap s> | saetta bench-attention | saetta bench-attention-prefill [context...] | saetta bench-attention-gemm [context...] | saetta kernel-info <kernel...> | saetta bench-decode <model dir> [context [16|8|4]] | saetta profile-token <model dir>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -263,6 +263,9 @@ struct Memory {
     /// Snapshots unused for this long go when they keep the KV caches more
     /// than twice as long as a request needs; None keeps them.
     cache_idle: Option<std::time::Duration>,
+    /// Prompt cache snapshots in f16 (`--half-snapshots`): half the bytes,
+    /// and a restore starts from rounded DeltaNet states.
+    half_snapshots: bool,
 }
 
 impl Default for Memory {
@@ -273,11 +276,12 @@ impl Default for Memory {
             cache_bytes: 1 << 30,
             kv_bits: KvBits::Half,
             cache_idle: Some(std::time::Duration::from_secs(15 * 60)),
+            half_snapshots: false,
         }
     }
 }
 
-/// `[--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N]
+/// `[--gpu] [--draft K] [--lookup K] [--context N] [--cache-mb N] [--half-snapshots] [--cache-idle-min M] [--kv-bits 16|8|4] [--port N]
 /// [--exact-history]` after `serve <dir>`.
 fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
     let mut draft = None;
@@ -328,6 +332,7 @@ fn serve_flags(flags: &[&str]) -> Result<ServeFlags, String> {
                 let value = it.next().ok_or("--kv-bits needs 16, 8 or 4")?;
                 f.memory.kv_bits = KvBits::parse(value).ok_or(format!("bad --kv-bits {value}"))?;
             }
+            "--half-snapshots" => f.memory.half_snapshots = true,
             "--cache-mb" => {
                 let value = it.next().ok_or("--cache-mb needs a number")?;
                 let mb: usize = value
@@ -496,13 +501,17 @@ fn load_gpu(
     )?;
     parts.add("model");
     let layers = model.deltanet_states();
-    let snapshot: usize = layers
+    let mut snapshot: usize = layers
         .iter()
         .map(|s| (s.conv.length() + s.recurrent.length()) as usize)
         .sum();
+    if memory.half_snapshots {
+        snapshot /= 2;
+    }
     // The cache adds a snapshot before it evicts one, so the pool has one more.
     let snapshots = (memory.cache_bytes / snapshot).max(2) - 1;
-    let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, snapshots + 1);
+    let pool = saetta::gpu_cache::SnapshotPool::new(gpu, &layers, snapshots + 1)
+        .half(memory.half_snapshots);
     let mut prefill = saetta::prefill::Prefill::new(gpu, config, weights, serve_chunk())?;
     prefill.exact = exact_prefill();
     parts.add("prefill");
@@ -552,13 +561,20 @@ struct BufferParts<'a> {
 #[cfg(target_os = "macos")]
 impl<'a> BufferParts<'a> {
     fn new(gpu: &'a saetta::gpu::Gpu) -> Self {
-        let mut p = BufferParts { gpu, last: 0, parts: Vec::new() };
+        let mut p = BufferParts {
+            gpu,
+            last: 0,
+            parts: Vec::new(),
+        };
         p.last = p.own();
         p
     }
 
     fn own(&self) -> u64 {
-        self.gpu.device.current_allocated_size().saturating_sub(self.gpu.no_copy_bytes())
+        self.gpu
+            .device
+            .current_allocated_size()
+            .saturating_sub(self.gpu.no_copy_bytes())
     }
 
     fn add(&mut self, name: &'static str) {
@@ -757,7 +773,11 @@ impl server::Model for GpuServed {
             return Vec::new();
         }
         self.decoded = 0;
-        saetta::memtrace::mark(&format!("prefill {} tokens at {}", tokens.len(), m.position()));
+        saetta::memtrace::mark(&format!(
+            "prefill {} tokens at {}",
+            tokens.len(),
+            m.position()
+        ));
         // The prefill writes the KV rows of all the tokens, and the MTP cache
         // never holds more entries than the model has tokens.
         let need = m.position() + tokens.len();
