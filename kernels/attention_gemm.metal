@@ -307,3 +307,226 @@ kernel void prefill_ag_final(device const float *o [[buffer(0)]],
     float gate = q_and_gate[2 * at + PREFILL_AG_D + d];
     y[at + d] = o[row * PREFILL_AG_D + d] / l[row] * sigmoid(gate);
 }
+
+// The fused variant (SAETTA_AG_FUSED=1): no softmax pass. The scores kernel
+// writes sh = scale S - t in half, with t the row's max over the keys it
+// sees in the 64-key tile (-inf for the keys it does not see), and t to
+// tmax[g][r][tile]. pv takes the row's new max m from m_in and the tile
+// maxes, loads P = exp(sh + t - m) into its tile, and the dim-0 threadgroup
+// writes m and l to m_out and l_out. Each thread loads, scales and writes
+// back the same row, so the row state stays in registers.
+constant uint PREFILL_AG_TILES = PREFILL_AG_KEYS / 64;
+
+template <uint BITS>
+kernel void prefill_ag_scores_f(device const half *q [[buffer(0)]],
+                                device const half *keys [[buffer(1)]],
+                                device half *sh [[buffer(2)]],
+                                constant AttGemmParams &p [[buffer(3)]],
+                                device const uint *codes [[buffer(4)]],
+                                device const half *scales [[buffer(5)]],
+                                device const half *biases [[buffer(6)]],
+                                device float *tmax [[buffer(7)]],
+                                uint3 tg [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint simd [[simdgroup_index_in_threadgroup]]) {
+    // The q and key tiles while the product runs, then the 64 x 64 scores.
+    threadgroup float c[64 * 64];
+    threadgroup half *qt = (threadgroup half *)c;
+    threadgroup half *kt = qt + 64 * PREFILL_AG_LD;
+    uint g = tg.z, r0 = tg.y * 64, k0 = tg.x * 64;
+    uint last_row = min(r0 + 63, p.rows - 1);
+    if (int(k0) > prefill_ag_limit(p, last_row)) {
+        return;
+    }
+
+    uint lr = tid / 2, lc = (tid % 2) * 16;
+    bool q_ok = r0 + lr < p.rows;
+    bool k_ok = k0 + lr < p.n;
+    device const half *qp = q + (q_ok ? prefill_ag_q_row(p, g, r0 + lr) : 0) + lc;
+    uint key = p.j0 + k0 + lr;
+    threadgroup half4 *qd = (threadgroup half4 *)(qt + lr * PREFILL_AG_LD + lc);
+    threadgroup half4 *kd = (threadgroup half4 *)(kt + lr * PREFILL_AG_LD + lc);
+
+    uint sm = (simd / 2) * 32, sn = (simd % 2) * 32;
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+    for (uint d0 = 0; d0 < PREFILL_AG_D; d0 += PREFILL_AG_BK) {
+        for (uint i = 0; i < 4; i++) {
+            qd[i] = q_ok ? ((device const half4 *)(qp + d0))[i] : half4(0);
+            kd[i] = k_ok ? prefill_ag_kv4<BITS>(keys, codes, scales, biases, p, g, key, d0 + lc + 4 * i)
+                         : half4(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+        for (uint kk = 0; kk < PREFILL_AG_BK; kk += 8) {
+            simdgroup_half8x8 a[4];
+            simdgroup_half8x8 b[4];
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(a[i], qt + (sm + 8 * i) * PREFILL_AG_LD + kk, PREFILL_AG_LD);
+                simdgroup_load(b[i], kt + (sn + 8 * i) * PREFILL_AG_LD + kk, PREFILL_AG_LD, ulong2(0, 0), true);
+            }
+            for (uint i = 0; i < 4; i++) {
+                for (uint j = 0; j < 4; j++) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_store(acc[i][j], c + (sm + 8 * i) * 64 + sn + 8 * j, 64);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread t: 32 keys of row t / 2; the pair shares the row max.
+    uint r = r0 + tid / 2, cc = (tid % 2) * 32;
+    int limit = prefill_ag_limit(p, r) - int(k0);
+    int seen = min(limit + 1, int(p.n) - int(k0));
+    threadgroup const float *crow = c + (tid / 2) * 64 + cc;
+    float mx = -INFINITY;
+    for (uint j = 0; j < 32; j++) {
+        if (int(cc + j) < seen) {
+            mx = max(mx, crow[j] * p.scale);
+        }
+    }
+    mx = max(mx, simd_shuffle_xor(mx, 1));
+    ulong row = ulong(g) * p.rows_pad + r;
+    if (tid % 2 == 0) {
+        tmax[row * PREFILL_AG_TILES + tg.x] = mx;
+    }
+    device half4 *out = (device half4 *)(sh + row * PREFILL_AG_KEYS + k0 + cc);
+    for (uint j = 0; j < 32; j += 4) {
+        half4 v;
+        for (uint i = 0; i < 4; i++) {
+            v[i] = int(cc + j + i) < seen ? half(crow[j + i] * p.scale - mx) : half(-INFINITY);
+        }
+        out[j / 4] = v;
+    }
+}
+
+template <uint BITS>
+kernel void prefill_ag_pv_f(device const half *sh [[buffer(0)]],
+                            device const half *values [[buffer(1)]],
+                            device float *o [[buffer(2)]],
+                            device const float *tmax [[buffer(3)]],
+                            constant AttGemmParams &p [[buffer(4)]],
+                            device const uint *codes [[buffer(5)]],
+                            device const half *scales [[buffer(6)]],
+                            device const half *biases [[buffer(7)]],
+                            device const float *m_in [[buffer(8)]],
+                            device float *m_out [[buffer(9)]],
+                            device const float *l_in [[buffer(10)]],
+                            device float *l_out [[buffer(11)]],
+                            uint3 tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float c[64 * 64];
+    threadgroup half *pt = (threadgroup half *)c;
+    threadgroup half *vt = pt + 64 * PREFILL_AG_LD;
+    uint g = tg.z, r0 = tg.y * 64, d0 = tg.x * 64;
+    if (r0 >= p.rows) {
+        return;
+    }
+    uint padded = prefill_ag_tile_keys(p, r0);
+
+    // Thread t loads P row t / 2 and later updates the same row of O.
+    uint pr = tid / 2, pc = (tid % 2) * 16;
+    uint r = r0 + pr;
+    ulong row = ulong(g) * p.rows_pad + r;
+    bool first = p.j0 == 0;
+    float m_old = first ? -INFINITY : m_in[row];
+    float mx = -INFINITY;
+    for (uint t = 0; t * 64 < padded; t++) {
+        mx = max(mx, tmax[row * PREFILL_AG_TILES + t]);
+    }
+    float m_new = max(m_old, mx);
+    // A row that has seen no key yet (only padding rows) keeps 0s.
+    float m_sub = m_new == -INFINITY ? 0.0f : m_new;
+    float a = first ? 0.0f : (m_new == -INFINITY ? 1.0f : exp(m_old - m_new));
+
+    if (padded == 0) {
+        // No row of the tile sees the block: O, m and l stay.
+        if (tg.x == 0 && tid % 2 == 0 && r < p.rows) {
+            m_out[row] = m_old;
+            l_out[row] = l_in[row];
+        }
+        return;
+    }
+
+    device const half *pp = sh + row * PREFILL_AG_KEYS + pc;
+    threadgroup half4 *pd = (threadgroup half4 *)(pt + pr * PREFILL_AG_LD + pc);
+    uint vr = tid / 4, vc = (tid % 4) * 16;
+    threadgroup half4 *vd = (threadgroup half4 *)(vt + vr * PREFILL_AG_VLD + vc);
+
+    uint sm = (simd / 2) * 32, sn = (simd % 2) * 32;
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            acc[i][j] = simdgroup_float8x8(0);
+        }
+    }
+    float sum = 0.0f;
+    for (uint k0 = 0; k0 < padded; k0 += PREFILL_AG_BK) {
+        float off = tmax[row * PREFILL_AG_TILES + k0 / 64] - m_sub;
+        for (uint i = 0; i < 4; i++) {
+            float4 e = exp(float4(((device const half4 *)(pp + k0))[i]) + off);
+            sum += e.x + e.y + e.z + e.w;
+            pd[i] = half4(e);
+        }
+        bool v_ok = k0 + vr < p.n;
+        for (uint i = 0; i < 4; i++) {
+            vd[i] = v_ok ? prefill_ag_kv4<BITS>(values, codes, scales, biases, p, g, p.j0 + k0 + vr,
+                                                d0 + vc + 4 * i)
+                         : half4(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+        for (uint kk = 0; kk < PREFILL_AG_BK; kk += 8) {
+            simdgroup_half8x8 a8[4];
+            simdgroup_half8x8 b8[4];
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(a8[i], pt + (sm + 8 * i) * PREFILL_AG_LD + kk, PREFILL_AG_LD);
+                simdgroup_load(b8[i], vt + kk * PREFILL_AG_VLD + sn + 8 * i, PREFILL_AG_VLD);
+            }
+            for (uint i = 0; i < 4; i++) {
+                for (uint j = 0; j < 4; j++) {
+                    simdgroup_multiply_accumulate(acc[i][j], a8[i], b8[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    sum += simd_shuffle_xor(sum, 1);
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_store(acc[i][j], c + (sm + 8 * i) * 64 + sn + 8 * j, 64);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (r < p.rows) {
+        if (tg.x == 0 && tid % 2 == 0) {
+            m_out[row] = m_new;
+            l_out[row] = (first ? 0.0f : l_in[row] * a) + sum;
+        }
+        uint cc = (tid % 2) * 32;
+        device float *orow = o + row * PREFILL_AG_D + d0 + cc;
+        threadgroup const float *crow = c + pr * 64 + cc;
+        for (uint j = 0; j < 32; j++) {
+            orow[j] = first ? crow[j] : a * orow[j] + crow[j];
+        }
+    }
+}
+
+template [[host_name("prefill_ag_scores_f")]] kernel decltype(prefill_ag_scores_f<16>) prefill_ag_scores_f<16>;
+template [[host_name("prefill_ag_scores_f_q8")]] kernel decltype(prefill_ag_scores_f<8>) prefill_ag_scores_f<8>;
+template [[host_name("prefill_ag_scores_f_q4")]] kernel decltype(prefill_ag_scores_f<4>) prefill_ag_scores_f<4>;
+template [[host_name("prefill_ag_pv_f")]] kernel decltype(prefill_ag_pv_f<16>) prefill_ag_pv_f<16>;
+template [[host_name("prefill_ag_pv_f_q8")]] kernel decltype(prefill_ag_pv_f<8>) prefill_ag_pv_f<8>;
+template [[host_name("prefill_ag_pv_f_q4")]] kernel decltype(prefill_ag_pv_f<4>) prefill_ag_pv_f<4>;

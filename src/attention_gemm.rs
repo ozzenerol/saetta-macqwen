@@ -55,6 +55,13 @@ mod mac {
     /// noise of one slice at 16 and 8 bits, 3k the same).
     const SLICES: usize = 2;
 
+    /// SAETTA_AG_FUSED=1: the softmax runs inside scores and pv
+    /// (prefill_ag_scores_f, prefill_ag_pv_f), one pass less per block and
+    /// 2 bytes of scratch per score instead of 6.
+    fn fused_from_env() -> bool {
+        std::env::var("SAETTA_AG_FUSED").is_ok_and(|v| v == "1")
+    }
+
     fn slices() -> usize {
         std::env::var("SAETTA_AG_SLICES")
             .ok()
@@ -74,6 +81,12 @@ mod mac {
         m: Buffer,
         l: Buffer,
         alpha: Buffer,
+        /// Fused only: the tile maxes and a second m and l, as pv reads the
+        /// old ones and writes the new ones.
+        tmax: Buffer,
+        m2: Buffer,
+        l2: Buffer,
+        pub fused: bool,
         /// For the bench: encode only the first `stages` passes of each
         /// block (1 scores, 2 softmax, 3 pv) and no final; 0 runs all.
         pub stages: std::cell::Cell<usize>,
@@ -87,15 +100,21 @@ mod mac {
             let slice = chunk.div_ceil(slices());
             let rows_pad = (slice * GROUP).next_multiple_of(64);
             let rows = kv_heads * rows_pad;
+            let fused = fused_from_env();
+            let (full, small) = (usize::from(!fused), usize::from(fused));
             AttGemm {
                 slice,
                 rows_pad,
-                s: gpu.buffer(rows * KEYS * 4),
-                p: gpu.buffer(rows * KEYS * 2),
+                s: gpu.buffer(rows * KEYS * (2 + 2 * full)),
+                p: gpu.buffer((rows * KEYS * 2 * full).max(4)),
                 o: gpu.buffer(rows * DIM * 4),
                 m: gpu.buffer(rows * 4),
                 l: gpu.buffer(rows * 4),
                 alpha: gpu.buffer(rows * 4),
+                tmax: gpu.buffer((rows * (KEYS / 64) * 4 * small).max(4)),
+                m2: gpu.buffer((rows * 4 * small).max(4)),
+                l2: gpu.buffer((rows * 4 * small).max(4)),
+                fused,
                 stages: std::cell::Cell::new(0),
             }
         }
@@ -199,10 +218,12 @@ mod mac {
                 Some(KvBits::Four) => "_q4",
                 Some(b) => panic!("no gemm attention for {b:?} rows"),
             };
+            let f_ = if self.fused { "_f" } else { "" };
             let (scores, pv) = (
-                gpu.pipeline(&format!("prefill_ag_scores{suffix}")),
-                gpu.pipeline(&format!("prefill_ag_pv{suffix}")),
+                gpu.pipeline(&format!("prefill_ag_scores{f_}{suffix}")),
+                gpu.pipeline(&format!("prefill_ag_pv{f_}{suffix}")),
             );
+            let (tmax, m2, l2) = (whole(&self.tmax), whole(&self.m2), whole(&self.l2));
             // The codes, scales and biases of keys and values; the half
             // kernels do not read these slots, so they get the half cache.
             let parts = |r: &QuantRows| [whole(&r.data), whole(&r.scales), whole(&r.biases)];
@@ -218,7 +239,8 @@ mod mac {
                     enc.set_buffer(first + i as u64, Some(&v.buffer), v.offset);
                 }
             };
-            for j0 in (0..end).step_by(KEYS) {
+            let mut l_last = &l;
+            for (b, j0) in (0..end).step_by(KEYS).enumerate() {
                 let n = KEYS.min(end - j0);
                 let params = Params {
                     rows: rows as u32,
@@ -234,12 +256,38 @@ mod mac {
                 set(&[q, keys, &s]);
                 bytes(3, &params);
                 set_at(4, &kq);
+                if self.fused {
+                    set_at(7, &[tmax.clone(), tmax.clone(), tmax.clone()]);
+                }
                 enc.dispatch_thread_groups(
                     MTLSize::new(n.div_ceil(64) as u64, row_tiles, kv),
                     MTLSize::new(128, 1, 1),
                 );
 
                 let stages = self.stages.get();
+                if self.fused {
+                    if stages == 1 || stages == 2 {
+                        continue;
+                    }
+                    // Block b reads the m and l block b - 1 wrote.
+                    let (m_in, m_out, l_in, l_out) = if b % 2 == 0 {
+                        (&m2, &m, &l2, &l)
+                    } else {
+                        (&m, &m2, &l, &l2)
+                    };
+                    enc.set_compute_pipeline_state(&pv);
+                    set(&[&s, values, &o, &tmax]);
+                    bytes(4, &params);
+                    set_at(5, &vq);
+                    set_at(8, &[m_in.clone(), m_out.clone(), l_in.clone()]);
+                    enc.set_buffer(11, Some(&l_out.buffer), 0);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((DIM / 64) as u64, row_tiles, kv),
+                        MTLSize::new(128, 1, 1),
+                    );
+                    l_last = l_out;
+                    continue;
+                }
                 if stages == 1 {
                     continue;
                 }
@@ -277,7 +325,7 @@ mod mac {
                 return;
             }
             enc.set_compute_pipeline_state(&gpu.pipeline("prefill_ag_final"));
-            set(&[&o, &l, q_and_gate, out]);
+            set(&[&o, l_last, q_and_gate, out]);
             bytes(4, &params);
             enc.dispatch_threads(
                 MTLSize::new(DIM as u64, rows as u64, kv),
