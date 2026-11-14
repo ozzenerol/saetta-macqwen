@@ -461,7 +461,15 @@ impl<M: Model + Restore> Model for Cached<M> {
         tokens: &[u32],
         alive: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<f32>, usize> {
+        let trace = std::env::var("SAETTA_TRACE_TTFT").is_ok_and(|v| v == "1");
+        let t0 = Instant::now();
+        let lap = |what: &str| {
+            if trace {
+                eprintln!("ttft: {what} at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
+        };
         self.save(false);
+        lap("saved");
         if tokens.is_empty() {
             return Ok(self.model.prefill(tokens));
         }
@@ -480,7 +488,9 @@ impl<M: Model + Restore> Model for Cached<M> {
             let stop = self.piece_end(start + done, last, anchor);
             let chunk = &tokens[done..stop - start];
             self.write_rows(start + done, chunk);
+            lap("piece");
             self.model.prefill(chunk);
+            lap("prefilled");
             self.tokens.extend_from_slice(chunk);
             done = stop - start;
             let at_anchor = Some(stop) == anchor;
@@ -501,10 +511,13 @@ impl<M: Model + Restore> Model for Cached<M> {
         }
         // One token is left. A decode step runs it in a few ms, where a
         // prefill call has a fixed cost of about half a second on the GPU.
+        lap("snapshots");
         let token = tokens[done];
         self.write_rows(start + done, &[token]);
         self.tokens.push(token);
-        Ok(self.model.step(token))
+        let logits = self.model.step(token);
+        lap("last step");
+        Ok(logits)
     }
 
     fn step(&mut self, token: u32) -> Vec<f32> {
