@@ -554,7 +554,7 @@ fn load_gpu(
         warm: warm_secs().map(|idle| {
             gpu.keep_warm(
                 std::time::Duration::from_secs(idle),
-                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(warm_every_ms()),
             )
         }),
     })
@@ -720,6 +720,16 @@ struct GpuServed {
 /// Seconds the GPU stays warm after a request: SAETTA_WARM_SECS, 300 by
 /// default, 0 for off. Batch 56, 20 s between requests: first token of a
 /// 49-token prompt in 0.22 s against 0.44 cold, 961 tokens 0.76 against 0.97.
+/// Milliseconds between the keep-warm kernels: SAETTA_WARM_MS, 500 by default.
+#[cfg(target_os = "macos")]
+fn warm_every_ms() -> u64 {
+    std::env::var("SAETTA_WARM_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&ms| ms >= 10)
+        .unwrap_or(500)
+}
+
 #[cfg(target_os = "macos")]
 fn warm_secs() -> Option<u64> {
     let secs = std::env::var("SAETTA_WARM_SECS")
