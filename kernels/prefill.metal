@@ -250,7 +250,7 @@ template [[host_name("qmm_8bit_split")]] kernel decltype(qmm<8, 2>) qmm<8, 2>;
 constant uint PREFILL_DQ_BK = 32;
 constant uint PREFILL_DQ_LD = PREFILL_DQ_BK + 8;
 
-template <uint BITS, uint BK = BK>
+template <uint BITS, uint BK = PREFILL_DQ_BK>
 kernel void qmm_dq(device const uint *words [[buffer(0)]],
                    device const ushort *scales [[buffer(1)]],
                    device const ushort *biases [[buffer(2)]],
