@@ -1019,12 +1019,6 @@ kernel void prefill_ag_pv_tp(device const half *sh [[buffer(0)]],
     }
 }
 
-template [[host_name("prefill_ag_scores_f")]] kernel decltype(prefill_ag_scores_f<16>) prefill_ag_scores_f<16>;
-template [[host_name("prefill_ag_scores_f_q8")]] kernel decltype(prefill_ag_scores_f<8>) prefill_ag_scores_f<8>;
-template [[host_name("prefill_ag_scores_f_q4")]] kernel decltype(prefill_ag_scores_f<4>) prefill_ag_scores_f<4>;
-template [[host_name("prefill_ag_pv_f")]] kernel decltype(prefill_ag_pv_f<16>) prefill_ag_pv_f<16>;
-template [[host_name("prefill_ag_pv_f_q8")]] kernel decltype(prefill_ag_pv_f<8>) prefill_ag_pv_f<8>;
-template [[host_name("prefill_ag_pv_f_q4")]] kernel decltype(prefill_ag_pv_f<4>) prefill_ag_pv_f<4>;
 template [[host_name("prefill_ag_scores_tp")]] kernel decltype(prefill_ag_scores_tp<16>) prefill_ag_scores_tp<16>;
 template [[host_name("prefill_ag_scores_tp_q8")]] kernel decltype(prefill_ag_scores_tp<8>) prefill_ag_scores_tp<8>;
 template [[host_name("prefill_ag_scores_tp_q4")]] kernel decltype(prefill_ag_scores_tp<4>) prefill_ag_scores_tp<4>;
