@@ -323,7 +323,10 @@ impl<M: Model + 'static> Server<M> {
         mut alive: impl FnMut() -> bool,
         mut emit: impl FnMut(Event) -> bool,
     ) -> Done {
+        let t0 = std::time::Instant::now();
+        let trace = std::env::var("SAETTA_TRACE_TTFT").is_ok_and(|v| v == "1");
         let mut engine = self.engine.lock().unwrap_or_else(|e| e.into_inner());
+        let t_lock = t0.elapsed();
         let _trace = crate::memtrace::Span::new("request");
         let held = engine.tokens.clone();
         let spliced = match engine.last.take() {
@@ -346,7 +349,9 @@ impl<M: Model + 'static> Server<M> {
                 tool_calls: 0,
             };
         }
+        let t_start = t0.elapsed();
         let started = engine.start(&prompt, &mut alive);
+        let t_prefill = t0.elapsed();
         let cached = match started {
             Ok((_, cached)) | Err((_, cached)) => cached,
         };
@@ -379,7 +384,11 @@ impl<M: Model + 'static> Server<M> {
             role: "assistant".into(),
             ..Message::default()
         };
+        let mut first_emit = None;
         let mut emit = |event: Event| {
+            if first_emit.is_none() {
+                first_emit = Some(t0.elapsed());
+            }
             record(&mut answer, &event);
             emit(event)
         };
@@ -420,7 +429,16 @@ impl<M: Model + 'static> Server<M> {
                 Take::Stop => break,
                 Take::Gone => return done,
             }
+            let ts = t0.elapsed();
             let (accepted, next) = engine.model.speculate(pending, &mut decide);
+            if trace && done.completion_tokens <= 4 {
+                eprintln!(
+                    "ttft: round at {:.1} ms took {:.1} ms, {} accepted",
+                    ts.as_secs_f64() * 1e3,
+                    (t0.elapsed() - ts).as_secs_f64() * 1e3,
+                    accepted.len()
+                );
+            }
             engine.tokens.push(pending);
             engine.tokens.extend(&accepted);
             for t in accepted {
@@ -433,7 +451,18 @@ impl<M: Model + 'static> Server<M> {
             pending = next;
         }
         let events = output.finish();
-        if self.emit_all(events, &mut emit, &mut done) {
+        let finished = self.emit_all(events, &mut emit, &mut done);
+        if trace {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "ttft: lock {:.1} ms, start {:.1}, prefill done {:.1}, first emit {:.1}",
+                ms(t_lock),
+                ms(t_start),
+                ms(t_prefill),
+                first_emit.map_or(f64::NAN, ms)
+            );
+        }
+        if finished {
             engine.last = Some(Turn {
                 messages: r.messages.clone(),
                 prompt_text: r.prompt_text.clone(),
