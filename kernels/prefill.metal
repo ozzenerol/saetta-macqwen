@@ -250,7 +250,7 @@ template [[host_name("qmm_8bit_split")]] kernel decltype(qmm<8, 2>) qmm<8, 2>;
 constant uint PREFILL_DQ_BK = 32;
 constant uint PREFILL_DQ_LD = PREFILL_DQ_BK + 8;
 
-template <uint BITS>
+template <uint BITS, uint BK = BK>
 kernel void qmm_dq(device const uint *words [[buffer(0)]],
                    device const ushort *scales [[buffer(1)]],
                    device const ushort *biases [[buffer(2)]],
@@ -264,8 +264,9 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
                    uint tid [[thread_index_in_threadgroup]],
                    uint simd [[simdgroup_index_in_threadgroup]],
                    uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup half xt[PREFILL_MM_BM * PREFILL_DQ_LD];
-    threadgroup half wt[PREFILL_MM_BN * PREFILL_DQ_LD];
+    constexpr uint LD = BK + 8;
+    threadgroup half xt[PREFILL_MM_BM * LD];
+    threadgroup half wt[PREFILL_MM_BN * LD];
     threadgroup float edge[4][64];
 
     uint expert = 0, first, count;
@@ -307,7 +308,7 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
             xrow = x + ulong(r) * s.k;
         }
     }
-    threadgroup half4 *dst = (threadgroup half4 *)((loads_w ? wt : xt) + lr * PREFILL_DQ_LD);
+    threadgroup half4 *dst = (threadgroup half4 *)((loads_w ? wt : xt) + lr * LD);
 
     uint sm = (simd / 2) * 32;
     uint sn = (simd % 2) * 32;
@@ -318,39 +319,42 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
         }
     }
 
-    for (uint k0 = 0; k0 < s.k; k0 += PREFILL_DQ_BK) {
+    for (uint k0 = 0; k0 < s.k; k0 += BK) {
         if (!ok) {
-            for (uint i = 0; i < 8; i++) {
+            for (uint i = 0; i < BK / 4; i++) {
                 dst[i] = half4(0);
             }
         } else if (loads_w) {
-            uint packed[BITS];
-            device const uint *wk = wp + k0 / 32 * BITS;
-            for (uint j = 0; j < BITS; j++) {
-                packed[j] = wk[j];
-            }
             float scale = bf16_to_float(sp[k0 / 64]);
             float bias = bf16_to_float(bp[k0 / 64]);
 #pragma clang loop unroll(full)
-            for (uint i = 0; i < 8; i++) {
-                float4 q = float4(unpack<BITS>(packed, 4 * i), unpack<BITS>(packed, 4 * i + 1),
-                                  unpack<BITS>(packed, 4 * i + 2), unpack<BITS>(packed, 4 * i + 3));
-                dst[i] = half4(q * scale + bias);
+            for (uint h = 0; h < BK / 32; h++) {
+                uint packed[BITS];
+                device const uint *wk = wp + (k0 / 32 + h) * BITS;
+                for (uint j = 0; j < BITS; j++) {
+                    packed[j] = wk[j];
+                }
+#pragma clang loop unroll(full)
+                for (uint i = 0; i < 8; i++) {
+                    float4 q = float4(unpack<BITS>(packed, 4 * i), unpack<BITS>(packed, 4 * i + 1),
+                                      unpack<BITS>(packed, 4 * i + 2), unpack<BITS>(packed, 4 * i + 3));
+                    dst[8 * h + i] = half4(q * scale + bias);
+                }
             }
         } else {
             device const float4 *p = (device const float4 *)(xrow + k0);
-            for (uint i = 0; i < 8; i++) {
+            for (uint i = 0; i < BK / 4; i++) {
                 dst[i] = half4(p[i]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kk = 0; kk < PREFILL_DQ_BK; kk += 8) {
+        for (uint kk = 0; kk < BK; kk += 8) {
             simdgroup_half8x8 a[4];
             simdgroup_half8x8 b[4];
             for (uint i = 0; i < 4; i++) {
-                simdgroup_load(a[i], xt + (sm + 8 * i) * PREFILL_DQ_LD + kk, PREFILL_DQ_LD);
-                simdgroup_load(b[i], wt + (sn + 8 * i) * PREFILL_DQ_LD + kk, PREFILL_DQ_LD, ulong2(0, 0), true);
+                simdgroup_load(a[i], xt + (sm + 8 * i) * LD + kk, LD);
+                simdgroup_load(b[i], wt + (sn + 8 * i) * LD + kk, LD, ulong2(0, 0), true);
             }
             for (uint i = 0; i < 4; i++) {
                 for (uint j = 0; j < 4; j++) {
@@ -394,6 +398,8 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmm_dq_5bit")]] kernel decltype(qmm_dq<5>) qmm_dq<5>;
 template [[host_name("qmm_dq_8bit")]] kernel decltype(qmm_dq<8>) qmm_dq<8>;
+template [[host_name("qmm_dq64_5bit")]] kernel decltype(qmm_dq<5, 64>) qmm_dq<5, 64>;
+template [[host_name("qmm_dq64_8bit")]] kernel decltype(qmm_dq<8, 64>) qmm_dq<8, 64>;
 
 // The same product for few rows: up to PREFILL_FEW rows of x per
 // threadgroup, in f32 as qmv.metal does, so weights are read once for all
