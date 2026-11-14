@@ -236,6 +236,8 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
         qmm2<bits, 32, 128, 32, 32, false, sub>;
 QMM2_SUB("qmm2_32x2_5bit", 5, 2)
 QMM2_SUB("qmm2_32x2_8bit", 8, 2)
+QMM2_SUB("qmm2_32x3_5bit", 5, 3)
+QMM2_SUB("qmm2_32x3_8bit", 8, 3)
 QMM2("qmm2_5bit", 5, 64, 64, 32, 32, false)
 QMM2("qmm2_8bit", 8, 64, 64, 32, 32, false)
 QMM2("qmm2_db_5bit", 5, 64, 64, 32, 32, true)

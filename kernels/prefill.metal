@@ -2135,6 +2135,177 @@ kernel void prefill_gate_up64k(device const uint *gate_words [[buffer(0)]],
 template [[host_name("prefill_gate_up64k_5bit")]] kernel decltype(prefill_gate_up64k<5>) prefill_gate_up64k<5>;
 template [[host_name("prefill_gate_up64k_8bit")]] kernel decltype(prefill_gate_up64k<8>) prefill_gate_up64k<8>;
 
+// prefill_gate_up64k on tiles of up to 96 rows, gather mode only: each
+// simdgroup takes 48 rows, so an expert with 65 to 96 tokens dequantizes its
+// weights once.
+template <uint BITS>
+kernel void prefill_gate_up96(device const uint *gate_words [[buffer(0)]],
+                               device const ushort *gate_scales [[buffer(1)]],
+                               device const ushort *gate_biases [[buffer(2)]],
+                               device const uint *up_words [[buffer(3)]],
+                               device const ushort *up_scales [[buffer(4)]],
+                               device const ushort *up_biases [[buffer(5)]],
+                               device const half *x [[buffer(6)]],
+                               device float *g [[buffer(7)]],
+                               device half *g_half [[buffer(8)]],
+                               constant MmShape &s [[buffer(9)]],
+                               device const uint4 *tiles [[buffer(10)]],
+                               device const uint *rows [[buffer(11)]],
+                               device const uint *tile_count [[buffer(12)]],
+                               uint2 tg [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               uint simd [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup half xt[96 * PREFILL_GUK_LD];
+    threadgroup half wt[2 * PREFILL_GU64_BN * PREFILL_GUK_LD];
+
+    uint expert = 0, first, count;
+    if (s.gather != 0) {
+        if (tg.y >= tile_count[0]) {
+            return;
+        }
+        uint4 tile = tiles[tg.y];
+        if (tile.z <= PREFILL_FEW) {
+            return;  // qmm_few takes it
+        }
+        expert = tile.x;
+        first = tile.y;
+        count = tile.z;
+    } else {
+        return;  // tiles only
+    }
+    uint n0 = tg.x * PREFILL_GU64_BN;
+
+    // Thread t loads x half4 slots t + 256 j, j < 6: row slot / 16,
+    // values 4 (slot % 16) to + 3 of the step.
+    device const half *xrow[6];
+    bool x_ok[6];
+    for (uint j = 0; j < 6; j++) {
+        uint slot = tid + 256 * j;
+        uint xr = slot / 16;
+        x_ok[j] = xr < count;
+        xrow[j] = x;
+        if (x_ok[j]) {
+            uint r = s.gather == 1 ? rows[first + xr] : first + xr;
+            xrow[j] = x + ulong(r) * s.k + (slot % 16) * 4;
+        }
+    }
+    uint wr = tid % (2 * PREFILL_GU64_BN);
+    uint whalf = tid / (2 * PREFILL_GU64_BN);  // 0: values 0-31, 1: 32-63
+    bool is_up = wr >= PREFILL_GU64_BN;
+    uint wn = n0 + wr % PREFILL_GU64_BN;
+    bool w_ok = wn < s.n;
+    ulong wrow = ulong(expert) * s.n + (w_ok ? wn : 0);
+    device const uint *wp = (is_up ? up_words : gate_words) + wrow * (s.k * BITS / 32);
+    device const ushort *sp = (is_up ? up_scales : gate_scales) + wrow * (s.k / 64);
+    device const ushort *bp = (is_up ? up_biases : gate_biases) + wrow * (s.k / 64);
+
+    uint sm = (simd / 4) * 48;
+    uint sn = (simd % 4) * 16;
+    bool active = sm < count;
+    simdgroup_float8x8 ag[6][2], au[6][2];
+    for (uint i = 0; i < 6; i++) {
+        for (uint j = 0; j < 2; j++) {
+            ag[i][j] = simdgroup_float8x8(0);
+            au[i][j] = simdgroup_float8x8(0);
+        }
+    }
+
+    threadgroup half4 *xt4 = (threadgroup half4 *)xt;
+    threadgroup half4 *wd = (threadgroup half4 *)(wt + wr * PREFILL_GUK_LD + whalf * 32);
+    half4 xv[6];
+    for (uint j = 0; j < 6; j++) {
+        xv[j] = half4(0);
+    }
+    uint packed[BITS];
+    float scale = 0, bias = 0;
+    auto fetch = [&](uint k0) {
+        for (uint j = 0; j < 6; j++) {
+            if (x_ok[j]) {
+                xv[j] = *(device const half4 *)(xrow[j] + k0);
+            }
+        }
+        if (w_ok) {
+            device const uint *wk = wp + (k0 / 32 + whalf) * BITS;
+            for (uint j = 0; j < BITS; j++) {
+                packed[j] = wk[j];
+            }
+            scale = bf16_to_float(sp[k0 / 64]);
+            bias = bf16_to_float(bp[k0 / 64]);
+        }
+    };
+    fetch(0);
+    for (uint k0 = 0; k0 < s.k; k0 += PREFILL_GUK_BK) {
+        for (uint j = 0; j < 6; j++) {
+            uint slot = tid + 256 * j;
+            xt4[((slot / 16) * PREFILL_GUK_LD + (slot % 16) * 4) / 4] = xv[j];
+        }
+        if (w_ok) {
+            dequant16<BITS, 0>(packed, scale, bias, wd);
+            dequant16<BITS, 16>(packed, scale, bias, wd + 4);
+        } else {
+            for (uint i = 0; i < 8; i++) {
+                wd[i] = half4(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + PREFILL_GUK_BK < s.k) {
+            fetch(k0 + PREFILL_GUK_BK);
+        }
+
+        if (active) {
+#pragma clang loop unroll(full)
+            for (uint kk = 0; kk < PREFILL_GUK_BK; kk += 8) {
+                simdgroup_half8x8 a[6];
+                simdgroup_half8x8 bg[2], bu[2];
+                for (uint i = 0; i < 6; i++) {
+                    simdgroup_load(a[i], xt + (sm + 8 * i) * PREFILL_GUK_LD + kk, PREFILL_GUK_LD);
+                }
+                for (uint j = 0; j < 2; j++) {
+                    simdgroup_load(bg[j], wt + (sn + 8 * j) * PREFILL_GUK_LD + kk, PREFILL_GUK_LD,
+                                   ulong2(0, 0), true);
+                    simdgroup_load(bu[j], wt + (PREFILL_GU64_BN + sn + 8 * j) * PREFILL_GUK_LD + kk,
+                                   PREFILL_GUK_LD, ulong2(0, 0), true);
+                }
+                for (uint i = 0; i < 6; i++) {
+                    for (uint j = 0; j < 2; j++) {
+                        simdgroup_multiply_accumulate(ag[i][j], a[i], bg[j], ag[i][j]);
+                        simdgroup_multiply_accumulate(au[i][j], a[i], bu[j], au[i][j]);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!active) {
+        return;
+    }
+
+    uint2 fp = frag_pos(lane);
+    for (uint i = 0; i < 6; i++) {
+        uint r = sm + 8 * i + fp.x;
+        if (r >= count) {
+            continue;
+        }
+        ulong out = ulong(first + r) * s.n + n0;
+        for (uint j = 0; j < 2; j++) {
+            uint c = sn + 8 * j + fp.y;
+            thread auto &ge = ag[i][j].thread_elements();
+            thread auto &ue = au[i][j].thread_elements();
+            for (uint e = 0; e < 2; e++) {
+                if (n0 + c + e < s.n) {
+                    float v = silu(ge[e]) * ue[e];
+                    g[out + c + e] = v;
+                    g_half[out + c + e] = half(v);
+                }
+            }
+        }
+    }
+}
+
+template [[host_name("prefill_gate_up96_5bit")]] kernel decltype(prefill_gate_up96<5>) prefill_gate_up96<5>;
+template [[host_name("prefill_gate_up96_8bit")]] kernel decltype(prefill_gate_up96<8>) prefill_gate_up96<8>;
+
 // g = silu(g) * u and g_half = g for the rows of the tiles of PREFILL_FEW
 // rows or fewer, which prefill_gate_up skips. One threadgroup per tile.
 kernel void prefill_silu_few(device float *g [[buffer(0)]],

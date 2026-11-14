@@ -382,7 +382,9 @@ mod mac {
             ("prefill_gate_up", 128)
         };
         let pf = if rows64 && gu_prefetch() { "_pf" } else { "" };
-        let kernel = if rows64 && gu_bk64() {
+        let kernel = if rows64 && shape.gather != 0 && gate_up96() {
+            format!("prefill_gate_up96_{}bit", gate.bits)
+        } else if rows64 && gu_bk64() {
             format!("prefill_gate_up64k_{}bit", gate.bits)
         } else {
             format!("{name}_{}bit{pf}", gate.bits)
@@ -459,6 +461,8 @@ mod mac {
                     // in batch 6: 201 against 174 ms per 2k chunk).
                     if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
                         crate::qmm::VARIANTS[0]
+                    } else if gate_up96() {
+                        crate::qmm::THIRDS
                     } else {
                         crate::qmm::HALVES
                     }
@@ -511,6 +515,11 @@ mod mac {
     /// SAETTA_GU_PF=0.
     fn gu_prefetch() -> bool {
         std::env::var("SAETTA_GU_PF").map_or(true, |v| v != "0")
+    }
+
+    /// SAETTA_GU96=1: expert tiles of up to 96 rows on prefill_gate_up96.
+    fn gate_up96() -> bool {
+        std::env::var("SAETTA_GU96").is_ok_and(|v| v == "1")
     }
 
     /// Expert gate,up on prefill_gate_up64k, 64-deep k steps, unless
