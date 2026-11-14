@@ -14,6 +14,15 @@
 //! inside the scores kernel with a max per 64-key tile (8.5 against 9.1
 //! TFLOP/s in all) and pv's update alpha O + P V in the accumulators (pv
 //! 6.6 TFLOP/s).
+//!
+//! The default is the fused variant (batches 27 to 29, last 2048-token
+//! chunk at 64k, interleaved runs): scores keep the row max of each 64-key
+//! tile and write scale S minus it in half, and pv exponentiates P as it
+//! loads it, so there is no softmax pass. 198 to 210 ms against 223 to 240
+//! ms (scores 96, pv 101), 11.0 TFLOP/s in all; 32k prefill at 8 bits 6 to
+//! 13% faster. The 32k gate and the 128k eval at 8 bits passed (128k median
+//! KL 1.33e-5, top-1 100%). pv on 64 x 128 tiles, to exponentiate P half as
+//! often, spilled its accumulators and ran 15 times slower.
 
 /// Keys per block; must match PREFILL_AG_KEYS.
 pub const KEYS: usize = 1024;
@@ -55,11 +64,11 @@ mod mac {
     /// noise of one slice at 16 and 8 bits, 3k the same).
     const SLICES: usize = 2;
 
-    /// SAETTA_AG_FUSED=1: the softmax runs inside scores and pv
-    /// (prefill_ag_scores_f, prefill_ag_pv_f), one pass less per block and
-    /// 2 bytes of scratch per score instead of 6.
+    /// The softmax runs inside scores and pv (prefill_ag_scores_f,
+    /// prefill_ag_pv_f) unless SAETTA_AG_FUSED=0: one pass less per block
+    /// and 2 bytes of scratch per score instead of 6.
     fn fused_from_env() -> bool {
-        std::env::var("SAETTA_AG_FUSED").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_AG_FUSED").map_or(true, |v| v != "0")
     }
 
     /// SAETTA_AG_PV128=1 (fused only): pv on 64 x 128 output tiles, so P is
