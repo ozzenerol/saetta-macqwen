@@ -155,6 +155,64 @@ mod mac {
         }
     }
 
+    /// Keeps the GPU warm between requests. A few seconds after the GPU goes
+    /// idle, the first dispatch of the next request waits about 270 ms, even
+    /// a one-thread kernel (batch 55), which is most of the time to first
+    /// token of a short prompt. A thread on its own queue runs a one-thread
+    /// kernel every `every` until `idle` after the last `touch`.
+    pub struct Warm {
+        last: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        start: Instant,
+    }
+
+    impl Warm {
+        /// Marks GPU work now.
+        pub fn touch(&self) {
+            let ms = self.start.elapsed().as_millis() as u64;
+            self.last.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Gpu {
+        // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+        #[allow(unexpected_cfgs)]
+        pub fn keep_warm(&self, idle: Duration, every: Duration) -> Warm {
+            use metal::foreign_types::ForeignType;
+            use metal::objc::runtime::Object;
+            use metal::objc::{msg_send, sel, sel_impl};
+            use std::sync::atomic::Ordering;
+            let queue = self.device.new_command_queue();
+            if let Some(r) = &self.residency {
+                unsafe {
+                    let _: () = msg_send![queue.as_ptr() as *mut Object, addResidencySet: r.set];
+                }
+            }
+            let pipeline = self.pipeline("add_in_place");
+            let buffer = self.buffer(4);
+            let start = Instant::now();
+            let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let seen = std::sync::Arc::clone(&last);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    let since = start.elapsed().as_millis() as u64 - seen.load(Ordering::Relaxed);
+                    if since > idle.as_millis() as u64 {
+                        continue;
+                    }
+                    metal::objc::rc::autoreleasepool(|| {
+                        let commands = queue.new_command_buffer();
+                        let enc = commands.new_compute_command_encoder();
+                        dispatch_1d(enc, &pipeline, &[(&buffer, 0), (&buffer, 0)], 1);
+                        enc.end_encoding();
+                        commands.commit();
+                        commands.wait_until_completed();
+                    });
+                }
+            });
+            Warm { last, start }
+        }
+    }
+
     /// A file mapped into memory and wrapped as a GPU buffer without a copy.
     /// Pages are read from disk only when the CPU or GPU touches them.
     pub struct MappedFile {
