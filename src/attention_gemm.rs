@@ -71,6 +71,15 @@ mod mac {
         std::env::var("SAETTA_AG_FUSED").map_or(true, |v| v != "0")
     }
 
+    /// Fused only, unless SAETTA_AG_TEXP=0: scores write P = exp(scale S - t)
+    /// per 64-key tile and its row sums, so pv scales P by exp(t - m) once
+    /// per tile instead of an exp per score in each of its 4 dim tiles.
+    /// Batch 33: 193 against 196 ms at 64k, 32k gate median KL 4.85e-5 and
+    /// top-1 97% (94% without).
+    fn texp_from_env() -> bool {
+        std::env::var("SAETTA_AG_TEXP").map_or(true, |v| v != "0")
+    }
+
     fn slices() -> usize {
         std::env::var("SAETTA_AG_SLICES")
             .ok()
@@ -95,7 +104,9 @@ mod mac {
         tmax: Buffer,
         m2: Buffer,
         l2: Buffer,
+        tsum: Buffer,
         pub fused: bool,
+        pub texp: bool,
         /// For the bench: encode only the first `stages` passes of each
         /// block (1 scores, 2 softmax, 3 pv) and no final; 0 runs all.
         pub stages: std::cell::Cell<usize>,
@@ -122,8 +133,10 @@ mod mac {
                 alpha: gpu.buffer(rows * 4),
                 tmax: gpu.buffer((rows * (KEYS / 64) * 4 * small).max(4)),
                 m2: gpu.buffer((rows * 4 * small).max(4)),
+                tsum: gpu.buffer((rows * (KEYS / 64) * 4 * small).max(4)),
                 l2: gpu.buffer((rows * 4 * small).max(4)),
                 fused,
+                texp: fused && texp_from_env(),
                 stages: std::cell::Cell::new(0),
             }
         }
@@ -227,7 +240,12 @@ mod mac {
                 Some(KvBits::Four) => "_q4",
                 Some(b) => panic!("no gemm attention for {b:?} rows"),
             };
-            let f_ = if self.fused { "_f" } else { "" };
+            let f_ = match (self.fused, self.texp) {
+                (false, _) => "",
+                (true, false) => "_f",
+                (true, true) => "_t",
+            };
+            let tsum = whole(&self.tsum);
             let (scores, pv) = (
                 gpu.pipeline(&format!("prefill_ag_scores{f_}{suffix}")),
                 gpu.pipeline(&format!("prefill_ag_pv{f_}{suffix}")),
@@ -266,7 +284,7 @@ mod mac {
                 bytes(3, &params);
                 set_at(4, &kq);
                 if self.fused {
-                    set_at(7, &[tmax.clone(), tmax.clone(), tmax.clone()]);
+                    set_at(7, &[tmax.clone(), tsum.clone(), tsum.clone()]);
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new(n.div_ceil(64) as u64, row_tiles, kv),
@@ -290,6 +308,7 @@ mod mac {
                     set_at(5, &vq);
                     set_at(8, &[m_in.clone(), m_out.clone(), l_in.clone()]);
                     enc.set_buffer(11, Some(&l_out.buffer), 0);
+                    enc.set_buffer(12, Some(&tsum.buffer), 0);
                     enc.dispatch_thread_groups(
                         MTLSize::new((DIM / 64) as u64, row_tiles, kv),
                         MTLSize::new(128, 1, 1),
