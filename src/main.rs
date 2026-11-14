@@ -551,6 +551,12 @@ fn load_gpu(
         drafting: spec,
         rows: saetta::gpu_cache::RowBackup::new(),
         decoded: 0,
+        warm: warm_secs().map(|idle| {
+            gpu.keep_warm(
+                std::time::Duration::from_secs(idle),
+                std::time::Duration::from_millis(500),
+            )
+        }),
     })
 }
 
@@ -707,6 +713,20 @@ struct GpuServed {
     rows: saetta::gpu_cache::RowBackup,
     /// Decode calls since the last prefill, for SAETTA_MEM_TRACE.
     decoded: usize,
+    /// Keeps the GPU warm for a while after each request (`warm_secs`).
+    warm: Option<saetta::gpu::Warm>,
+}
+
+/// Seconds the GPU stays warm after a request: SAETTA_WARM_SECS, 300 by
+/// default, 0 for off. Batch 56: a 49-token prompt after 3 idle seconds
+/// had its first token in 0.44 s cold.
+#[cfg(target_os = "macos")]
+fn warm_secs() -> Option<u64> {
+    let secs = std::env::var("SAETTA_WARM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    (secs > 0).then_some(secs)
 }
 
 #[cfg(target_os = "macos")]
@@ -816,6 +836,9 @@ impl server::Model for GpuServed {
         if tokens.is_empty() {
             return Vec::new();
         }
+        if let Some(w) = &self.warm {
+            w.touch();
+        }
         self.decoded = 0;
         saetta::memtrace::mark(&format!(
             "prefill {} tokens at {}",
@@ -906,6 +929,9 @@ impl server::Model for GpuServed {
         decide: &mut dyn saetta::speculative::Decider,
     ) -> (Vec<u32>, u32) {
         self.trace_decode();
+        if let Some(w) = &self.warm {
+            w.touch();
+        }
         match &mut self.drafting {
             Some(d) => d.spec.speculate(&mut self.model, pending, decide),
             None => match decide.sampling() {
