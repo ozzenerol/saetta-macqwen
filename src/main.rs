@@ -965,6 +965,18 @@ impl Restore for GpuServed {
         if std::env::var("SAETTA_TRACE_TTFT").is_ok_and(|v| v == "1") {
             let t = m.gpu().run(|_| {});
             eprintln!("ttft: empty command buffer {:.1} ms", t.as_secs_f64() * 1e3);
+            let b = m.gpu().buffer(4096);
+            let p = m.gpu().pipeline("add_in_place");
+            let t = m.gpu().run(|enc| saetta::gpu::dispatch_1d(enc, &p, &[(&b, 0), (&b, 0)], 1));
+            eprintln!("ttft: one-thread kernel {:.1} ms", t.as_secs_f64() * 1e3);
+            let states = m.deltanet_states();
+            let p = m.gpu().pipeline("add_in_place");
+            let t = m.gpu().run(|enc| {
+                for s in &states {
+                    saetta::gpu::dispatch_1d(enc, &p, &[(&b, 0), (&s.recurrent, 0)], 1);
+                }
+            });
+            eprintln!("ttft: kernel reading the states {:.1} ms", t.as_secs_f64() * 1e3);
         }
         let (snapshot, blit) = saetta::gpu_cache::save(m.gpu(), &self.pool, &m.deltanet_states());
         *self.last_blit.borrow_mut() = Some(blit);
