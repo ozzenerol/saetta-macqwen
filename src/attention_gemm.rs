@@ -71,11 +71,13 @@ mod mac {
         std::env::var("SAETTA_AG_FUSED").map_or(true, |v| v != "0")
     }
 
-    /// SAETTA_AG_TEXP=1 (fused only): scores write P = exp(scale S - t) per
-    /// 64-key tile and its row sums, so pv scales P by exp(t - m) once per
-    /// tile instead of an exp per score in each of its 4 dim tiles.
+    /// Fused only, unless SAETTA_AG_TEXP=0: scores write P = exp(scale S - t)
+    /// per 64-key tile and its row sums, so pv scales P by exp(t - m) once
+    /// per tile instead of an exp per score in each of its 4 dim tiles.
+    /// Batch 33: 193 against 196 ms at 64k, 32k gate median KL 4.85e-5 and
+    /// top-1 97% (94% without).
     fn texp_from_env() -> bool {
-        std::env::var("SAETTA_AG_TEXP").is_ok_and(|v| v == "1")
+        std::env::var("SAETTA_AG_TEXP").map_or(true, |v| v != "0")
     }
 
     fn slices() -> usize {
