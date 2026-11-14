@@ -188,7 +188,13 @@ mod mac {
                 }
             }
             let pipeline = self.pipeline("add_in_place");
-            let buffer = self.buffer(4);
+            // SAETTA_WARM_THREADS: threads of the keep-warm kernel (1).
+            let threads = std::env::var("SAETTA_WARM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1);
+            let buffer = self.buffer(threads * 4);
             let start = Instant::now();
             let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let seen = std::sync::Arc::clone(&last);
@@ -202,7 +208,7 @@ mod mac {
                     metal::objc::rc::autoreleasepool(|| {
                         let commands = queue.new_command_buffer();
                         let enc = commands.new_compute_command_encoder();
-                        dispatch_1d(enc, &pipeline, &[(&buffer, 0), (&buffer, 0)], 1);
+                        dispatch_1d(enc, &pipeline, &[(&buffer, 0), (&buffer, 0)], threads);
                         enc.end_encoding();
                         commands.commit();
                         commands.wait_until_completed();
