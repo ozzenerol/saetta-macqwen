@@ -382,7 +382,12 @@ mod mac {
             ("prefill_gate_up", 128)
         };
         let pf = if rows64 && gu_prefetch() { "_pf" } else { "" };
-        enc.set_compute_pipeline_state(&gpu.pipeline(&format!("{name}_{}bit{pf}", gate.bits)));
+        let kernel = if rows64 && gu_bk64() {
+            format!("prefill_gate_up64k_{}bit", gate.bits)
+        } else {
+            format!("{name}_{}bit{pf}", gate.bits)
+        };
+        enc.set_compute_pipeline_state(&gpu.pipeline(&kernel));
         set_quant(enc, 0, gate);
         set_quant(enc, 3, up);
         set_views(enc, 6, &[x_half, g_out, g_half]);
@@ -506,6 +511,13 @@ mod mac {
     /// SAETTA_GU_PF=0.
     fn gu_prefetch() -> bool {
         std::env::var("SAETTA_GU_PF").map_or(true, |v| v != "0")
+    }
+
+    /// Expert gate,up on prefill_gate_up64k, 64-deep k steps, unless
+    /// SAETTA_GU_BK64=0. Batch 58: 960 tokens 0.671 against 0.682 s, 3026
+    /// tokens 1.80 against 1.86 s; batch 62: 32k gate median KL 3.24e-5.
+    fn gu_bk64() -> bool {
+        std::env::var("SAETTA_GU_BK64").map_or(true, |v| v != "0")
     }
 
     fn gate_up64() -> bool {
