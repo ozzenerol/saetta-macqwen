@@ -631,6 +631,21 @@ mod gpu {
         lookup_rounds: usize,
         lookup_accepted: usize,
         pub stats: Stats,
+        /// The MTP entries of the last prompt, made at the next use of the
+        /// MTP layer (`flush`), so they are not in the time to the first
+        /// token.
+        deferred: Option<Deferred>,
+    }
+
+    /// The prompt tail `after_prefill` left for `flush`.
+    struct Deferred {
+        tokens: Vec<u32>,
+        /// The normed hidden states of tokens[start - 1 ..] (or from 0).
+        rows: Vec<f32>,
+        pos: usize,
+        start: usize,
+        /// The state at pos - 1, for the entry of tokens[0] (start 0).
+        before: Option<Vec<f32>>,
     }
 
     impl<'a> GpuSpec<'a> {
@@ -642,6 +657,7 @@ mod gpu {
             GpuSpec {
                 last: View::new(gpu.buffer(hidden * 4)),
                 mtp_positions: Vec::new(),
+                deferred: None,
                 length: DraftLength::new(k),
                 lookup: LookupAccept::new(k),
                 use_lookup: std::env::var("SAETTA_LOOKUP").map_or(true, |v| v != "0"),
@@ -707,31 +723,56 @@ mod gpu {
         /// the normed hidden states of `tokens`, which ran at positions
         /// `pos ..`; `last` must hold the state at `pos - 1` when `pos > 0`.
         /// Only the last `window` tokens get an entry: an entry costs about
-        /// as much as a decode step, and older ones matter less.
+        /// as much as a decode step, and older ones matter less. The entries
+        /// are made at the next use of the MTP layer, after the first token
+        /// of the answer has gone out.
         pub fn after_prefill(&mut self, tokens: &[u32], rows: &[f32], pos: usize, window: usize) {
+            self.flush();
             self.ran(pos, tokens);
             let n = tokens.len();
             let h = self.hidden;
             let start = n.saturating_sub(window).max(usize::from(pos == 0));
-            let staged = View::new(self.gpu.buffer_from(rows));
-            for r in start..n {
-                if r == 0 {
-                    let last = self.last.clone();
-                    self.mtp_record(&last, pos - 1, tokens[0]);
-                } else {
-                    let at = View {
-                        buffer: staged.buffer.clone(),
-                        offset: ((r - 1) * h * 4) as u64,
-                    };
-                    self.mtp_record(&at, pos + r - 1, tokens[r]);
-                }
-            }
+            // Entry r reads the state of row r - 1.
+            let from = start.saturating_sub(1);
+            let before = (start == 0).then(|| read(&self.last, h));
+            self.deferred = Some(Deferred {
+                tokens: tokens[start..].to_vec(),
+                rows: rows[from * h..(n - 1) * h].to_vec(),
+                pos,
+                start,
+                before,
+            });
             write(&self.last, &rows[(n - 1) * h..n * h]);
+        }
+
+        /// Makes the MTP entries `after_prefill` left. Every use of the MTP
+        /// layer calls this first.
+        fn flush(&mut self) {
+            let Some(d) = self.deferred.take() else {
+                return;
+            };
+            let h = self.hidden;
+            let staged = (!d.rows.is_empty()).then(|| View::new(self.gpu.buffer_from(&d.rows)));
+            let before = d.before.map(|b| View::new(self.gpu.buffer_from(&b)));
+            for (i, &t) in d.tokens.iter().enumerate() {
+                let r = d.start + i;
+                let state = if r == 0 {
+                    before.clone().expect("the state before the prompt")
+                } else {
+                    let s = staged.as_ref().expect("staged rows");
+                    View {
+                        buffer: s.buffer.clone(),
+                        offset: ((r - 1 - d.start.saturating_sub(1)) * h * 4) as u64,
+                    }
+                };
+                self.mtp_record(&state, d.pos + r - 1, t);
+            }
         }
 
         /// After going back to `len` tokens: keeps the MTP entries made from
         /// states before `len - 1` and sets the last hidden state.
         pub fn after_restore(&mut self, len: usize, last: &[f32]) {
+            self.flush();
             let keep = self
                 .mtp_positions
                 .iter()
@@ -787,6 +828,7 @@ mod gpu {
         /// state up to date, for a token run outside `speculate` (the
         /// prompt cache runs a prompt's last token this way).
         pub fn step(&mut self, model: &mut GpuModel<'a>, token: u32) -> Vec<f32> {
+            self.flush();
             let pos = model.position();
             self.ran(pos, &[token]);
             if pos > 0 {
@@ -802,6 +844,7 @@ mod gpu {
         /// multi-row verify, `k + 1` tokens per pass, keeping all of them;
         /// returns the logits after the last. For a prompt's short tail.
         pub fn run_rows(&mut self, model: &mut GpuModel<'a>, tokens: &[u32]) -> Vec<f32> {
+            self.flush();
             let mut logits = Vec::new();
             for piece in tokens.chunks(self.k + 1) {
                 let pos = model.position();
@@ -837,6 +880,7 @@ mod gpu {
         }
 
         pub fn reset(&mut self) {
+            self.deferred = None;
             self.mtp.reset();
             self.mtp_positions.clear();
             self.history.clear();
@@ -853,6 +897,7 @@ mod gpu {
             pending: u32,
             decide: &mut dyn Decider,
         ) -> (Vec<u32>, u32) {
+            self.flush();
             let context = model.position();
             self.ran(context, &[pending]);
             let found = if self.use_lookup {
