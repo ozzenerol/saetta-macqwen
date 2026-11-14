@@ -538,6 +538,8 @@ mod mac {
 
             let want = cpu_step(&mtp, &model, &hidden(21), 7, &mut state);
             g.record(&main(21), 7);
+            // `record` may not have finished on the GPU yet.
+            g.settle();
             check("record", &g, want.1, &want);
             let want = cpu_step(&mtp, &model, &hidden(22), 8, &mut state);
             let got = g.step(&main(22), 8);
