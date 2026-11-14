@@ -718,8 +718,8 @@ struct GpuServed {
 }
 
 /// Seconds the GPU stays warm after a request: SAETTA_WARM_SECS, 300 by
-/// default, 0 for off. Batch 56: a 49-token prompt after 3 idle seconds
-/// had its first token in 0.44 s cold.
+/// default, 0 for off. Batch 56, 20 s between requests: first token of a
+/// 49-token prompt in 0.22 s against 0.44 cold, 961 tokens 0.76 against 0.97.
 #[cfg(target_os = "macos")]
 fn warm_secs() -> Option<u64> {
     let secs = std::env::var("SAETTA_WARM_SECS")
