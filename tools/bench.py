@@ -121,6 +121,14 @@ def fit_filler(url, model):
     return lambda tokens: max(0, round((tokens - fixed) / per))
 
 
+def cool(args, progress):
+    """Waits --cool seconds before a run. The M3 Max gets slower as it heats:
+    without a pause, the later contexts of a run measure a hot GPU."""
+    if args.cool > 0:
+        progress.set(f"cool-down {args.cool} s")
+        time.sleep(args.cool)
+
+
 def bench_contexts(args, url, model, progress):
     sentences = fit_filler(url, model)
     stamp = int(time.time())
@@ -130,6 +138,7 @@ def bench_contexts(args, url, model, progress):
         filler = "".join(FILLER.format(i) for i in range(sentences(target)))
         runs = []
         for r in range(args.runs):
+            cool(args, progress)
             progress.set(f"context {name} run {r + 1}/{args.runs}")
             head = f"Run {stamp}-{name}-{r}. "
             try:
@@ -179,6 +188,7 @@ def bench_multiturn(args, url, model, progress):
     stamp = int(time.time())
     messages = [{"role": "system", "content": f"Session {stamp}. " + SYSTEM}]
     turns = []
+    cool(args, progress)
     for t in range(args.turns):
         progress.set(f"multi-turn {t + 1}/{args.turns}")
         messages.append({"role": "user", "content":
@@ -245,6 +255,8 @@ def main():
     ap.add_argument("--turn-tokens", type=int, default=128)
     ap.add_argument("--progress", type=int, default=120, help="seconds between progress lines")
     ap.add_argument("--out", help="JSON file for the results")
+    ap.add_argument("--cool", type=int, default=0,
+                    help="seconds to wait before each run and before the multi-turn case")
     ap.add_argument("--report", nargs="+", metavar="JSON", help="print a markdown table and exit")
     args = ap.parse_args()
     if args.report:
@@ -253,7 +265,7 @@ def main():
     model = model_id(args.url)
     progress = Progress(args.label, args.progress)
     result = {"label": args.label, "url": args.url, "model": model, "date": time.ctime(),
-              "runs": args.runs, "answer_tokens": args.tokens}
+              "runs": args.runs, "answer_tokens": args.tokens, "cool": args.cool}
     if args.contexts:
         result["contexts"] = bench_contexts(args, args.url, model, progress)
     if args.turns:

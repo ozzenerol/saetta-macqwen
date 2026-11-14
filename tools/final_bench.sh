@@ -6,12 +6,14 @@
 #   tools/final_bench.sh report   writes results.md from the JSON files
 # The mlx part never starts or stops MLX; start it with `llm qwen36 start`.
 # Env: CONTEXTS (default 40,1k,4k,16k,32k,64k,128k), RUNS (3), TURNS (10),
-# OUT (~/saetta/final-bench). A progress line goes out every 2 minutes.
+# COOL (seconds of rest before each run, default 60), OUT (~/saetta/final-bench).
+# A progress line goes out every 2 minutes.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 contexts=${CONTEXTS:-40,1k,4k,16k,32k,64k,128k}
 runs=${RUNS:-3}
 turns=${TURNS:-10}
+cool=${COOL:-60}
 out=${OUT:-$HOME/saetta/final-bench}
 python=$HOME/llm/mlx/bin/python
 model=$HOME/llm/saetta-models/Qwen3.6-35B-A3B-5bit
@@ -21,7 +23,7 @@ up() { curl -s -m 2 "127.0.0.1:$1/v1/models" >/dev/null; }
 
 bench() {
 	"$python" -u "$here/tools/bench.py" --url "http://127.0.0.1:$1" --label "$2" \
-		--contexts "$contexts" --runs "$runs" --turns "$turns" --out "$out/$2.json"
+		--contexts "$contexts" --runs "$runs" --turns "$turns" --cool "$cool" --out "$out/$2.json"
 }
 
 case "${1:-}" in
