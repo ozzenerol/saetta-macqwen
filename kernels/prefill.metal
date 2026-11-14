@@ -250,7 +250,7 @@ template [[host_name("qmm_8bit_split")]] kernel decltype(qmm<8, 2>) qmm<8, 2>;
 constant uint PREFILL_DQ_BK = 32;
 constant uint PREFILL_DQ_LD = PREFILL_DQ_BK + 8;
 
-template <uint BITS>
+template <uint BITS, bool PF = false>
 kernel void qmm_dq(device const uint *words [[buffer(0)]],
                    device const ushort *scales [[buffer(1)]],
                    device const ushort *biases [[buffer(2)]],
@@ -318,19 +318,41 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
         }
     }
 
+    // The global loads of a step go to registers first; with PF, the next
+    // step's loads are issued before this step's MMAs.
+    uint packed[BITS];
+    float scale = 0, bias = 0;
+    float4 xv[8];
+    auto fetch = [&](uint k0) {
+        if (!ok) {
+            return;
+        }
+        if (loads_w) {
+            device const uint *wk = wp + k0 / 32 * BITS;
+            for (uint j = 0; j < BITS; j++) {
+                packed[j] = wk[j];
+            }
+            scale = bf16_to_float(sp[k0 / 64]);
+            bias = bf16_to_float(bp[k0 / 64]);
+        } else {
+            device const float4 *p = (device const float4 *)(xrow + k0);
+            for (uint i = 0; i < 8; i++) {
+                xv[i] = p[i];
+            }
+        }
+    };
+    if (PF) {
+        fetch(0);
+    }
     for (uint k0 = 0; k0 < s.k; k0 += PREFILL_DQ_BK) {
+        if (!PF) {
+            fetch(k0);
+        }
         if (!ok) {
             for (uint i = 0; i < 8; i++) {
                 dst[i] = half4(0);
             }
         } else if (loads_w) {
-            uint packed[BITS];
-            device const uint *wk = wp + k0 / 32 * BITS;
-            for (uint j = 0; j < BITS; j++) {
-                packed[j] = wk[j];
-            }
-            float scale = bf16_to_float(sp[k0 / 64]);
-            float bias = bf16_to_float(bp[k0 / 64]);
 #pragma clang loop unroll(full)
             for (uint i = 0; i < 8; i++) {
                 float4 q = float4(unpack<BITS>(packed, 4 * i), unpack<BITS>(packed, 4 * i + 1),
@@ -338,12 +360,14 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
                 dst[i] = half4(q * scale + bias);
             }
         } else {
-            device const float4 *p = (device const float4 *)(xrow + k0);
             for (uint i = 0; i < 8; i++) {
-                dst[i] = half4(p[i]);
+                dst[i] = half4(xv[i]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (PF && k0 + PREFILL_DQ_BK < s.k) {
+            fetch(k0 + PREFILL_DQ_BK);
+        }
 
         for (uint kk = 0; kk < PREFILL_DQ_BK; kk += 8) {
             simdgroup_half8x8 a[4];
@@ -394,6 +418,8 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmm_dq_5bit")]] kernel decltype(qmm_dq<5>) qmm_dq<5>;
 template [[host_name("qmm_dq_8bit")]] kernel decltype(qmm_dq<8>) qmm_dq<8>;
+template [[host_name("qmm_dq_5bit_pf")]] kernel decltype(qmm_dq<5, true>) qmm_dq<5, true>;
+template [[host_name("qmm_dq_8bit_pf")]] kernel decltype(qmm_dq<8, true>) qmm_dq<8, true>;
 
 // The same product for few rows: up to PREFILL_FEW rows of x per
 // threadgroup, in f32 as qmv.metal does, so weights are read once for all

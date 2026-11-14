@@ -145,9 +145,16 @@ mod mac {
         assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
         if split {
             format!("qmm_{}bit_split", w.bits)
+        } else if dq_prefetch() {
+            format!("qmm_dq_{}bit_pf", w.bits)
         } else {
             format!("qmm_dq_{}bit", w.bits)
         }
+    }
+
+    /// SAETTA_DQ_PF=1: qmm_dq loads the next step during this one's MMAs.
+    fn dq_prefetch() -> bool {
+        std::env::var("SAETTA_DQ_PF").is_ok_and(|v| v == "1")
     }
 
     fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
