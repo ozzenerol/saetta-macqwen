@@ -709,9 +709,11 @@ kernel void prefill_ag_pv_t(device const half *sh [[buffer(0)]],
         }
     }
     for (uint k0 = 0; k0 < padded; k0 += PREFILL_AG_BK) {
-        half f = half(exp(tmax[row * PREFILL_AG_TILES + k0 / 64] - m_sub));
+        // f in f32: rounded to half it would scale a whole tile by the
+        // same error, which the 32k gate showed (median KL 1.1e-4, not 4.5e-5).
+        float f = exp(tmax[row * PREFILL_AG_TILES + k0 / 64] - m_sub);
         for (uint i = 0; i < 4; i++) {
-            pd[i] = ((device const half4 *)(pp + k0))[i] * f;
+            pd[i] = half4(float4(((device const half4 *)(pp + k0))[i]) * f);
         }
         bool v_ok = k0 + vr < p.n;
         for (uint i = 0; i < 4; i++) {
