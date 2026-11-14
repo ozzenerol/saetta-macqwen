@@ -329,10 +329,12 @@ kernel void prefill_ag_scores_f(device const half *q [[buffer(0)]],
                                 uint3 tg [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]],
                                 uint simd [[simdgroup_index_in_threadgroup]]) {
-    // The q and key tiles while the product runs, then the 64 x 64 scores.
-    threadgroup float c[64 * 64];
-    threadgroup half *qt = (threadgroup half *)c;
+    // The q and key tiles while the product runs, then 32 rows of scores
+    // at a time (8 KB), so the kernel needs no more threadgroup memory
+    // than prefill_ag_scores.
+    threadgroup half qt[2 * 64 * PREFILL_AG_LD];
     threadgroup half *kt = qt + 64 * PREFILL_AG_LD;
+    threadgroup float *c = (threadgroup float *)qt;
     uint g = tg.z, r0 = tg.y * 64, k0 = tg.x * 64;
     uint last_row = min(r0 + 63, p.rows - 1);
     if (int(k0) > prefill_ag_limit(p, last_row)) {
@@ -377,36 +379,43 @@ kernel void prefill_ag_scores_f(device const half *q [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint i = 0; i < 4; i++) {
-        for (uint j = 0; j < 4; j++) {
-            simdgroup_store(acc[i][j], c + (sm + 8 * i) * 64 + sn + 8 * j, 64);
+    // Simdgroups 0 and 1 hold rows 0 .. 31, 2 and 3 rows 32 .. 63. Thread t
+    // then takes 16 keys of row t / 4; the four share the row max.
+    uint qr = tid / 4, cc = (tid % 4) * 16;
+    for (uint half_ = 0; half_ < 2; half_++) {
+        if (simd / 2 == half_) {
+            for (uint i = 0; i < 4; i++) {
+                for (uint j = 0; j < 4; j++) {
+                    simdgroup_store(acc[i][j], c + (8 * i) * 64 + sn + 8 * j, 64);
+                }
+            }
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Thread t: 32 keys of row t / 2; the pair shares the row max.
-    uint r = r0 + tid / 2, cc = (tid % 2) * 32;
-    int limit = prefill_ag_limit(p, r) - int(k0);
-    int seen = min(limit + 1, int(p.n) - int(k0));
-    threadgroup const float *crow = c + (tid / 2) * 64 + cc;
-    float mx = -INFINITY;
-    for (uint j = 0; j < 32; j++) {
-        if (int(cc + j) < seen) {
-            mx = max(mx, crow[j] * p.scale);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint r = r0 + half_ * 32 + qr;
+        int limit = prefill_ag_limit(p, r) - int(k0);
+        int seen = min(limit + 1, int(p.n) - int(k0));
+        threadgroup const float *crow = c + qr * 64 + cc;
+        float mx = -INFINITY;
+        for (uint j = 0; j < 16; j++) {
+            if (int(cc + j) < seen) {
+                mx = max(mx, crow[j] * p.scale);
+            }
         }
-    }
-    mx = max(mx, simd_shuffle_xor(mx, 1));
-    ulong row = ulong(g) * p.rows_pad + r;
-    if (tid % 2 == 0) {
-        tmax[row * PREFILL_AG_TILES + tg.x] = mx;
-    }
-    device half4 *out = (device half4 *)(sh + row * PREFILL_AG_KEYS + k0 + cc);
-    for (uint j = 0; j < 32; j += 4) {
-        half4 v;
-        for (uint i = 0; i < 4; i++) {
-            v[i] = int(cc + j + i) < seen ? half(crow[j + i] * p.scale - mx) : half(-INFINITY);
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        ulong row = ulong(g) * p.rows_pad + r;
+        if (tid % 4 == 0) {
+            tmax[row * PREFILL_AG_TILES + tg.x] = mx;
         }
-        out[j / 4] = v;
+        device half4 *out = (device half4 *)(sh + row * PREFILL_AG_KEYS + k0 + cc);
+        for (uint j = 0; j < 16; j += 4) {
+            half4 v;
+            for (uint i = 0; i < 4; i++) {
+                v[i] = int(cc + j + i) < seen ? half(crow[j + i] * p.scale - mx) : half(-INFINITY);
+            }
+            out[j / 4] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
