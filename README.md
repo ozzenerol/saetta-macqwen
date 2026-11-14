@@ -23,16 +23,16 @@ The first model is Qwen3.6-35B-A3B, 5-bit MLX quantization, on an M3 Max with 48
 - weights read per generated token: about 2.04 GB
 - decode ceiling from those numbers: about 190 tokens/s
 
-Against `mlx_lm.server` on the same weights, measured with `tools/final_bench.sh` on 2026-11-12 at d9c512f (3 runs each, median; full table in [docs/BENCHMARK.md](docs/BENCHMARK.md)):
+Against `mlx_lm.server` on the same weights, measured with `tools/final_bench.sh` on 2026-11-14 at 3a49049 (3 runs each after 60 s of rest, median; full table in [docs/BENCHMARK.md](docs/BENCHMARK.md)):
 
 | prompt tokens | saetta decode tok/s | MLX decode tok/s | saetta TTFT s | MLX TTFT s |
 |---|---|---|---|---|
-| 49 | 110.5 | 73.8 | 0.28 | 0.15 |
-| 4,111 | 108.5 | 70.5 | 3.23 | 2.72 |
-| 35,958 | 89.3 | 58.5 | 37.8 | 33.3 |
-| 150,597 | 50.4 | out of memory | 362 | - |
+| 49 | 117.3 | 76.7 | 0.22 | 0.52 |
+| 4,111 | 115.5 | 73.7 | 2.58 | 3.06 |
+| 35,958 | 101.0 | 60.2 | 31.5 | 33.5 |
+| 150,597 | 53.8 | out of memory | 307 | - |
 
-saetta decodes about 1.5 times faster and runs the full context; MLX still gets to the first token sooner, so prefill is the current target. These numbers predate the 8-bit KV default and the 4096-token prefill chunks, which brought 4k TTFT from 2.75 to 2.62 s and 16k from 13.5 to 12.9 s in our own benches; the table will be measured again.
+saetta decodes 1.5 to 1.7 times faster, reaches the first token sooner at every length and runs the full context. In a qh-like session of 10 turns, a turn's first token still comes about 0.1 s later than with MLX (2.82 against 2.70 s), with answers twice as fast.
 
 Design notes and measured numbers are in [docs/PLAN.md](docs/PLAN.md).
 
