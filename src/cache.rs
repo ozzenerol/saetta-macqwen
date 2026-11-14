@@ -564,7 +564,11 @@ impl<M: Model + Restore> Model for Cached<M> {
         let keep = if common == self.tokens.len() && common >= best {
             common
         } else {
+            let t0 = Instant::now();
             self.save(false);
+            if std::env::var("SAETTA_TRACE_TTFT").is_ok_and(|v| v == "1") {
+                eprintln!("ttft: resume save {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
             if best == 0 {
                 self.reset();
                 0

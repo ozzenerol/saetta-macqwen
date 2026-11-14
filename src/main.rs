@@ -926,12 +926,24 @@ impl server::Model for GpuServed {
     }
 
     fn reset(&mut self) {
+        let t0 = Instant::now();
         if let Some(blit) = self.last_blit.take() {
             blit.wait_until_completed();
         }
+        let t1 = t0.elapsed();
         self.model.reset();
+        let t2 = t0.elapsed();
         if let Some(d) = &mut self.drafting {
             d.spec.reset();
+        }
+        if std::env::var("SAETTA_TRACE_TTFT").is_ok_and(|v| v == "1") {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "ttft: reset: blit wait {:.1} ms, model {:.1}, drafts {:.1}",
+                ms(t1),
+                ms(t2 - t1),
+                ms(t0.elapsed() - t2)
+            );
         }
     }
 
