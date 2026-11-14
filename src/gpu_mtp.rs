@@ -137,8 +137,10 @@ mod mac {
                 limit,
                 position: 0,
                 pending: None,
-                // SAETTA_MTP_ASYNC=1: `record` does not wait for the GPU.
-                record_async: std::env::var("SAETTA_MTP_ASYNC").is_ok_and(|v| v == "1"),
+                // `record` does not wait for the GPU unless SAETTA_MTP_ASYNC=0.
+                // Batch 44, spec_bench: code 169.3 against 166.6 tok/s, file
+                // edit 251 against 245, prose the same, outputs equal.
+                record_async: std::env::var("SAETTA_MTP_ASYNC").map_or(true, |v| v != "0"),
             })
         }
 
