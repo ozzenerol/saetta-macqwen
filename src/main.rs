@@ -1223,9 +1223,16 @@ fn bench_serve_prefill(dir: &str, tokens: usize, every: usize) -> Result<(), Box
         context: (tokens + 64).next_multiple_of(1024),
         ..Memory::default()
     };
-    let served = load_gpu(config, weights, 0, 0, memory)?;
+    // SAETTA_BSP_DRAFTS=1: with the MTP drafter and lookup of serve's
+    // defaults, so the prefill also keeps the hidden rows for the MTP cache.
+    let (draft, lookup) = if std::env::var("SAETTA_BSP_DRAFTS").is_ok_and(|v| v == "1") {
+        (3, 7)
+    } else {
+        (0, 0)
+    };
+    let served = load_gpu(config, weights, draft, lookup, memory)?;
     let snapshots = served.snapshots;
-    let mut model = Cached::new(served, snapshots, every);
+    let mut model = Cached::new(served, snapshots, every).min_piece(serve_chunk());
     let prompt = saetta::prefill::test_tokens(tokens);
     let start = Instant::now();
     model.prefill(&prompt);
