@@ -145,16 +145,9 @@ mod mac {
         assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
         if split {
             format!("qmm_{}bit_split", w.bits)
-        } else if dq_bk64() {
-            format!("qmm_dq64_{}bit", w.bits)
         } else {
             format!("qmm_dq_{}bit", w.bits)
         }
-    }
-
-    /// SAETTA_DQ_BK64=1: qmm_dq with 64-deep k steps.
-    fn dq_bk64() -> bool {
-        std::env::var("SAETTA_DQ_BK64").is_ok_and(|v| v == "1")
     }
 
     fn qmm_pipeline(gpu: &Gpu, w: &GpuQuant, split: bool) -> metal::ComputePipelineState {
