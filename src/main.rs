@@ -962,6 +962,10 @@ impl Restore for GpuServed {
 
     fn save(&self) -> Self::State {
         let m = &self.model;
+        if std::env::var("SAETTA_TRACE_TTFT").is_ok_and(|v| v == "1") {
+            let t = m.gpu().run(|_| {});
+            eprintln!("ttft: empty command buffer {:.1} ms", t.as_secs_f64() * 1e3);
+        }
         let (snapshot, blit) = saetta::gpu_cache::save(m.gpu(), &self.pool, &m.deltanet_states());
         *self.last_blit.borrow_mut() = Some(blit);
         saetta::memtrace::mark("snapshot saved");
