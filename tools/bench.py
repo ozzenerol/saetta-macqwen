@@ -194,11 +194,19 @@ def bench_multiturn(args, url, model, progress):
         messages.append({"role": "user", "content":
                          f"Here is file step{t}.go:\n{tool_result(t)}\n"
                          f"In two sentences, what does step{t}_7 return for x = 2?"})
-        row = one_run(url, model, messages, args.turn_tokens)
+        try:
+            row = one_run(url, model, messages, args.turn_tokens)
+        except Exception as e:
+            # A server that ran out of memory on the longest context may be
+            # gone; keep the turns so far.
+            print(f"  turn {t + 1}: failed: {e}", flush=True)
+            break
         messages.append({"role": "assistant", "content": row.pop("answer")})
         turns.append(row)
         print(f"  turn {t + 1}: prompt {row['prompt_tokens']}, cached {row['cached_tokens']}, "
               f"ttft {row['ttft']:.2f} s, decode {row['decode'] or 0:.1f} tok/s", flush=True)
+    if len(turns) < 2:
+        return None
     return {
         "turns": turns,
         "ttft": median(turns[1:], "ttft"),
@@ -266,15 +274,19 @@ def main():
     progress = Progress(args.label, args.progress)
     result = {"label": args.label, "url": args.url, "model": model, "date": time.ctime(),
               "runs": args.runs, "answer_tokens": args.tokens, "cool": args.cool}
+    def save():
+        if args.out:
+            with open(args.out, "w") as f:
+                json.dump(result, f, indent=1)
+
     if args.contexts:
         result["contexts"] = bench_contexts(args, args.url, model, progress)
+        save()
     if args.turns:
         result["multiturn"] = bench_multiturn(args, args.url, model, progress)
     progress.set("done")
     print(progress.line(), flush=True)
-    if args.out:
-        with open(args.out, "w") as f:
-            json.dump(result, f, indent=1)
+    save()
 
 
 if __name__ == "__main__":
