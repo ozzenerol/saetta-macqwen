@@ -1796,7 +1796,7 @@ inline void dequant16(thread const uint *packed, float scale, float bias,
     }
 }
 
-template <uint BITS, bool PF>
+template <uint BITS, bool PF, uint BM = PREFILL_GU64_BM>
 kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                               device const ushort *gate_scales [[buffer(1)]],
                               device const ushort *gate_biases [[buffer(2)]],
@@ -1814,7 +1814,7 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
                               uint tid [[thread_index_in_threadgroup]],
                               uint simd [[simdgroup_index_in_threadgroup]],
                               uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup half xt[PREFILL_GU64_BM * PREFILL_GU_LD];
+    threadgroup half xt[BM * PREFILL_GU_LD];
     threadgroup half wt[2 * PREFILL_GU64_BN * PREFILL_GU_LD];
 
     uint expert = 0, first, count;
@@ -1830,8 +1830,8 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
         first = tile.y;
         count = tile.z;
     } else {
-        first = tg.y * PREFILL_GU64_BM;
-        count = min(PREFILL_GU64_BM, s.m - first);
+        first = tg.y * BM;
+        count = min(BM, s.m - first);
     }
     uint n0 = tg.x * PREFILL_GU64_BN;
 
@@ -1849,7 +1849,9 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
     bool low = tid < 2 * PREFILL_GU64_BN;
     bool is_up = wr >= PREFILL_GU64_BN;
     uint wn = n0 + wr % PREFILL_GU64_BN;
-    bool w_ok = wn < s.n;
+    // With 128-row tiles, threads 256 and up load x only.
+    bool w_loader = tid < 4 * PREFILL_GU64_BN;
+    bool w_ok = w_loader && wn < s.n;
     ulong wrow = ulong(expert) * s.n + (w_ok ? wn : 0);
     device const uint *wp = (is_up ? up_words : gate_words) + wrow * (s.k * BITS / 32);
     device const ushort *sp = (is_up ? up_scales : gate_scales) + wrow * (s.k / 64);
@@ -1903,7 +1905,7 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
             } else {
                 dequant16<BITS, 16>(packed, scale, bias, wd);
             }
-        } else {
+        } else if (w_loader) {
             for (uint i = 0; i < 4; i++) {
                 wd[i] = half4(0);
             }
@@ -1968,6 +1970,8 @@ template [[host_name("prefill_gate_up64_5bit")]] kernel decltype(prefill_gate_up
 template [[host_name("prefill_gate_up64_8bit")]] kernel decltype(prefill_gate_up64<8, false>) prefill_gate_up64<8, false>;
 template [[host_name("prefill_gate_up64_5bit_pf")]] kernel decltype(prefill_gate_up64<5, true>) prefill_gate_up64<5, true>;
 template [[host_name("prefill_gate_up64_8bit_pf")]] kernel decltype(prefill_gate_up64<8, true>) prefill_gate_up64<8, true>;
+template [[host_name("prefill_gate_up128_5bit_pf")]] kernel decltype(prefill_gate_up64<5, true, 128>) prefill_gate_up64<5, true, 128>;
+template [[host_name("prefill_gate_up128_8bit_pf")]] kernel decltype(prefill_gate_up64<8, true, 128>) prefill_gate_up64<8, true, 128>;
 
 // g = silu(g) * u and g_half = g for the rows of the tiles of PREFILL_FEW
 // rows or fewer, which prefill_gate_up skips. One threadgroup per tile.

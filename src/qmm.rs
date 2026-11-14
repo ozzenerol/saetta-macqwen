@@ -62,6 +62,14 @@ pub const HALVES: Variant = Variant {
     sub: 2,
 };
 
+/// qmm2_32 on expert tiles of 128 rows, for prefill_gate_up128's tiles.
+pub const QUARTERS: Variant = Variant {
+    name: "qmm2_32x4",
+    rows: 128,
+    cols: 128,
+    sub: 4,
+};
+
 /// The fastest in bench-qmm2: 32 x 128 tiles, single buffered.
 pub const DEFAULT: Variant = VARIANTS[2];
 /// For expert tiles of 16 rows or fewer: 7.5 TFLOP/s there against 5.0 for

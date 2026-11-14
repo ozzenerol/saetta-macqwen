@@ -343,7 +343,11 @@ mod mac {
             k: gate.cols as u32,
             gather: 1,
         };
-        let threads = bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, rows64);
+        let threads = if rows64 && gate_up128() {
+            bind_gate_up128(gpu, enc, gate, up, x_half, g_out, g_half, &shape)
+        } else {
+            bind_gate_up(gpu, enc, gate, up, x_half, g_out, g_half, &shape, rows64)
+        };
         set_views(enc, 10, &[g.tiles, g.rows, g.tile_count]);
         groups(enc, (gate.rows.div_ceil(64), g.max_tiles), threads);
 
@@ -388,6 +392,28 @@ mod mac {
         set_views(enc, 6, &[x_half, g_out, g_half]);
         params(enc, 9, shape);
         threads
+    }
+
+    /// bind_gate_up for prefill_gate_up128: 128-row tiles, 512 threads.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_gate_up128(
+        gpu: &Gpu,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuQuant,
+        up: &GpuQuant,
+        x_half: &View,
+        g_out: &View,
+        g_half: &View,
+        shape: &MmShape,
+    ) -> usize {
+        assert!(matches!(gate.bits, 5 | 8));
+        let name = format!("prefill_gate_up128_{}bit_pf", gate.bits);
+        enc.set_compute_pipeline_state(&gpu.pipeline(&name));
+        set_quant(enc, 0, gate);
+        set_quant(enc, 3, up);
+        set_views(enc, 6, &[x_half, g_out, g_half]);
+        params(enc, 9, shape);
+        512
     }
 
     /// g = silu(x gate^T) * (x up^T) for `m` rows of half x, in f32 and in
@@ -454,6 +480,8 @@ mod mac {
                     // in batch 6: 201 against 174 ms per 2k chunk).
                     if std::env::var("SAETTA_DOWN64").is_ok_and(|v| v == "1") {
                         crate::qmm::VARIANTS[0]
+                    } else if gate_up128() {
+                        crate::qmm::QUARTERS
                     } else {
                         crate::qmm::HALVES
                     }
@@ -506,6 +534,12 @@ mod mac {
     /// SAETTA_GU_PF=0.
     fn gu_prefetch() -> bool {
         std::env::var("SAETTA_GU_PF").map_or(true, |v| v != "0")
+    }
+
+    /// SAETTA_GU128=1: expert tiles of up to 128 rows, so an expert with
+    /// 65 to 128 tokens dequantizes its gate and up once instead of twice.
+    fn gate_up128() -> bool {
+        std::env::var("SAETTA_GU128").is_ok_and(|v| v == "1")
     }
 
     fn gate_up64() -> bool {
