@@ -185,7 +185,8 @@ mod mac {
             gather: 0,
         };
         // The exact (split) kernels keep qmm_few's f32 up to FEW_MAX rows.
-        let few = m <= FEW_MAX && (kernel.ends_with("_split") || m <= fast_few_max());
+        let few = (m <= FEW_MAX && (kernel.ends_with("_split") || m <= fast_few_max()))
+            || (w.rows <= NARROW_ROWS && m <= narrow_few_max());
         if few {
             enc.set_compute_pipeline_state(&few_pipeline(gpu, w));
         } else {
@@ -221,6 +222,28 @@ mod mac {
                 .map_or(FAST_FEW_MAX, |n: usize| n.min(FEW_MAX))
         })
     }
+    /// Matrices with at most this many rows (the router, the shared expert
+    /// gate, attention k and v) give the 64 x 64 tiles few threadgroups: 4
+    /// for the router at up to 64 tokens, about 300 us a layer.
+    const NARROW_ROWS: usize = 512;
+
+    /// Up to this many tokens the narrow matrices run on qmm_few, which has a
+    /// threadgroup per 8 rows of x and 8 of y: 64 by default, or
+    /// SAETTA_NARROW_FEW=<n> (0 turns it off). Batch 37, bench-prefill: 49
+    /// tokens 0.123 s instead of 0.147, 512 and 1024 the same (0.438, 0.719);
+    /// 1024 made 1024 tokens slower (0.761).
+    fn narrow_few_max() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("SAETTA_NARROW_FEW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(NARROW_FEW_MAX)
+        })
+    }
+
+    const NARROW_FEW_MAX: usize = 64;
+
     /// x rows per qmm_few threadgroup; must match PREFILL_FEW.
     const FEW: usize = 8;
     /// y columns per qmm_few threadgroup: 2 simdgroups of 4.
