@@ -37,6 +37,12 @@ pub const BACKUP_ROWS: usize = 16384;
 /// Rows a speculative step may write past the tokens it returns.
 const DRAFT_ROWS: usize = 8;
 
+/// No anchor when fewer tokens than this follow it in the prompt: the
+/// prompt of a lone user message ends 7 tokens after its <|im_end|>, and a
+/// separate prefill call for that tail cost 40 ms of a 0.22 s TTFT. The
+/// snapshot one token before the end still lets a retry reuse the prompt.
+const ANCHOR_MIN_TAIL: usize = 16;
+
 /// A model whose recurrent state can be copied out and put back.
 pub trait Restore {
     type State: Send;
@@ -461,7 +467,9 @@ impl<M: Model + Restore> Model for Cached<M> {
         }
         let start = self.tokens.len();
         let last = start + tokens.len() - 1;
-        let anchor = self.anchor_in(tokens).filter(|&a| a <= last);
+        let anchor = self
+            .anchor_in(tokens)
+            .filter(|&a| a <= last && last - a >= ANCHOR_MIN_TAIL);
         let mut done = 0;
         // Lengths of the snapshots taken on the way that were new.
         let mut taken: Vec<usize> = Vec::new();
@@ -1132,6 +1140,23 @@ mod tests {
         let lengths = c.snapshots().lengths();
         assert!(lengths.contains(&6), "{lengths:?}");
         assert_eq!(lengths.len(), KEEP_ON_THE_WAY + 2, "{lengths:?}");
+    }
+
+    /// A message end close to the end of the prompt gets no anchor, so the
+    /// prompt runs in one piece up to the token before its end.
+    #[test]
+    fn no_anchor_before_a_short_tail() {
+        const END: u32 = 1_000_000;
+        let mut c = Cached::new(Toy::keeping(), 4096, 4096).anchor_after(END);
+        let mut prompt = tokens(40, 0);
+        prompt.push(END);
+        prompt.extend(tokens(7, 1));
+        c.prefill(&prompt);
+        assert_eq!(c.snapshots().lengths(), vec![prompt.len() - 1]);
+        prompt.extend(tokens(ANCHOR_MIN_TAIL, 2));
+        let mut c = Cached::new(Toy::keeping(), 4096, 4096).anchor_after(END);
+        c.prefill(&prompt);
+        assert!(c.snapshots().lengths().contains(&41));
     }
 
     /// A long conversation pushes every early snapshot out, but a new one
