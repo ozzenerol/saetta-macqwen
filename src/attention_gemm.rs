@@ -78,6 +78,12 @@ mod mac {
         std::env::var("SAETTA_AG_TEXP").is_ok_and(|v| v == "1")
     }
 
+    /// SAETTA_AG_PF=1 (with SAETTA_AG_TEXP): scores and pv load the next K
+    /// step into registers while the current one multiplies.
+    fn prefetch_from_env() -> bool {
+        std::env::var("SAETTA_AG_PF").is_ok_and(|v| v == "1")
+    }
+
     fn slices() -> usize {
         std::env::var("SAETTA_AG_SLICES")
             .ok()
@@ -241,6 +247,7 @@ mod mac {
             let f_ = match (self.fused, self.texp) {
                 (false, _) => "",
                 (true, false) => "_f",
+                (true, true) if prefetch_from_env() => "_tp",
                 (true, true) => "_t",
             };
             let tsum = whole(&self.tsum);
