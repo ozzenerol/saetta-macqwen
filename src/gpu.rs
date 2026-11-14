@@ -143,6 +143,64 @@ mod mac {
         }
     }
 
+    /// A retained reference to the `Gpu`'s residency set, for buffers that
+    /// come and go (snapshots): `add` and `remove` commit at once.
+    pub struct Resident {
+        set: *mut metal::objc::runtime::Object,
+    }
+
+    // The set is only used under the server's engine lock.
+    unsafe impl Send for Resident {}
+    unsafe impl Sync for Resident {}
+
+    // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+    #[allow(unexpected_cfgs)]
+    impl Resident {
+        pub fn add(&self, buffer: &Buffer) {
+            use metal::foreign_types::ForeignType;
+            use metal::objc::runtime::Object;
+            use metal::objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let _: () = msg_send![self.set, addAllocation: buffer.as_ptr() as *mut Object];
+                let _: () = msg_send![self.set, commit];
+                let _: () = msg_send![self.set, requestResidency];
+            }
+        }
+
+        pub fn remove(&self, buffer: &Buffer) {
+            use metal::foreign_types::ForeignType;
+            use metal::objc::runtime::Object;
+            use metal::objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let _: () = msg_send![self.set, removeAllocation: buffer.as_ptr() as *mut Object];
+                let _: () = msg_send![self.set, commit];
+            }
+        }
+    }
+
+    // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+    #[allow(unexpected_cfgs)]
+    impl Clone for Resident {
+        fn clone(&self) -> Resident {
+            use metal::objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let _: *mut metal::objc::runtime::Object = msg_send![self.set, retain];
+            }
+            Resident { set: self.set }
+        }
+    }
+
+    // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+    #[allow(unexpected_cfgs)]
+    impl Drop for Resident {
+        fn drop(&mut self) {
+            use metal::objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let _: () = msg_send![self.set, release];
+            }
+        }
+    }
+
     // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
     #[allow(unexpected_cfgs)]
     impl Drop for Residency {
@@ -153,6 +211,10 @@ mod mac {
                 let _: () = msg_send![self.set, release];
             }
         }
+    }
+
+    fn resident_states() -> bool {
+        std::env::var("SAETTA_RESIDENT_STATES").map_or(true, |v| v != "0")
     }
 
     /// A file mapped into memory and wrapped as a GPU buffer without a copy.
@@ -438,6 +500,31 @@ mod mac {
     }
 
     impl Gpu {
+        /// Adds a buffer that lives as long as the `Gpu` (a DeltaNet state)
+        /// to the residency set, unless SAETTA_RESIDENT_STATES=0. Without
+        /// it the first copy of the states after a few idle seconds waited
+        /// about 270 ms (batch 53).
+        pub fn keep_resident(&self, buffer: &Buffer) {
+            if let Some(r) = &self.residency
+                && resident_states()
+            {
+                r.add(buffer);
+            }
+        }
+
+        /// The residency set for buffers that come and go, unless
+        /// SAETTA_RESIDENT_STATES=0.
+        // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+        #[allow(unexpected_cfgs)]
+        pub fn resident(&self) -> Option<Resident> {
+            use metal::objc::{msg_send, sel, sel_impl};
+            let r = self.residency.as_ref().filter(|_| resident_states())?;
+            unsafe {
+                let _: *mut metal::objc::runtime::Object = msg_send![r.set, retain];
+            }
+            Some(Resident { set: r.set })
+        }
+
         /// Commits weight buffers added since the last command buffer to
         /// the residency set.
         pub fn commit_residency(&self) {

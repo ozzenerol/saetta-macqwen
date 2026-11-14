@@ -15,7 +15,7 @@ pub use mac::*;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use crate::gpu::{Gpu, dispatch_1d};
+    use crate::gpu::{Gpu, Resident, dispatch_1d};
     use crate::gpu_layers::{GpuDeltaNetState, GpuKvCache};
     use metal::{Buffer, CommandBuffer, Device, MTLResourceOptions};
     use std::sync::Arc;
@@ -32,18 +32,24 @@ mod mac {
         live: Arc<AtomicUsize>,
         /// States are stored in f16.
         half: bool,
+        resident: Option<Resident>,
     }
 
     pub struct GpuSnapshot {
         buffer: Buffer,
         live: Arc<AtomicUsize>,
         half: bool,
+        /// The snapshot stays in the residency set while it lives.
+        resident: Option<Resident>,
     }
 
     impl Drop for GpuSnapshot {
         fn drop(&mut self) {
             // A blit still in flight retains the buffer until it is done.
             self.live.fetch_sub(1, Ordering::Relaxed);
+            if let Some(r) = &self.resident {
+                r.remove(&self.buffer);
+            }
         }
     }
 
@@ -67,6 +73,7 @@ mod mac {
                 limit: count,
                 live: Arc::new(AtomicUsize::new(0)),
                 half: false,
+                resident: gpu.resident(),
             }
         }
 
@@ -102,12 +109,17 @@ mod mac {
             if self.live.fetch_add(1, Ordering::Relaxed) >= self.limit {
                 eprintln!("snapshot pool is full: allocating past the cache limit");
             }
+            let buffer = self
+                .device
+                .new_buffer(self.size, MTLResourceOptions::StorageModePrivate);
+            if let Some(r) = &self.resident {
+                r.add(&buffer);
+            }
             GpuSnapshot {
-                buffer: self
-                    .device
-                    .new_buffer(self.size, MTLResourceOptions::StorageModePrivate),
+                buffer,
                 live: Arc::clone(&self.live),
                 half: self.half,
+                resident: self.resident.clone(),
             }
         }
     }

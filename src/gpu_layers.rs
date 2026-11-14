@@ -535,10 +535,13 @@ mod mac {
     impl GpuDeltaNetState {
         pub fn new(gpu: &Gpu, cfg: &DeltaNetConfig) -> GpuDeltaNetState {
             let channels = 2 * cfg.k_heads * cfg.k_dim + cfg.v_heads * cfg.v_dim;
-            GpuDeltaNetState {
+            let state = GpuDeltaNetState {
                 conv: gpu.buffer((cfg.kernel - 1) * channels * 4),
                 recurrent: gpu.buffer(cfg.v_heads * cfg.v_dim * cfg.k_dim * 4),
-            }
+            };
+            gpu.keep_resident(&state.conv);
+            gpu.keep_resident(&state.recurrent);
+            state
         }
     }
 
