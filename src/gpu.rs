@@ -385,6 +385,39 @@ mod mac {
         }
     }
 
+    /// A command buffer committed by `Gpu::commit`: `wait` blocks until it
+    /// is done and panics if it failed.
+    pub struct Pending(metal::CommandBuffer);
+
+    impl Pending {
+        pub fn wait(self) {
+            self.0.wait_until_completed();
+            if self.0.status() == metal::MTLCommandBufferStatus::Error {
+                panic!("GPU command buffer failed: {}", command_buffer_error(&self.0));
+            }
+        }
+    }
+
+    impl Gpu {
+        /// `run_timed` without the wait: the command buffer is committed and
+        /// runs while the CPU goes on; `Pending::wait` checks it.
+        pub fn commit_with(
+            &self,
+            dispatch: MTLDispatchType,
+            encode: impl FnOnce(&ComputeCommandEncoderRef),
+        ) -> Pending {
+            metal::objc::rc::autoreleasepool(|| {
+                self.commit_residency();
+                let commands = self.queue.new_command_buffer();
+                let encoder = commands.compute_command_encoder_with_dispatch_type(dispatch);
+                encode(encoder);
+                encoder.end_encoding();
+                commands.commit();
+                Pending(commands.to_owned())
+            })
+        }
+    }
+
     /// The error description of a failed command buffer.
     // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
     #[allow(unexpected_cfgs)]

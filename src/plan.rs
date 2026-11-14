@@ -247,20 +247,29 @@ mod mac {
         // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
         #[allow(unexpected_cfgs)]
         pub fn run_timed(&self, gpu: &Gpu) -> (Duration, f64) {
-            gpu.run_timed(MTLDispatchType::Concurrent, |enc| {
-                let refs: Vec<&metal::ResourceRef> = self
-                    .resources
-                    .iter()
-                    .map(|b| -> &metal::ResourceRef { b })
-                    .collect();
-                enc.use_resources(&refs, MTLResourceUsage::Read | MTLResourceUsage::Write);
-                let range = NSRange::new(0, self.count as u64);
-                let icb: &metal::IndirectCommandBufferRef = &self.icb;
-                // The metal crate binds this call only on the render encoder.
-                unsafe {
-                    let _: () = msg_send![enc, executeCommandsInBuffer: icb withRange: range];
-                }
-            })
+            gpu.run_timed(MTLDispatchType::Concurrent, |enc| self.encode(enc))
+        }
+
+        /// `run` without the wait (`Gpu::commit`).
+        pub fn commit(&self, gpu: &Gpu) -> crate::gpu::Pending {
+            gpu.commit_with(MTLDispatchType::Concurrent, |enc| self.encode(enc))
+        }
+
+        // The objc 0.2 msg_send! macro checks an old `cargo-clippy` cfg.
+        #[allow(unexpected_cfgs)]
+        fn encode(&self, enc: &metal::ComputeCommandEncoderRef) {
+            let refs: Vec<&metal::ResourceRef> = self
+                .resources
+                .iter()
+                .map(|b| -> &metal::ResourceRef { b })
+                .collect();
+            enc.use_resources(&refs, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            let range = NSRange::new(0, self.count as u64);
+            let icb: &metal::IndirectCommandBufferRef = &self.icb;
+            // The metal crate binds this call only on the render encoder.
+            unsafe {
+                let _: () = msg_send![enc, executeCommandsInBuffer: icb withRange: range];
+            }
         }
     }
 }

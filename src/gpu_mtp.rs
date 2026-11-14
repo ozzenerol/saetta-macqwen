@@ -71,6 +71,11 @@ mod mac {
         /// The most the cache may grow to.
         limit: usize,
         position: usize,
+        /// The last `record`, which runs while the main model goes on. Its
+        /// buffers are this layer's own, so only the next use of the layer
+        /// waits for it (`settle`).
+        pending: Option<crate::gpu::Pending>,
+        record_async: bool,
     }
 
     impl<'a> GpuMtp<'a> {
@@ -131,6 +136,11 @@ mod mac {
                 capacity,
                 limit,
                 position: 0,
+                pending: None,
+                // `record` does not wait for the GPU unless SAETTA_MTP_ASYNC=0.
+                // Batch 44, spec_bench: code 169.3 against 166.6 tok/s, file
+                // edit 251 against 245, prose the same, outputs equal.
+                record_async: std::env::var("SAETTA_MTP_ASYNC").map_or(true, |v| v != "0"),
             })
         }
 
@@ -155,6 +165,7 @@ mod mac {
         }
 
         fn resize(&mut self, capacity: usize) {
+            self.settle();
             self.layer.resize(self.gpu, capacity);
             self.capacity = capacity;
             self.rebuild();
@@ -212,7 +223,15 @@ mod mac {
             self.run(hidden, token, false);
         }
 
+        /// Waits for the last `record`.
+        fn settle(&mut self) {
+            if let Some(p) = self.pending.take() {
+                p.wait();
+            }
+        }
+
         fn run(&mut self, hidden: &View, token: u32, draft: bool) {
+            self.settle();
             assert!(
                 self.position < self.limit,
                 "MTP cache is full ({} steps)",
@@ -224,6 +243,9 @@ mod mac {
             if draft {
                 self.plan.set_params(params);
                 self.built.run(self.gpu);
+            } else if self.record_async {
+                self.record_plan.set_params(params);
+                self.pending = Some(self.record_built.commit(self.gpu));
             } else {
                 self.record_plan.set_params(params);
                 self.record_built.run(self.gpu);
@@ -231,7 +253,8 @@ mod mac {
             self.position += 1;
         }
 
-        /// The normed hidden state of the last step.
+        /// The normed hidden state of the last `step`; after a `record` it
+        /// may not be written yet.
         pub fn output(&self) -> &View {
             &self.output
         }
@@ -252,6 +275,7 @@ mod mac {
         }
 
         pub fn reset(&mut self) {
+            self.settle();
             self.layer.reset();
             self.position = 0;
         }
@@ -514,6 +538,8 @@ mod mac {
 
             let want = cpu_step(&mtp, &model, &hidden(21), 7, &mut state);
             g.record(&main(21), 7);
+            // `record` may not have finished on the GPU yet.
+            g.settle();
             check("record", &g, want.1, &want);
             let want = cpu_step(&mtp, &model, &hidden(22), 8, &mut state);
             let got = g.step(&main(22), 8);
