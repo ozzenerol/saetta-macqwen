@@ -71,12 +71,6 @@ mod mac {
         std::env::var("SAETTA_AG_FUSED").map_or(true, |v| v != "0")
     }
 
-    /// SAETTA_AG_PV128=1 (fused only): pv on 64 x 128 output tiles, so P is
-    /// loaded and exponentiated twice per block instead of four times.
-    fn pv128_from_env() -> bool {
-        std::env::var("SAETTA_AG_PV128").is_ok_and(|v| v == "1")
-    }
-
     fn slices() -> usize {
         std::env::var("SAETTA_AG_SLICES")
             .ok()
@@ -102,7 +96,6 @@ mod mac {
         m2: Buffer,
         l2: Buffer,
         pub fused: bool,
-        pub pv128: bool,
         /// For the bench: encode only the first `stages` passes of each
         /// block (1 scores, 2 softmax, 3 pv) and no final; 0 runs all.
         pub stages: std::cell::Cell<usize>,
@@ -131,7 +124,6 @@ mod mac {
                 m2: gpu.buffer((rows * 4 * small).max(4)),
                 l2: gpu.buffer((rows * 4 * small).max(4)),
                 fused,
-                pv128: fused && pv128_from_env(),
                 stages: std::cell::Cell::new(0),
             }
         }
@@ -236,12 +228,10 @@ mod mac {
                 Some(b) => panic!("no gemm attention for {b:?} rows"),
             };
             let f_ = if self.fused { "_f" } else { "" };
-            let w = if self.pv128 { "128" } else { "" };
             let (scores, pv) = (
                 gpu.pipeline(&format!("prefill_ag_scores{f_}{suffix}")),
-                gpu.pipeline(&format!("prefill_ag_pv{f_}{w}{suffix}")),
+                gpu.pipeline(&format!("prefill_ag_pv{f_}{suffix}")),
             );
-            let dim_tiles = (DIM / if self.pv128 { 128 } else { 64 }) as u64;
             let (tmax, m2, l2) = (whole(&self.tmax), whole(&self.m2), whole(&self.l2));
             // The codes, scales and biases of keys and values; the half
             // kernels do not read these slots, so they get the half cache.
@@ -301,7 +291,7 @@ mod mac {
                     set_at(8, &[m_in.clone(), m_out.clone(), l_in.clone()]);
                     enc.set_buffer(11, Some(&l_out.buffer), 0);
                     enc.dispatch_thread_groups(
-                        MTLSize::new(dim_tiles, row_tiles, kv),
+                        MTLSize::new((DIM / 64) as u64, row_tiles, kv),
                         MTLSize::new(128, 1, 1),
                     );
                     l_last = l_out;
