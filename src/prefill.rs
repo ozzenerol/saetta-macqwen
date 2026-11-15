@@ -143,7 +143,7 @@ mod mac {
     /// (x split into two halves, close to f32), else qmm_dq_<bits>bit (w
     /// dequantized to half, as MLX).
     fn qmm_name(w: &GpuQuant, split: bool) -> String {
-        assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
+        assert!(matches!(w.bits, 5 | 6 | 8), "no qmm kernel for {} bits", w.bits);
         if split {
             format!("qmm_{}bit_split", w.bits)
         } else {

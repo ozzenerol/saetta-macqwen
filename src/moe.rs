@@ -50,7 +50,7 @@ mod mac {
                 down: load("down_proj")?,
             };
             let block = ROWS_PER_SIMD * SIMDS;
-            assert_eq!(e.gate.bits, 5, "moe kernels are 5-bit");
+            assert!(matches!(e.gate.bits, 5 | 6), "moe kernels are 5 and 6-bit");
             assert!(e.gate.rows.is_multiple_of(block) && e.down.rows.is_multiple_of(block));
             assert_eq!((e.up.rows, e.up.cols), (e.gate.rows, e.gate.cols));
             assert_eq!((e.down.rows, e.down.cols), (e.gate.cols, e.gate.rows));
