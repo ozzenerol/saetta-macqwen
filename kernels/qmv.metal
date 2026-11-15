@@ -49,3 +49,6 @@ kernel void qmv(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmv_5bit")]] kernel decltype(qmv<5>) qmv<5>;
 template [[host_name("qmv_8bit")]] kernel decltype(qmv<8>) qmv<8>;
+#if WBITS == 6
+template [[host_name("qmv_6bit")]] kernel decltype(qmv<6>) qmv<6>;
+#endif

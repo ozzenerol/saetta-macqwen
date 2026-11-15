@@ -128,6 +128,7 @@ mod mac {
             assert_eq!(self.experts, 1, "stacked experts go through moe");
             let kernel = match self.bits {
                 5 => "qmv_5bit",
+                6 => "qmv_6bit",
                 8 => "qmv_8bit",
                 b => panic!("no qmv kernel for {b} bits"),
             };

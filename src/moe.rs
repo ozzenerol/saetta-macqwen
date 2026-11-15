@@ -127,10 +127,11 @@ mod mac {
             ];
             let grid = MTLSize::new(row_groups(g.rows), count as u64, 1);
             let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
+            let name = format!("moe_gate_up_{}bit", g.bits);
             if parallel {
-                plan.op_parallel("moe_gate_up_5bit", &buffers, grid, threads);
+                plan.op_parallel(&name, &buffers, grid, threads);
             } else {
-                plan.op("moe_gate_up_5bit", &buffers, grid, threads);
+                plan.op(&name, &buffers, grid, threads);
             }
         }
 
@@ -146,8 +147,9 @@ mod mac {
         ) {
             let d = &self.down;
             let shape = plan.constant(&[d.rows as u32, d.cols as u32, count as u32]);
+            let name = format!("moe_down_{}bit", d.bits);
             plan.op(
-                "moe_down_5bit",
+                &name,
                 &[&d.words, &d.scales, &d.biases, h, y, &shape, ids, weights],
                 MTLSize::new(row_groups(d.rows), 1, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),

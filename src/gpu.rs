@@ -60,6 +60,9 @@ mod mac {
 
     pub struct Gpu {
         pub device: Device,
+        /// Bit width of the model's main weights; the kernels that are not
+        /// templated on it are compiled for it (WBITS in params.metal).
+        pub wbits: u32,
         queue: CommandQueue,
         library: Library,
         pipelines: RefCell<HashMap<String, ComputePipelineState>>,
@@ -228,14 +231,29 @@ mod mac {
 
     impl Gpu {
         pub fn new() -> Result<Gpu, String> {
+            Gpu::for_bits(5)
+        }
+
+        /// The device with the kernels compiled for a model whose main
+        /// weights are `wbits` bits (5 or 6).
+        pub fn for_bits(wbits: u32) -> Result<Gpu, String> {
+            if !matches!(wbits, 5 | 6) {
+                return Err(format!("no kernels for {wbits}-bit weights"));
+            }
             let device = Device::system_default().ok_or("no Metal device")?;
+            let source = if wbits == 5 {
+                KERNELS.to_string()
+            } else {
+                format!("#define WBITS {wbits}\n{KERNELS}")
+            };
             let library = device
-                .new_library_with_source(KERNELS, &CompileOptions::new())
+                .new_library_with_source(&source, &CompileOptions::new())
                 .map_err(|e| format!("kernel compile failed: {e}"))?;
             let queue = device.new_command_queue();
             let residency = Residency::new(&device, &queue);
             Ok(Gpu {
                 device,
+                wbits,
                 queue,
                 library,
                 pipelines: RefCell::new(HashMap::new()),

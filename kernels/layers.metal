@@ -282,6 +282,9 @@ kernel void qmv_conv(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmv_conv_5bit")]] kernel decltype(qmv_conv<5>) qmv_conv<5>;
 template [[host_name("qmv_conv_8bit")]] kernel decltype(qmv_conv<8>) qmv_conv<8>;
+#if WBITS == 6
+template [[host_name("qmv_conv_6bit")]] kernel decltype(qmv_conv<6>) qmv_conv<6>;
+#endif
 
 
 struct StepParams {

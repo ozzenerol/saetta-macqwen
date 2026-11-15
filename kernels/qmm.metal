@@ -236,13 +236,31 @@ kernel void qmm2(device const uint *words [[buffer(0)]],
         qmm2<bits, 32, 128, 32, 32, false, sub>;
 QMM2_SUB("qmm2_32x2_5bit", 5, 2)
 QMM2_SUB("qmm2_32x2_8bit", 8, 2)
+#if WBITS == 6
+QMM2_SUB("qmm2_32x2_6bit", 6, 2)
+#endif
 QMM2("qmm2_5bit", 5, 64, 64, 32, 32, false)
 QMM2("qmm2_8bit", 8, 64, 64, 32, 32, false)
+#if WBITS == 6
+QMM2("qmm2_6bit", 6, 64, 64, 32, 32, false)
+#endif
 QMM2("qmm2_db_5bit", 5, 64, 64, 32, 32, true)
 QMM2("qmm2_db_8bit", 8, 64, 64, 32, 32, true)
+#if WBITS == 6
+QMM2("qmm2_db_6bit", 6, 64, 64, 32, 32, true)
+#endif
 QMM2("qmm2_32_5bit", 5, 32, 128, 32, 32, false)
 QMM2("qmm2_32_8bit", 8, 32, 128, 32, 32, false)
+#if WBITS == 6
+QMM2("qmm2_32_6bit", 6, 32, 128, 32, 32, false)
+#endif
 QMM2("qmm2_32_db_5bit", 5, 32, 128, 32, 32, true)
 QMM2("qmm2_32_db_8bit", 8, 32, 128, 32, 32, true)
+#if WBITS == 6
+QMM2("qmm2_32_db_6bit", 6, 32, 128, 32, 32, true)
+#endif
 QMM2("qmm2_16_5bit", 5, 16, 128, 16, 32, false)
 QMM2("qmm2_16_8bit", 8, 16, 128, 16, 32, false)
+#if WBITS == 6
+QMM2("qmm2_16_6bit", 6, 16, 128, 16, 32, false)
+#endif

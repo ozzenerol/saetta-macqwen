@@ -173,6 +173,7 @@ mod mac {
         );
         let kernel = match w.bits {
             5 => "qmv_mma_5bit",
+            6 => "qmv_mma_6bit",
             8 => "qmv_mma_8bit",
             b => panic!("no qmv_mma kernel for {b} bits"),
         };
