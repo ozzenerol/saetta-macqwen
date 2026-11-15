@@ -239,8 +239,14 @@ kernel void qmm(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmm_5bit")]] kernel decltype(qmm<5, 1>) qmm<5, 1>;
 template [[host_name("qmm_8bit")]] kernel decltype(qmm<8, 1>) qmm<8, 1>;
+#if WBITS == 6
+template [[host_name("qmm_6bit")]] kernel decltype(qmm<6, 1>) qmm<6, 1>;
+#endif
 template [[host_name("qmm_5bit_split")]] kernel decltype(qmm<5, 2>) qmm<5, 2>;
 template [[host_name("qmm_8bit_split")]] kernel decltype(qmm<8, 2>) qmm<8, 2>;
+#if WBITS == 6
+template [[host_name("qmm_6bit_split")]] kernel decltype(qmm<6, 2>) qmm<6, 2>;
+#endif
 
 // The same product with the weights dequantized to half in threadgroup
 // memory (w = scale q + bias), as MLX does: one set of accumulators and no
@@ -394,6 +400,9 @@ kernel void qmm_dq(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmm_dq_5bit")]] kernel decltype(qmm_dq<5>) qmm_dq<5>;
 template [[host_name("qmm_dq_8bit")]] kernel decltype(qmm_dq<8>) qmm_dq<8>;
+#if WBITS == 6
+template [[host_name("qmm_dq_6bit")]] kernel decltype(qmm_dq<6>) qmm_dq<6>;
+#endif
 
 // The same product for few rows: up to PREFILL_FEW rows of x per
 // threadgroup, in f32 as qmv.metal does, so weights are read once for all
@@ -478,6 +487,9 @@ kernel void qmm_few(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmm_few_5bit")]] kernel decltype(qmm_few<5>) qmm_few<5>;
 template [[host_name("qmm_few_8bit")]] kernel decltype(qmm_few<8>) qmm_few<8>;
+#if WBITS == 6
+template [[host_name("qmm_few_6bit")]] kernel decltype(qmm_few<6>) qmm_few<6>;
+#endif
 
 // ---------------------------------------------------------------------------
 // Small batched ops.
@@ -512,6 +524,9 @@ kernel void embed_rows(device const uint *words [[buffer(0)]],
 
 template [[host_name("embed_rows_5bit")]] kernel decltype(embed_rows<5>) embed_rows<5>;
 template [[host_name("embed_rows_8bit")]] kernel decltype(embed_rows<8>) embed_rows<8>;
+#if WBITS == 6
+template [[host_name("embed_rows_6bit")]] kernel decltype(embed_rows<6>) embed_rows<6>;
+#endif
 
 kernel void add_in_place(device float *x [[buffer(0)]],
                          device const float *y [[buffer(1)]],
@@ -1774,6 +1789,9 @@ kernel void prefill_gate_up(device const uint *gate_words [[buffer(0)]],
 
 template [[host_name("prefill_gate_up_5bit")]] kernel decltype(prefill_gate_up<5>) prefill_gate_up<5>;
 template [[host_name("prefill_gate_up_8bit")]] kernel decltype(prefill_gate_up<8>) prefill_gate_up<8>;
+#if WBITS == 6
+template [[host_name("prefill_gate_up_6bit")]] kernel decltype(prefill_gate_up<6>) prefill_gate_up<6>;
+#endif
 
 // prefill_gate_up on tiles of up to 64 rows: 8 simdgroups, each 32 rows by
 // 16 columns of gate and the same 16 of up, so silu(gate) * up is taken in
@@ -1966,8 +1984,14 @@ kernel void prefill_gate_up64(device const uint *gate_words [[buffer(0)]],
 
 template [[host_name("prefill_gate_up64_5bit")]] kernel decltype(prefill_gate_up64<5, false>) prefill_gate_up64<5, false>;
 template [[host_name("prefill_gate_up64_8bit")]] kernel decltype(prefill_gate_up64<8, false>) prefill_gate_up64<8, false>;
+#if WBITS == 6
+template [[host_name("prefill_gate_up64_6bit")]] kernel decltype(prefill_gate_up64<6, false>) prefill_gate_up64<6, false>;
+#endif
 template [[host_name("prefill_gate_up64_5bit_pf")]] kernel decltype(prefill_gate_up64<5, true>) prefill_gate_up64<5, true>;
 template [[host_name("prefill_gate_up64_8bit_pf")]] kernel decltype(prefill_gate_up64<8, true>) prefill_gate_up64<8, true>;
+#if WBITS == 6
+template [[host_name("prefill_gate_up64_6bit_pf")]] kernel decltype(prefill_gate_up64<6, true>) prefill_gate_up64<6, true>;
+#endif
 
 // prefill_gate_up64 with 64-deep k steps: half the barriers, and a step is
 // one quantization group, so a thread loads one scale and bias per step.
@@ -2134,6 +2158,9 @@ kernel void prefill_gate_up64k(device const uint *gate_words [[buffer(0)]],
 
 template [[host_name("prefill_gate_up64k_5bit")]] kernel decltype(prefill_gate_up64k<5>) prefill_gate_up64k<5>;
 template [[host_name("prefill_gate_up64k_8bit")]] kernel decltype(prefill_gate_up64k<8>) prefill_gate_up64k<8>;
+#if WBITS == 6
+template [[host_name("prefill_gate_up64k_6bit")]] kernel decltype(prefill_gate_up64k<6>) prefill_gate_up64k<6>;
+#endif
 
 // g = silu(g) * u and g_half = g for the rows of the tiles of PREFILL_FEW
 // rows or fewer, which prefill_gate_up skips. One threadgroup per tile.

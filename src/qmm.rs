@@ -109,7 +109,7 @@ mod mac {
         shape: &QmmShape,
     ) {
         assert!(
-            w.bits == 5 || w.bits == 8,
+            matches!(w.bits, 5 | 6 | 8),
             "no qmm2 kernel for {} bits",
             w.bits
         );

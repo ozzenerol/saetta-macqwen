@@ -50,7 +50,7 @@ mod mac {
                 down: load("down_proj")?,
             };
             let block = ROWS_PER_SIMD * SIMDS;
-            assert_eq!(e.gate.bits, 5, "moe kernels are 5-bit");
+            assert!(matches!(e.gate.bits, 5 | 6 | 8), "moe kernels are 5, 6 and 8-bit");
             assert!(e.gate.rows.is_multiple_of(block) && e.down.rows.is_multiple_of(block));
             assert_eq!((e.up.rows, e.up.cols), (e.gate.rows, e.gate.cols));
             assert_eq!((e.down.rows, e.down.cols), (e.gate.cols, e.gate.rows));
@@ -127,10 +127,11 @@ mod mac {
             ];
             let grid = MTLSize::new(row_groups(g.rows), count as u64, 1);
             let threads = MTLSize::new(32 * SIMDS as u64, 1, 1);
+            let name = format!("moe_gate_up_{}bit", g.bits);
             if parallel {
-                plan.op_parallel("moe_gate_up_5bit", &buffers, grid, threads);
+                plan.op_parallel(&name, &buffers, grid, threads);
             } else {
-                plan.op("moe_gate_up_5bit", &buffers, grid, threads);
+                plan.op(&name, &buffers, grid, threads);
             }
         }
 
@@ -146,8 +147,9 @@ mod mac {
         ) {
             let d = &self.down;
             let shape = plan.constant(&[d.rows as u32, d.cols as u32, count as u32]);
+            let name = format!("moe_down_{}bit", d.bits);
             plan.op(
-                "moe_down_5bit",
+                &name,
                 &[&d.words, &d.scales, &d.biases, h, y, &shape, ids, weights],
                 MTLSize::new(row_groups(d.rows), 1, 1),
                 MTLSize::new(32 * SIMDS as u64, 1, 1),

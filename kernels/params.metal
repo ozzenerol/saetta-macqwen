@@ -1,3 +1,9 @@
+// WBITS is the bit width of the model's main weights. The host puts a
+// #define in front of the source when the model is not 5-bit.
+#ifndef WBITS
+#define WBITS 5
+#endif
+
 // What changes from one token to the next. The CPU writes it before each
 // command buffer; kernels that need it take it as one more buffer.
 // Must match plan::TokenParams.

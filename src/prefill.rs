@@ -120,6 +120,7 @@ mod mac {
     fn qmv(gpu: &Gpu, enc: &ComputeCommandEncoderRef, w: &GpuQuant, x: &View, y: &View) {
         let name = match w.bits {
             5 => "qmv_5bit",
+            6 => "qmv_6bit",
             8 => "qmv_8bit",
             b => panic!("no qmv kernel for {b} bits"),
         };
@@ -142,7 +143,7 @@ mod mac {
     /// (x split into two halves, close to f32), else qmm_dq_<bits>bit (w
     /// dequantized to half, as MLX).
     fn qmm_name(w: &GpuQuant, split: bool) -> String {
-        assert!(matches!(w.bits, 5 | 8), "no qmm kernel for {} bits", w.bits);
+        assert!(matches!(w.bits, 5 | 6 | 8), "no qmm kernel for {} bits", w.bits);
         if split {
             format!("qmm_{}bit_split", w.bits)
         } else {
@@ -270,6 +271,7 @@ mod mac {
     fn few_pipeline(gpu: &Gpu, w: &GpuQuant) -> metal::ComputePipelineState {
         match w.bits {
             5 => gpu.pipeline("qmm_few_5bit"),
+            6 => gpu.pipeline("qmm_few_6bit"),
             8 => gpu.pipeline("qmm_few_8bit"),
             b => panic!("no qmm_few kernel for {b} bits"),
         }
@@ -372,7 +374,7 @@ mod mac {
         rows64: bool,
     ) -> usize {
         assert!(
-            matches!(gate.bits, 5 | 8),
+            matches!(gate.bits, 5 | 6 | 8),
             "no prefill_gate_up kernel for {} bits",
             gate.bits
         );
@@ -1080,6 +1082,7 @@ mod mac {
             let h = self.cfg.hidden_size;
             let name = match self.embed.bits {
                 5 => "embed_rows_5bit",
+                6 => "embed_rows_6bit",
                 8 => "embed_rows_8bit",
                 b => panic!("no embed kernel for {b} bits"),
             };
@@ -1795,7 +1798,11 @@ mod mac {
             let top_k = self.cfg.num_experts_per_tok;
             let h = self.cfg.hidden_size;
             let (g, up, d) = (&e.gate, &e.up, &e.down);
-            assert!(g.bits == 5 && d.bits == 5, "the rows MoE kernels are 5-bit");
+            assert!(
+                g.bits == gpu.wbits && d.bits == gpu.wbits,
+                "the rows MoE kernels are compiled for {}-bit experts",
+                gpu.wbits
+            );
             let (list, slots) = (whole(&s.few_list), whole(&s.few_slots));
             let eg = whole(&s.expert_g);
             let split = FEW_MOE_SPLIT;

@@ -86,8 +86,13 @@ fn main() -> ExitCode {
         }
         #[cfg(target_os = "macos")]
         ["kernel-info", ref names @ ..] => {
-            // Compiles only; runs nothing on the GPU.
-            let gpu = match saetta::gpu::Gpu::new() {
+            // Compiles only; runs nothing on the GPU. SAETTA_WBITS=6 compiles
+            // the library for 6-bit weights.
+            let wbits = std::env::var("SAETTA_WBITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5);
+            let gpu = match saetta::gpu::Gpu::for_bits(wbits) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("{e}");
@@ -495,7 +500,8 @@ fn load_gpu(
     lookup: usize,
     memory: Memory,
 ) -> Result<GpuServed, Box<dyn Error>> {
-    let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::new()?));
+    let bits = config.quantization.default.bits;
+    let gpu: &'static saetta::gpu::Gpu = Box::leak(Box::new(saetta::gpu::Gpu::for_bits(bits)?));
     let context = memory.context;
     let mut parts = BufferParts::new(gpu);
     let mut model = saetta::gpu_model::GpuModel::load_with_bits(

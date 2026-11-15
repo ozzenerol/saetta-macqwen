@@ -28,7 +28,7 @@ mod mac {
         assert_eq!(w.experts, 1, "stacked experts go through moe");
         assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
         assert!(
-            matches!(w.bits, 5 | 8),
+            matches!(w.bits, 5 | 6 | 8),
             "no qmv_rows kernel for {} bits",
             w.bits
         );
@@ -76,7 +76,7 @@ mod mac {
         assert_eq!(w.experts, 1, "stacked experts go through moe");
         assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
         assert!(
-            matches!(w.bits, 5 | 8),
+            matches!(w.bits, 5 | 6 | 8),
             "no qmv_pk kernel for {} bits",
             w.bits
         );
@@ -123,7 +123,7 @@ mod mac {
         assert!((1..=MAX_ROWS).contains(&m), "{m} rows");
         assert!(w.cols.is_multiple_of(64));
         assert!(
-            matches!(w.bits, 5 | 8),
+            matches!(w.bits, 5 | 6 | 8),
             "no qmv_reg kernel for {} bits",
             w.bits
         );
@@ -173,6 +173,7 @@ mod mac {
         );
         let kernel = match w.bits {
             5 => "qmv_mma_5bit",
+            6 => "qmv_mma_6bit",
             8 => "qmv_mma_8bit",
             b => panic!("no qmv_mma kernel for {b} bits"),
         };

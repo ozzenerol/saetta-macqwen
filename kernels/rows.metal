@@ -99,6 +99,9 @@ kernel void qmv_rows(device const uint *words [[buffer(0)]],
     QMV_ROWS_M(BITS, 5) QMV_ROWS_M(BITS, 6) QMV_ROWS_M(BITS, 7) QMV_ROWS_M(BITS, 8)
 QMV_ROWS_ALL(5)
 QMV_ROWS_ALL(8)
+#if WBITS == 6
+QMV_ROWS_ALL(6)
+#endif
 
 // acc[j] += dot(w, x[j]) over 32 values for M rows of x, times wt[j] when
 // WEIGHTED: the math of `acc += dot32(...)` with the weights unpacked once.
@@ -256,7 +259,7 @@ kernel void moe_gate_up_rows(device const uint *gate_w [[buffer(0)]],
                              uint2 tg [[threadgroup_position_in_grid]],
                              uint simd [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     uint u = tg.y;
     if (u >= list[0]) {
         return;
@@ -316,7 +319,7 @@ kernel void moe_down_rows(device const uint *words [[buffer(0)]],
                           uint tg [[threadgroup_position_in_grid]],
                           uint simd [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     uint out_row = tg * MOE_SIMDS + simd;
     uint row_words = shape.cols * BITS / 32;
     uint groups = shape.cols / 64;
@@ -461,6 +464,9 @@ kernel void qmv_mma(device const uint *words [[buffer(0)]],
 
 template [[host_name("qmv_mma_5bit")]] kernel decltype(qmv_mma<5>) qmv_mma<5>;
 template [[host_name("qmv_mma_8bit")]] kernel decltype(qmv_mma<8>) qmv_mma<8>;
+#if WBITS == 6
+template [[host_name("qmv_mma_6bit")]] kernel decltype(qmv_mma<6>) qmv_mma<6>;
+#endif
 
 // moe_gate_up_rows with simdgroup matrices, split k like qmv_mma:
 // threadgroup (tile of 8 rows, distinct expert u). All 8 rows of x go
@@ -482,7 +488,7 @@ kernel void moe_gate_up_mma(device const uint *gate_w [[buffer(0)]],
                             uint tid [[thread_index_in_threadgroup]],
                             uint simd [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     threadgroup float red[MMA_SIMDS * 64];
     uint u = tg.y;
     if (u >= list[0]) {
@@ -539,7 +545,7 @@ kernel void moe_down_mma(device const uint *words [[buffer(0)]],
                          uint tid [[thread_index_in_threadgroup]],
                          uint simd [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     threadgroup float red[MMA_SIMDS * 64];
     uint2 f = frag(lane);
     uint row_words = shape.cols * BITS / 32;
@@ -618,7 +624,7 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint simd [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint NW = BITS == 5 ? 3 : 4;
+    constexpr uint NW = BITS == 8 ? 4 : 3;
     uint row0 = (tg * QR_SIMDS + simd) * QR;
     uint row_words = shape.cols * BITS / 32;
     uint groups = shape.cols / 64;
@@ -698,12 +704,16 @@ kernel void qmv_reg(device const uint *words [[buffer(0)]],
     QMV_REG(5, 1, QR) QMV_REG(5, 2, QR) QMV_REG(5, 3, QR) QMV_REG(5, 4, QR) \
     QMV_REG(8, 1, QR) QMV_REG(8, 2, QR) QMV_REG(8, 3, QR) QMV_REG(8, 4, QR)
 QMV_REG_QR(2) QMV_REG_QR(4) QMV_REG_QR(8)
+#if WBITS == 6
+#define QMV_REG_QR6(QR) QMV_REG(6, 1, QR) QMV_REG(6, 2, QR) QMV_REG(6, 3, QR) QMV_REG(6, 4, QR)
+QMV_REG_QR6(2) QMV_REG_QR6(4) QMV_REG_QR6(8)
+#endif
 
 // This lane's 16 values of weight row `row` from k, dequantized as q (the
 // scale and bias are applied by the caller): the qmv_reg layout.
 template <uint BITS>
 inline void q16(device const uint *words, uint row, uint row_words, uint k, thread float4 *q) {
-    constexpr uint NW = BITS == 5 ? 3 : 4;
+    constexpr uint NW = BITS == 8 ? 4 : 3;
     uint bit0 = k * BITS;
     device const uint *w = words + row * row_words + bit0 / 32;
     uint packed[NW];
@@ -741,7 +751,7 @@ kernel void moe_gate_up_reg(device const uint *gate_w [[buffer(0)]],
                             uint2 tg [[threadgroup_position_in_grid]],
                             uint simd [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     uint u = tg.y;
     if (u >= list[0]) {
         return;
@@ -904,6 +914,9 @@ kernel void qmv_pk(device const uint *words [[buffer(0)]],
     QMV_PK(BITS, 5) QMV_PK(BITS, 6) QMV_PK(BITS, 7) QMV_PK(BITS, 8)
 QMV_PK_ALL(5)
 QMV_PK_ALL(8)
+#if WBITS == 6
+QMV_PK_ALL(6)
+#endif
 
 // qmv for up to 8 rows with simdgroup matrices, loads like qmv's. Per group
 // of 64 values of k, a simdgroup does 8 MMAs of an 8x8 W tile (8 weight
@@ -927,7 +940,7 @@ kernel void qmv_mma2(device const uint *words [[buffer(0)]],
                      uint tid [[thread_index_in_threadgroup]],
                      uint simd [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint NW = BITS == 5 ? 3 : 4;
+    constexpr uint NW = BITS == 8 ? 4 : 3;
     threadgroup float xs[8 * MMA2_KB];
     uint2 f = frag(lane);
     uint row_words = shape.cols * BITS / 32;
@@ -988,6 +1001,9 @@ kernel void qmv_mma2(device const uint *words [[buffer(0)]],
     template [[host_name("qmv_mma2_" #BITS "bit_" #S)]] kernel decltype(qmv_mma2<BITS, S>) \
         qmv_mma2<BITS, S>;
 QMV_MMA2(5, 2) QMV_MMA2(5, 4) QMV_MMA2(5, 8) QMV_MMA2(8, 2) QMV_MMA2(8, 4) QMV_MMA2(8, 8)
+#if WBITS == 6
+QMV_MMA2(6, 2) QMV_MMA2(6, 4) QMV_MMA2(6, 8)
+#endif
 
 // Shifts a lane's packed words right by off (0 or 16 for 5 bits, 0 for 8)
 // so the values start at bit 0 and unpack_at takes constant bit offsets.
@@ -1022,7 +1038,7 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
                      uint tg [[threadgroup_position_in_grid]],
                      uint simd [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint NW = BITS == 5 ? 3 : 4;
+    constexpr uint NW = BITS == 8 ? 4 : 3;
     threadgroup float red[SPLIT * 64];
     uint2 f = frag(lane);
     uint row_words = shape.cols * BITS / 32;
@@ -1100,6 +1116,9 @@ kernel void qmv_mma3(device const uint *words [[buffer(0)]],
     template [[host_name("qmv_mma3_" #BITS "bit_" #S)]] kernel decltype(qmv_mma3<BITS, S>) \
         qmv_mma3<BITS, S>;
 QMV_MMA3(5, 2) QMV_MMA3(5, 4) QMV_MMA3(5, 8) QMV_MMA3(8, 2) QMV_MMA3(8, 4) QMV_MMA3(8, 8)
+#if WBITS == 6
+QMV_MMA3(6, 2) QMV_MMA3(6, 4) QMV_MMA3(6, 8)
+#endif
 #define QMV_PROBE(MODE) \
     template [[host_name("qmv_mma3_probe_" #MODE)]] kernel decltype(qmv_mma3<5, 4, MODE>) \
         qmv_mma3<5, 4, MODE>;
@@ -1119,7 +1138,7 @@ inline void mma3_group(device const uint *wrow,
                        device const float *x1,
                        float2 xs,
                        thread simdgroup_float8x8 &acc) {
-    constexpr uint NW = BITS == 5 ? 3 : 4;
+    constexpr uint NW = BITS == 8 ? 4 : 3;
     uint bit0 = (g * 64 + wk) * BITS;
     device const uint *w = wrow + bit0 / 32;
     uint packed[NW];
@@ -1176,7 +1195,7 @@ kernel void moe_gate_up_mma3(device const uint *gate_w [[buffer(0)]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint simd [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     threadgroup float red[SPLIT * 64];
     uint u = tg.y;
     if (u >= list[0]) {
@@ -1226,7 +1245,7 @@ kernel void moe_down_mma3(device const uint *words [[buffer(0)]],
                           uint tid [[thread_index_in_threadgroup]],
                           uint simd [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint BITS = 5;
+    constexpr uint BITS = WBITS;
     threadgroup float red[SPLIT * 64];
     uint2 f = frag(lane);
     uint row_words = shape.cols * BITS / 32;
@@ -1280,7 +1299,7 @@ kernel void qmv_mma4(device const uint *words [[buffer(0)]],
                      uint tid [[thread_index_in_threadgroup]],
                      uint simd [[simdgroup_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint NW = BITS == 5 ? 3 : 4;
+    constexpr uint NW = BITS == 8 ? 4 : 3;
     threadgroup float red[SPLIT * 64 * T];
     uint2 f = frag(lane);
     uint row_words = shape.cols * BITS / 32;
@@ -1360,6 +1379,9 @@ kernel void qmv_mma4(device const uint *words [[buffer(0)]],
 #define QMV_MMA4_T(BITS, S) QMV_MMA4(BITS, S, 2) QMV_MMA4(BITS, S, 4)
 QMV_MMA4_T(5, 2) QMV_MMA4_T(5, 4) QMV_MMA4_T(5, 8) QMV_MMA4_T(8, 2) QMV_MMA4_T(8, 4)
 QMV_MMA4_T(8, 8)
+#if WBITS == 6
+QMV_MMA4_T(6, 2) QMV_MMA4_T(6, 4) QMV_MMA4_T(6, 8)
+#endif
 
 // qmv_mma3 with 128 values of k per step: 16 MMAs, tile i's column t is k =
 // 32 (t / 2) + 2 i + t % 2, so a lane holds 32 contiguous values of its
@@ -1433,3 +1455,6 @@ kernel void qmv_mma5(device const uint *words [[buffer(0)]],
     template [[host_name("qmv_mma5_" #BITS "bit_" #S)]] kernel decltype(qmv_mma5<BITS, S>) \
         qmv_mma5<BITS, S>;
 QMV_MMA5(5, 2) QMV_MMA5(5, 4) QMV_MMA5(5, 8) QMV_MMA5(8, 2) QMV_MMA5(8, 4) QMV_MMA5(8, 8)
+#if WBITS == 6
+QMV_MMA5(6, 2) QMV_MMA5(6, 4) QMV_MMA5(6, 8)
+#endif

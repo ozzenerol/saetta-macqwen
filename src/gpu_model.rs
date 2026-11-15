@@ -375,9 +375,9 @@ mod mac {
         weights: &'a Weights,
     ) -> Result<GpuQuant<'a>, String> {
         let embed = matrix(gpu, weights, cfg, &format!("{PREFIX}.embed_tokens"))?;
-        if embed.bits != 5 {
+        if !matches!(embed.bits, 5 | 6 | 8) {
             return Err(format!(
-                "embedding is {}-bit, the kernel is 5-bit",
+                "embedding is {}-bit, the kernels are 5, 6 and 8-bit",
                 embed.bits
             ));
         }
@@ -420,8 +420,9 @@ mod mac {
         let cols = embed.cols;
         let shape = plan.constant(&[cols as u32]);
         let params = plan.params.clone();
+        let name = format!("embed_{}bit", embed.bits);
         plan.op(
-            "embed_5bit",
+            &name,
             &[
                 &embed.words,
                 &embed.scales,
