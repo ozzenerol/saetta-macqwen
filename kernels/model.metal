@@ -34,6 +34,9 @@ kernel void embed(device const uint *words [[buffer(0)]],
 }
 
 template [[host_name("embed_5bit")]] kernel decltype(embed<5>) embed<5>;
+#if WBITS == 8
+template [[host_name("embed_8bit")]] kernel decltype(embed<8>) embed<8>;
+#endif
 #if WBITS == 6
 template [[host_name("embed_6bit")]] kernel decltype(embed<6>) embed<6>;
 #endif

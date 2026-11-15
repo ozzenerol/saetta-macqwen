@@ -43,6 +43,22 @@ All seven norms here (`pre_fc_norm_embedding`, `pre_fc_norm_hidden`, `input_laye
 
 MLX affine, group size 64. Weights are `U32` words of packed bits, `scales` and `biases` are BF16, one pair per group: `w = scale * q + bias`. Most tensors are 5-bit (2048 inputs packed into 320 words). The routers (`mlp.gate`, `mlp.shared_expert_gate`) are 8-bit.
 
+The main weights can also be 6 or 8-bit (mlx-community's 6bit and 8bit conversions, same layout, routers 8-bit). The expert kernels that are not templated on the bit width read `WBITS`, which `Gpu::for_bits` puts in front of the kernel source; `serve` and `eval` take it from the model's config.
+
+### 5, 6 and 8-bit compared (2026-11-15)
+
+MLX float32 references of each conversion on the same tokens (`tools/eval_ref.py`, then `tools/quant_compare.py` with the 8-bit one as the baseline, since it is the closest to bf16). One run each.
+
+| weights | size | ppl, prose | ppl, 32k long | top-1 same as 8-bit (32k) | KL from 8-bit, median / mean / max |
+|---|---|---|---|---|---|
+| 8-bit | 37 GB | 2.4669 | 1.8157 | | |
+| 6-bit | 29 GB | 2.4798 | 1.8192 | 97.0% | 2.8e-4 / 1.2e-2 / 0.17 |
+| 5-bit | 24 GB | 2.4879 | 1.8363 | 95.4% | 1.5e-3 / 7.6e-2 / 1.91 |
+
+The 6-bit model closes about 83% of the 5-bit to 8-bit gap in long-context perplexity, and its worst checkpoint is 11 times closer to 8-bit.
+
+saetta on 6-bit against its own MLX reference (`eval --gpu --long 32768`): median KL 5.9e-5, max 1.8e-2, top-1 100% of 32 checkpoints. Decode on 400-token answers, three prompts, one run each: 104 tok/s without drafts (5-bit 119), 136 to 163 with drafts (5-bit 145 to 161). The qh eval (14 tasks, 2 runs each, sidekick rules) passed 28/28 on both 5-bit and 6-bit; those tasks are too easy to show the difference.
+
 ## References
 
 The MLX implementation is the ground truth for numerics (MIT licensed):

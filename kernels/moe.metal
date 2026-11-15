@@ -107,6 +107,10 @@ kernel void moe_down(device const uint *words [[buffer(0)]],
 
 template [[host_name("moe_gate_up_5bit")]] kernel decltype(moe_gate_up<5>) moe_gate_up<5>;
 template [[host_name("moe_down_5bit")]] kernel decltype(moe_down<5>) moe_down<5>;
+#if WBITS == 8
+template [[host_name("moe_gate_up_8bit")]] kernel decltype(moe_gate_up<8>) moe_gate_up<8>;
+template [[host_name("moe_down_8bit")]] kernel decltype(moe_down<8>) moe_down<8>;
+#endif
 #if WBITS == 6
 template [[host_name("moe_gate_up_6bit")]] kernel decltype(moe_gate_up<6>) moe_gate_up<6>;
 template [[host_name("moe_down_6bit")]] kernel decltype(moe_down<6>) moe_down<6>;

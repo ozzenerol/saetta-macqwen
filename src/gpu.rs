@@ -235,9 +235,9 @@ mod mac {
         }
 
         /// The device with the kernels compiled for a model whose main
-        /// weights are `wbits` bits (5 or 6).
+        /// weights are `wbits` bits (5, 6 or 8).
         pub fn for_bits(wbits: u32) -> Result<Gpu, String> {
-            if !matches!(wbits, 5 | 6) {
+            if !matches!(wbits, 5 | 6 | 8) {
                 return Err(format!("no kernels for {wbits}-bit weights"));
             }
             let device = Device::system_default().ok_or("no Metal device")?;
