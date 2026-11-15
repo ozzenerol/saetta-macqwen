@@ -346,7 +346,9 @@ impl<M: Model + 'static> Server<M> {
                 tool_calls: 0,
             };
         }
+        let t_start = std::time::Instant::now();
         let started = engine.start(&prompt, &mut alive);
+        let prefill_s = t_start.elapsed().as_secs_f64();
         let cached = match started {
             Ok((_, cached)) | Err((_, cached)) => cached,
         };
@@ -413,12 +415,17 @@ impl<M: Model + 'static> Server<M> {
             Take::Go
         };
 
+        let t_decode = std::time::Instant::now();
+        let speed = |done: &Done| speed_line(done, prefill_s, t_decode.elapsed().as_secs_f64());
         let mut pending = decide.pick(&logits);
         'outer: loop {
             match take(pending, &mut done) {
                 Take::Go => {}
                 Take::Stop => break,
-                Take::Gone => return done,
+                Take::Gone => {
+                    eprintln!("{} (client left)", speed(&done));
+                    return done;
+                }
             }
             let (accepted, next) = engine.model.speculate(pending, &mut decide);
             engine.tokens.push(pending);
@@ -427,12 +434,16 @@ impl<M: Model + 'static> Server<M> {
                 match take(t, &mut done) {
                     Take::Go => {}
                     Take::Stop => break 'outer,
-                    Take::Gone => return done,
+                    Take::Gone => {
+                        eprintln!("{} (client left)", speed(&done));
+                        return done;
+                    }
                 }
             }
             pending = next;
         }
         let events = output.finish();
+        eprintln!("{}", speed(&done));
         if self.emit_all(events, &mut emit, &mut done) {
             engine.last = Some(Turn {
                 messages: r.messages.clone(),
@@ -608,6 +619,19 @@ struct ChatRequest {
     max_tokens: usize,
     sampling: Params,
     seed: u64,
+}
+
+/// One log line per request: prefill and decode speed and the context.
+fn speed_line(done: &Done, prefill_s: f64, decode_s: f64) -> String {
+    let fresh = done.prompt_tokens - done.cached_tokens;
+    let out = done.completion_tokens;
+    format!(
+        "speed: prefill {fresh} new tokens in {prefill_s:.2} s ({:.0} tok/s), \
+         decode {out} tokens in {decode_s:.2} s ({:.1} tok/s), context {}",
+        fresh as f64 / prefill_s.max(1e-9),
+        out as f64 / decode_s.max(1e-9),
+        done.prompt_tokens + out
+    )
 }
 
 struct Done {
